@@ -14,6 +14,17 @@ export type ModelId = typeof SPARK_MODEL_ID | typeof SAM_MODEL_ID;
 export type ClientMode = 'live' | 'simulated';
 /** How segmentation masks are sourced. `simulated` is the legacy chat-mode alias of `static_fixture`. */
 export type SegmentationMode = 'static_fixture' | 'simulated' | 'live_api';
+
+/**
+ * AI transparency classification (Phase 1.5). Every AI capability reports
+ * one of these — never present simulated/fixture output as live inference.
+ * - `LIVE_API`: verified execution through the real remote model.
+ * - `SIMULATED`: deterministic mock or simulated output.
+ * - `STATIC_FIXTURE`: predefined reference geometry or static fixture data.
+ * - `UNVERIFIED`: live implementation exists but no real response confirmed yet.
+ * - `UNAVAILABLE`: required proxy/key/capability is not configured.
+ */
+export type OperationalMode = 'LIVE_API' | 'SIMULATED' | 'STATIC_FIXTURE' | 'UNVERIFIED' | 'UNAVAILABLE';
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'max';
 
 /** JSON-schema subset used for tool parameter definitions. */
@@ -28,7 +39,9 @@ export interface ToolDefinition {
   name:
     | 'lookup_pinout'
     | 'verify_rail_voltage'
+    | 'measure_node_voltage'
     | 'check_continuity'
+    | 'measure_branch_current'
     | 'generate_rework_guidance';
   description: string;
   parameters: JsonSchema;
@@ -135,6 +148,54 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   },
 ];
 
+/**
+ * Phase 1.5 virtual-lab tool schemas. These probe the deterministic MNA
+ * solver (`measure_node_voltage`, `measure_branch_current`) and reuse the
+ * legacy `check_continuity` / `lookup_pinout` / `generate_rework_guidance`
+ * shapes. `TOOL_DEFINITIONS` (the original four) is unchanged for backwards
+ * compatibility; use `VIRTUAL_LAB_TOOL_DEFINITIONS` for virtual sessions and
+ * `ALL_TOOL_DEFINITIONS` when both generations must be offered.
+ *
+ * Ground-truth rule: none of these schemas carries fault ids, target refs,
+ * or faulted values — they name only nodes, branches, and part numbers.
+ */
+export const VIRTUAL_LAB_TOOL_DEFINITIONS: ToolDefinition[] = [
+  {
+    name: 'measure_node_voltage',
+    description:
+      'Measure the powered DC voltage at a circuit node relative to GND using the deterministic MNA virtual bench.',
+    parameters: {
+      type: 'object',
+      properties: {
+        node: { type: 'string', description: 'Circuit node or probe-pad id, e.g. "U1-15" or "TP_NRST".' },
+        ref_node: { type: 'string', description: 'Reference node, defaults to "GND".' },
+      },
+      required: ['node'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'measure_branch_current',
+    description:
+      'Measure the DC branch current through a virtual-bench component using the deterministic MNA solver.',
+    parameters: {
+      type: 'object',
+      properties: {
+        component_id: { type: 'string', description: 'Component id in the nominal netlist, e.g. "R_PULLUP".' },
+      },
+      required: ['component_id'],
+      additionalProperties: false,
+    },
+  },
+  ...TOOL_DEFINITIONS,
+];
+
+/** Union of legacy and virtual-lab tool schemas. */
+export const ALL_TOOL_DEFINITIONS: ToolDefinition[] = [
+  ...TOOL_DEFINITIONS,
+  ...VIRTUAL_LAB_TOOL_DEFINITIONS.filter((t) => t.name === 'measure_node_voltage' || t.name === 'measure_branch_current'),
+];
+
 /** Build a tool-call payload in the Meta Model API shape. */
 export function buildToolCallPayload(request: ChatRequest): Record<string, unknown> {
   return {
@@ -231,6 +292,23 @@ export interface MetaClientOptions {
   fetchFn?: FetchFn;
   /** Override simulated tool handlers per tool name. */
   simulatedTools?: Partial<Record<ToolDefinition['name'], (args: Record<string, unknown>) => unknown>>;
+  /**
+   * Local server-proxy base path used by browser live mode
+   * (default `/api/meta`; set to `undefined` to disable the proxy route).
+   * The proxy attaches `META_API_KEY` server-side; the browser never sees it.
+   */
+  proxyBaseUrl?: string;
+}
+
+/** Shape returned by the local server proxy for chat completions. */
+export interface ProxyChatResult {
+  content: string;
+  toolCalls: ToolCall[];
+  model?: string;
+}
+
+function isBrowserRuntime(): boolean {
+  return typeof window !== 'undefined';
 }
 
 export interface SegmentPoint {
@@ -333,9 +411,20 @@ export class MetaClient {
   private readonly baseUrl: string;
   private readonly fetchFn?: FetchFn;
   private readonly simulatedTools: MetaClientOptions['simulatedTools'];
+  private readonly proxyBaseUrl?: string;
+  /** Set only after a verified real response arrives (gates `LIVE_API`). */
+  private verifiedLiveApi = false;
 
   constructor(options: MetaClientOptions = {}) {
-    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    // SECURITY: `META_API_KEY` is read from the process environment ONLY on
+    // the Node server side. Browser bundles must NEVER embed the key: in a
+    // browser runtime (`window` defined) this reads nothing and live traffic
+    // goes through the local server proxy instead. `VITE_*` env access is
+    // deliberately absent from this module for the same reason.
+    const inBrowser = isBrowserRuntime();
+    const env = inBrowser
+      ? undefined
+      : (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
     this.apiKey = options.apiKey ?? env?.['META_API_KEY'];
     this.mode = options.mode ?? (this.apiKey ? 'live' : 'simulated');
     this.segmentationMode =
@@ -344,6 +433,27 @@ export class MetaClient {
     this.baseUrl = (options.baseUrl ?? 'https://api.meta.ai/v1').replace(/\/$/, '');
     this.fetchFn = options.fetchFn;
     this.simulatedTools = options.simulatedTools;
+    this.proxyBaseUrl = options.proxyBaseUrl ?? (inBrowser ? '/api/meta' : undefined);
+  }
+
+  /** Whether this client would route live traffic through the server proxy. */
+  usesProxyRoute(): boolean {
+    return isBrowserRuntime() && !this.apiKey && this.proxyBaseUrl !== undefined;
+  }
+
+  private sparkOperationalMode(): OperationalMode {
+    if (this.mode === 'simulated') return 'SIMULATED';
+    if (this.verifiedLiveApi) return 'LIVE_API';
+    if (this.apiKey || this.proxyBaseUrl) return 'UNVERIFIED';
+    return 'UNAVAILABLE';
+  }
+
+  private samOperationalMode(): OperationalMode {
+    if (this.segmentationMode !== 'live_api') return 'STATIC_FIXTURE';
+    if (this.mode === 'simulated') return 'STATIC_FIXTURE';
+    if (this.verifiedLiveApi) return 'LIVE_API';
+    if (this.apiKey || this.proxyBaseUrl) return 'UNVERIFIED';
+    return 'UNAVAILABLE';
   }
 
   /** Active status snapshot for the workbench header. */
@@ -353,6 +463,12 @@ export class MetaClient {
     segmenter: 'sam-3.1';
     mode: ClientMode;
     segmentationMode: SegmentationMode;
+    /** Phase 1.5 transparency: Muse Spark reasoning capability mode. */
+    sparkMode: OperationalMode;
+    /** Phase 1.5 transparency: SAM segmentation capability mode. */
+    samMode: OperationalMode;
+    /** True once a real remote response has been verified this session. */
+    liveVerified: boolean;
   } {
     return {
       model: this.model,
@@ -360,6 +476,30 @@ export class MetaClient {
       segmenter: 'sam-3.1',
       mode: this.mode,
       segmentationMode: this.segmentationMode,
+      sparkMode: this.sparkOperationalMode(),
+      samMode: this.samOperationalMode(),
+      liveVerified: this.verifiedLiveApi,
+    };
+  }
+
+  /**
+   * Query the local server proxy status (`GET <proxyBaseUrl>/status`).
+   * Reports whether the server holds a `META_API_KEY` — without ever
+   * exposing the key itself.
+   */
+  async proxyStatus(): Promise<{ configured: boolean; mode: OperationalMode }> {
+    if (!this.proxyBaseUrl) return { configured: false, mode: 'UNAVAILABLE' };
+    const fetchFn = this.fetchFn ?? globalThis.fetch.bind(globalThis);
+    const res = await fetchFn(`${this.proxyBaseUrl}/status`, {
+      method: 'GET',
+      headers: {},
+      body: '',
+    });
+    if (!res.ok) throw new Error(`Meta proxy status error: HTTP ${res.status}`);
+    const data = (await res.json()) as { configured?: boolean; mode?: OperationalMode };
+    return {
+      configured: data.configured === true,
+      mode: data.mode ?? (data.configured ? 'UNVERIFIED' : 'UNAVAILABLE'),
     };
   }
 
@@ -384,6 +524,27 @@ export class MetaClient {
       throw new Error('segmentImage requires an image url or base64 payload.');
     }
     const fetchFn = this.fetchFn ?? globalThis.fetch.bind(globalThis);
+    if (this.usesProxyRoute()) {
+      // Browser live mode: proxy attaches the key server-side. No
+      // `Authorization` header is ever constructed in browser code.
+      const res = await fetchFn(`${this.proxyBaseUrl}/segment`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image }),
+      });
+      if (res.status === 503) {
+        throw new Error('Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.');
+      }
+      if (!res.ok) throw new Error(`SAM 3.1 segmentation error: HTTP ${res.status}`);
+      const data = (await res.json()) as { masks?: SegmentMask[]; confidence?: number };
+      if (!Array.isArray(data.masks)) throw new Error('SAM 3.1 response missing masks array.');
+      this.verifiedLiveApi = true;
+      return {
+        mode: 'live_api',
+        masks: data.masks,
+        confidence: typeof data.confidence === 'number' ? data.confidence : 0,
+      };
+    }
     const res = await fetchFn(`${this.baseUrl}/v1/responses`, {
       method: 'POST',
       headers: {
@@ -413,6 +574,7 @@ export class MetaClient {
       confidence?: number;
     };
     if (!Array.isArray(data.masks)) throw new Error('SAM 3.1 response missing masks array.');
+    this.verifiedLiveApi = true;
     return {
       mode: 'live_api',
       masks: data.masks.map((m, i) => ({
@@ -444,6 +606,45 @@ export class MetaClient {
   async chat(request: ChatRequest): Promise<ChatResponse> {
     if (this.mode === 'simulated') return this.simulatedChat(request);
     const fetchFn = this.fetchFn ?? globalThis.fetch.bind(globalThis);
+    if (this.usesProxyRoute()) {
+      // Browser live mode: POST to the local server proxy WITHOUT any
+      // `Authorization` header. The proxy attaches `META_API_KEY`
+      // server-side and never echoes it back.
+      const res = await fetchFn(`${this.proxyBaseUrl}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: request.model ?? this.model,
+          messages: request.messages,
+          tools: request.tools,
+          responseFormat: request.responseFormat,
+          effort: request.effort,
+          maxTokens: request.maxTokens,
+        }),
+      });
+      if (res.status === 503) {
+        throw new Error('Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.');
+      }
+      if (!res.ok) throw new Error(`Meta Model API error: HTTP ${res.status}`);
+      const data = (await res.json()) as Partial<ProxyChatResult> & {
+        choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+      };
+      const toolCalls: ToolCall[] = Array.isArray(data.toolCalls)
+        ? data.toolCalls
+        : (data.choices?.[0]?.message?.tool_calls ?? []).map((t) => ({
+            id: t.id,
+            name: t.function.name as ToolCall['name'],
+            arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
+          }));
+      this.verifiedLiveApi = true;
+      return {
+        model: request.model ?? this.model,
+        mode: 'live',
+        content: data.content ?? data.choices?.[0]?.message?.content ?? '',
+        toolCalls,
+        simulated: false,
+      };
+    }
     const payload = buildToolCallPayload({ ...request, model: request.model ?? this.model });
     const res = await fetchFn(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -463,6 +664,7 @@ export class MetaClient {
       name: t.function.name as ToolCall['name'],
       arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
     }));
+    this.verifiedLiveApi = true;
     return {
       model: request.model ?? this.model,
       mode: 'live',
@@ -537,6 +739,17 @@ export function defaultSimulatedToolResult(
         rail_name: args['rail_name'],
         measured_volts: args['measured_volts'],
         note: 'simulated rail reading',
+      };
+    case 'measure_node_voltage':
+      return {
+        node: args['node'],
+        ref_node: args['ref_node'] ?? 'GND',
+        note: 'simulated MNA node-voltage reading (wire to the virtual bench for exact values)',
+      };
+    case 'measure_branch_current':
+      return {
+        component_id: args['component_id'],
+        note: 'simulated MNA branch-current reading (wire to the virtual bench for exact values)',
       };
     case 'check_continuity':
       return {

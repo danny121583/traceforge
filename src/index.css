@@ -54,6 +54,8 @@ body {
 .tf-chip strong { color: var(--ink); font-weight: 600; }
 .tf-chip.live strong { color: var(--ok); }
 .tf-chip.sim strong { color: var(--cyan); }
+.tf-chip.unverified strong { color: var(--warn); }
+.tf-chip.unavailable strong { color: var(--fault); }
 
 .tf-main {
   display: grid;

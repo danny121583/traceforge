@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Header } from './components/Header';
 import { PcbCanvas } from './components/PcbCanvas';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
-import { MetaClient, assembleDatasheetPayload, TOOL_DEFINITIONS } from './lib/meta-client';
+import { MetaClient, assembleDatasheetPayload, TOOL_DEFINITIONS, VIRTUAL_LAB_TOOL_DEFINITIONS } from './lib/meta-client';
 import { verifyRailReading, checkContinuityReading, formatVolts, formatOhms, RAIL_SPECS } from './lib/electrical';
 import {
   parseEvidenceTranscript,
@@ -10,8 +10,22 @@ import {
   type ClassifiedEvidence,
   type ProbeMeasurement,
 } from './lib/diagnostic-parser';
-import { SIMULATED_CONTINUITY, SAMPLE_BOARDS, getBoard } from './data/samples';
+import { SAMPLE_BOARDS, getBoard } from './data/samples';
 import type { ClientMode } from './lib/meta-client';
+import {
+  createVirtualSession,
+  getReferenceBoard,
+  applyFaultToCircuit,
+  solveDcCircuit,
+  measureNodeVoltage,
+  measureEffectiveResistance,
+  assertGroundTruthIsolated,
+  scoreDiagnosis,
+  MAX_TOOL_CALLS,
+  type ProbeRecord,
+  type DiagnosisScore,
+  type FaultType,
+} from './lib/circuit-simulator';
 
 interface Diagnosis {
   evidence: ClassifiedEvidence;
@@ -23,16 +37,30 @@ interface StreamLine {
   text: string;
 }
 
-function continuityBetween(a: string, b: string): number {
-  const key = [a, b].sort().join('|');
-  return SIMULATED_CONTINUITY[key] ?? 12_000_000;
-}
+const FAULT_TYPE_OPTIONS: FaultType[] = [
+  'solder_bridge',
+  'shorted_component',
+  'open_circuit',
+  'parameter_drift',
+  'reverse_polarity_leakage',
+];
 
 export function App() {
   const [mode, setMode] = useState<ClientMode>('simulated');
   const client = useMemo(() => new MetaClient({ mode }), [mode]);
   const [boardId, setBoardId] = useState(SAMPLE_BOARDS[0]!.id);
   const board = getBoard(boardId) ?? SAMPLE_BOARDS[0]!;
+  const [faultSel, setFaultSel] = useState<string>('random');
+  const [runId, setRunId] = useState(0);
+  // Harness-side session: holds the faulted MNA circuit + withheld ground
+  // truth. The agent/model only ever sees `session.getAgentView()`.
+  const session = useMemo(
+    () => createVirtualSession(boardId, faultSel),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [boardId, faultSel, runId],
+  );
+  const referenceBoard = getReferenceBoard(boardId);
+  const truth = session.getGroundTruth();
   const [symptom, setSymptom] = useState(board.symptoms[0] ?? '');
   const [customDoc, setCustomDoc] = useState('');
   const [lines, setLines] = useState<StreamLine[]>([]);
@@ -42,21 +70,47 @@ export function App() {
   const [probeB, setProbeB] = useState<string | null>(null);
   const [probeArmed, setProbeArmed] = useState(true);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
+  const [probeLog, setProbeLog] = useState<ProbeRecord[]>([]);
+  const [toolsUsed, setToolsUsed] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [submitRef, setSubmitRef] = useState('');
+  const [submitFault, setSubmitFault] = useState<FaultType>('solder_bridge');
+  const [score, setScore] = useState<DiagnosisScore | null>(null);
 
   const selected = board.components.find((c) => c.ref === selectedRef) ?? null;
   const pointA = board.probePoints.find((p) => p.id === probeA) ?? null;
   const pointB = board.probePoints.find((p) => p.id === probeB) ?? null;
 
+  function syncSessionState() {
+    setProbeLog(session.getProbeLog());
+    setToolsUsed(session.getToolCallsUsed());
+  }
+
+  function resetLabState() {
+    setProbeA(null);
+    setProbeB(null);
+    setProbeLog([]);
+    setToolsUsed(0);
+    setRevealed(false);
+    setSubmitRef('');
+    setScore(null);
+    setDiagnosis(null);
+  }
+
   function switchBoard(id: string) {
     const next = getBoard(id);
     if (!next) return;
     setBoardId(id);
+    setFaultSel('random');
     setSymptom(next.symptoms[0] ?? '');
     setLines([]);
     setSelectedRef(null);
-    setProbeA(null);
-    setProbeB(null);
-    setDiagnosis(null);
+    resetLabState();
+  }
+
+  function switchFault(sel: string) {
+    setFaultSel(sel);
+    resetLabState();
   }
 
   function handleProbePoint(id: string) {
@@ -67,6 +121,175 @@ export function App() {
     } else {
       setProbeB(id);
     }
+  }
+
+  // Harness-side display solve: identical MNA math to the session, used for
+  // instant canvas meter readouts (not tool-counted, not scored evidence).
+  const displayBench = useMemo(() => {
+    if (!referenceBoard) return null;
+    try {
+      const faulted = truth ? applyFaultToCircuit(referenceBoard.nominal, truth) : referenceBoard.nominal;
+      return { faulted, solution: solveDcCircuit(faulted) };
+    } catch {
+      return null;
+    }
+  }, [referenceBoard, truth]);
+
+  function resolveNode(pad: string): string {
+    return session.resolveProbeNode(pad);
+  }
+
+  const meterVoltsA =
+    displayBench && probeA ? tryRead(() => measureNodeVoltage(displayBench.solution, resolveNode(probeA)).formatted) : null;
+
+  const meterContinuity =
+    displayBench && probeA && probeB
+      ? tryRead(() => {
+          const r = measureEffectiveResistance(
+            displayBench.faulted,
+            resolveNode(probeA),
+            resolveNode(probeB),
+            undefined,
+            { supplyMode: 'unpowered_unplugged' },
+          );
+          return { text: r.continuous ? `BEEP — ${r.formatted} SHORT` : `${r.formatted} OPEN`, fault: r.continuous };
+        })
+      : null;
+
+  function logVoltageProbe() {
+    if (!probeA) return;
+    try {
+      const rd = session.measureVoltage(probeA);
+      pushLine('k-rule-ok', `▸ [Simulated measurement (MNA)] ${probeA} = ${rd.formatted} (powered, vs GND)`);
+    } catch (err) {
+      pushLine('k-rule-bad', `⏚ Probe blocked: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    syncSessionState();
+  }
+
+  function logContinuityProbe() {
+    if (!probeA || !probeB) return;
+    try {
+      const rd = session.measureContinuity(probeA, probeB);
+      pushLine(
+        rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
+        `▸ [Simulated measurement (MNA)] ${probeA} ↔ ${probeB} = ${rd.formatted} ${rd.continuous ? '(SHORT — continuity beep)' : '(open)'}`,
+      );
+    } catch (err) {
+      pushLine('k-rule-bad', `⏚ Probe blocked: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    syncSessionState();
+  }
+
+  /** Budgeted scripted probe sweep (≤ MAX_TOOL_CALLS): spec rails first, then continuity on the first abnormal node. */
+  async function runVirtualSweep() {
+    setRunning(true);
+    try {
+      const view = session.getAgentView();
+      pushLine('k-reasoning', `▸ Virtual bench armed: ${view.boardName} · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`);
+      try {
+        assertGroundTruthIsolated(
+          { agentView: view, tools: VIRTUAL_LAB_TOOL_DEFINITIONS },
+          session.getGroundTruth(),
+        );
+        pushLine('k-rule-ok', '✓ Ground-truth isolation check passed — model context carries no fault id, target ref, or faulted values.');
+      } catch (err) {
+        pushLine('k-rule-bad', `⏚ Isolation breach: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      for (const spec of view.nominalSpecs) {
+        try {
+          const rd = session.measureVoltage(spec.node);
+          const abnormal = Math.abs(rd.volts - spec.nominalVolts) > Math.abs(spec.nominalVolts) * spec.toleranceFrac + 1e-9;
+          pushLine(
+            abnormal ? 'k-rule-bad' : 'k-rule-ok',
+            `▸ [Simulated measurement (MNA)] ${spec.node} = ${rd.formatted} (nominal ${spec.nominalVolts.toFixed(3)} V) — ${abnormal ? 'ABNORMAL' : 'nominal'}`,
+          );
+        } catch (err) {
+          pushLine('k-rule-bad', `⏚ Sweep stopped: ${err instanceof Error ? err.message : String(err)}`);
+          break;
+        }
+      }
+      const abnormal = session.getProbeLog().find((p) => p.abnormal);
+      if (abnormal) {
+        const others = view.nominalSpecs.map((s) => s.node).filter((n) => n !== abnormal.target);
+        for (const other of [`GND`, ...others].slice(0, 2)) {
+          try {
+            const rd = session.measureContinuity(abnormal.target, other);
+            pushLine(
+              rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
+              `▸ [Simulated measurement (MNA)] ${abnormal.target} ↔ ${other} = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ''}`,
+            );
+          } catch (err) {
+            pushLine('k-rule-bad', `⏚ Sweep stopped: ${err instanceof Error ? err.message : String(err)}`);
+            break;
+          }
+        }
+      } else {
+        pushLine('k-rule-ok', '▸ All probed rails nominal — no continuity follow-up indicated.');
+      }
+      pushLine('k-reasoning', '▸ Sweep evidence is logged below. Pick a suspect component + fault class, then Score diagnosis.');
+    } finally {
+      syncSessionState();
+      setRunning(false);
+    }
+  }
+
+  function submitDiagnosis() {
+    const gt = session.getGroundTruth();
+    if (!gt) {
+      pushLine('k-rule-ok', '▸ Nominal session: nothing to score — inject a hidden fault to evaluate a diagnosis.');
+      return;
+    }
+    const options = suspectOptions();
+    const submission = {
+      componentRef: submitRef || options[0]!,
+      faultType: submitFault,
+      verificationStatus: (probeLog.some((p) => p.abnormal) ? 'confirmed' : 'hypothesis') as 'confirmed' | 'hypothesis',
+    };
+    const result = scoreDiagnosis(submission, gt, session.getProbeLog());
+    setScore(result);
+    setRevealed(true);
+    pushLine(
+      result.totalScore >= 70 ? 'k-dx' : 'k-rule-bad',
+      `■ GROUND-TRUTH EVALUATION: ${result.totalScore}/100 — ${result.summary}`,
+    );
+    const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
+      point: p.target,
+      value: `[Simulated measurement (MNA)] ${p.detail ?? p.kind}`,
+      status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
+    }));
+    const evidence: ClassifiedEvidence = {
+      observedEvidence: [...board.symptoms],
+      probeMeasurements: measurements,
+      datasheetSpecs: board.datasheet.map((d) => ({ section: d.title, spec: d.title })),
+      hypotheses: [
+        {
+          claim: `Model-generated hypothesis: ${submission.componentRef} · ${submission.faultType}.`,
+          likelihood: result.evidenceConfirmed ? 'high' : 'medium',
+          falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
+        },
+      ],
+      nextVerificationSteps: ['Re-probe suspect nets on the virtual bench before rework.'],
+    };
+    setDiagnosis({
+      evidence,
+      verification: diagnosisVerificationStatus({
+        probeMeasurements: evidence.probeMeasurements,
+        hypotheses: evidence.hypotheses,
+      }),
+    });
+  }
+
+  function suspectOptions(): string[] {
+    const ids = new Set<string>();
+    for (const c of session.getAgentView().nominalComponents) ids.add(c.id);
+    for (const c of board.components) ids.add(c.ref);
+    return [...ids];
+  }
+
+  function pushLine(cls: string, text: string) {
+    setLines((prev) => [...prev, { cls, text }]);
   }
 
   async function runDiagnosis() {
@@ -190,8 +413,11 @@ export function App() {
     reader.readAsText(file);
   }
 
-  const meterOhms = pointA && pointB ? continuityBetween(pointA.id, pointB.id) : null;
-  const meterCont = meterOhms !== null ? checkContinuityReading(meterOhms) : null;
+  const faultOptions = referenceBoard
+    ? [{ value: 'nominal', label: 'Nominal / Healthy (no fault)' }, { value: 'random', label: 'Random Hidden Fault' }].concat(
+        referenceBoard.faults.map((f) => ({ value: f.faultId, label: `${f.faultId} (${f.faultType})` })),
+      )
+    : [];
 
   return (
     <div className="tf-app">
@@ -239,19 +465,106 @@ export function App() {
                 <button onClick={() => { setProbeA(null); setProbeB(null); }}>Clear probes</button>
               </div>
               <div style={{ marginTop: 8 }}>
-                A: {pointA ? `${pointA.label} = ${formatVolts(pointA.expectedVolts ?? 0)}` : '—'} · B:{' '}
-                {pointB ? `${pointB.label} = ${formatVolts(pointB.expectedVolts ?? 0)}` : '—'}
+                A: {pointA ? `${pointA.label} = ${meterVoltsA ?? '—'}` : '—'} · B:{' '}
+                {pointB ? `${pointB.label}` : '—'}
+                <span style={{ color: 'var(--ink-dim)' }}> · Simulated measurements (MNA)</span>
               </div>
-              {meterOhms !== null && meterCont && (
-                <div className={`reading ${meterCont.continuous ? 'fault' : ''}`} style={{ marginTop: 4 }}>
-                  {meterCont.continuous ? `BEEP — ${formatOhms(meterOhms)} SHORT` : `${formatOhms(meterOhms)} OPEN`}
+              {meterContinuity && (
+                <div className={`reading ${meterContinuity.fault ? 'fault' : ''}`} style={{ marginTop: 4 }}>
+                  {meterContinuity.text}
                 </div>
               )}
+              <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+                <button onClick={logVoltageProbe} disabled={!probeA || running}>Log voltage probe (A vs GND)</button>
+                <button onClick={logContinuityProbe} disabled={!probeA || !probeB || running}>Log continuity (A↔B)</button>
+              </div>
+              <div style={{ marginTop: 4, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)' }}>
+                Logged probes count against the tool budget ({toolsUsed}/{MAX_TOOL_CALLS} used).
+              </div>
             </div>
           </div>
         </div>
 
         <div className="tf-right">
+          <div className="tf-card">
+            <h3>VIRTUAL CIRCUIT LAB (MNA SOLVER) · HARDWARE-FREE</h3>
+            <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+              Hidden fault scenario:{' '}
+              <select value={faultSel} onChange={(e) => switchFault(e.target.value)} disabled={running}>
+                {faultOptions.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </label>
+            {faultSel === 'random' && (
+              <div style={{ marginTop: 6 }}>
+                <button onClick={() => { setRunId((n) => n + 1); resetLabState(); }} disabled={running}>
+                  Re-roll random fault
+                </button>
+              </div>
+            )}
+            <div className="tf-row" style={{ marginTop: 8 }}>
+              <button className="primary" onClick={runVirtualSweep} disabled={running}>
+                {running ? 'Probing…' : 'Run virtual probe sweep'}
+              </button>
+            </div>
+            <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 12 }}>
+              {truth ? (
+                revealed ? (
+                  <span>Ground-truth evaluation result: <strong>{truth.faultId}</strong> · {truth.faultType} @ {truth.targetComponentRef} — {truth.description}</span>
+                ) : (
+                  <span>Withheld Ground Truth 🔒 — fault injected, identity hidden during probing.{' '}
+                    <button onClick={() => setRevealed(true)}>Reveal</button>
+                  </span>
+                )
+              ) : (
+                <span>Nominal session — no fault injected (healthy board).</span>
+              )}
+            </div>
+            {probeLog.length > 0 && (
+              <div style={{ marginTop: 8 }}>
+                <h4 style={{ margin: '4px 0' }}>PROBE LOG · Simulated measurements (MNA)</h4>
+                <ul className="tf-ev-list">
+                  {probeLog.map((p, i) => (
+                    <li key={i}>
+                      <span className={p.abnormal ? 'tf-ev-chip warn' : 'tf-ev-chip ok'}>
+                        {p.abnormal ? 'abnormal' : p.kind}
+                      </span>{' '}
+                      <strong>{p.target}</strong> · {p.detail}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+              <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+                Suspect:{' '}
+                <select value={submitRef} onChange={(e) => setSubmitRef(e.target.value)}>
+                  <option value="">— pick —</option>
+                  {suspectOptions().map((o) => (
+                    <option key={o} value={o}>{o}</option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+                Fault class:{' '}
+                <select value={submitFault} onChange={(e) => setSubmitFault(e.target.value as FaultType)}>
+                  {FAULT_TYPE_OPTIONS.map((o) => (
+                    <option key={o} value={o}>{o}</option>
+                  ))}
+                </select>
+              </label>
+              <button className="primary" onClick={submitDiagnosis} disabled={running || !truth}>Score diagnosis</button>
+            </div>
+            {score && (
+              <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 12 }}>
+                <strong>Objective score: {score.totalScore}/100</strong>
+                <div>component {score.componentMatch ? 'MATCH' : 'MISS'} · fault-type {score.faultTypeMatch ? 'MATCH' : 'MISS'} · evidence {score.evidenceConfirmed ? 'CONFIRMED' : 'NOT confirmed'}</div>
+                <div>probes {score.probeCount} · efficiency {score.efficiencyScore} · {score.summary}</div>
+              </div>
+            )}
+          </div>
+
           <div className="tf-card">
             <h3>SYMPTOM INPUT · DATASHEET SELECTOR</h3>
             <select value={boardId} onChange={(e) => switchBoard(e.target.value)}>
@@ -302,9 +615,20 @@ export function App() {
             </ol>
             {board.rework.replacementPart && <p><strong>Replacement:</strong> {board.rework.replacementPart}</p>}
             <p><strong>Safety:</strong> {board.rework.safetyChecks.join(' · ')}</p>
+            <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)' }}>
+              Actual measurements · Datasheet specifications · Model-generated hypotheses · Verified faults · Recommended tests · Ground-truth evaluation results are kept distinct in the panels above.
+            </p>
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+function tryRead<T>(fn: () => T): T | null {
+  try {
+    return fn();
+  } catch {
+    return null;
+  }
 }
