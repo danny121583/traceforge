@@ -27,6 +27,152 @@ export type SegmentationMode = 'static_fixture' | 'simulated' | 'live_api';
 export type OperationalMode = 'LIVE_API' | 'SIMULATED' | 'STATIC_FIXTURE' | 'UNVERIFIED' | 'UNAVAILABLE';
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'max';
 
+/* ---------------------------------------------------------------------------
+ * Token / cost telemetry & promotional-credit budget ledger (Milestone B)
+ * ------------------------------------------------------------------------- */
+
+/** Promotional-credit baseline recorded 2026-10-26 (see AGENTS.md §8). */
+export const STARTING_PROMOTIONAL_BALANCE_USD = 147.26;
+/** Maximum authorized incremental consumption across coding agent + runtime. */
+export const AUTHORIZED_ADDITIONAL_BUDGET_USD = 100.0;
+/** Mandatory ending balance: starting balance minus authorized budget. */
+export const TARGET_RESERVE_USD = 47.26;
+/** Stop discretionary model usage at this incremental spend (keeps a $5 buffer). */
+export const BUDGET_SAFETY_THRESHOLD_USD = 95.0;
+/** Planned split: $60 implementation + $20 debugging/corrections. */
+export const CODING_AGENT_BUDGET_USD = 80.0;
+/** Planned split: $10 live runtime testing + $10 demo/contingency. */
+export const RUNTIME_TESTING_BUDGET_USD = 20.0;
+
+/** Conservative per-token live planning rates (USD per 1M tokens). */
+export const INPUT_COST_USD_PER_MTOKEN = 2.0;
+export const OUTPUT_COST_USD_PER_MTOKEN = 6.0;
+
+/** Default / maximum `max_tokens` per chat request (runaway-request guard). */
+export const DEFAULT_MAX_TOKENS = 1024;
+export const MAX_TOKENS_CAP = 1024;
+/** Bounded retry: at most one retry, transient 5xx only. */
+export const MAX_CHAT_RETRIES = 1;
+export const TRANSIENT_RETRY_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
+/** Per-attempt network timeout. Timeouts are not HTTP statuses: never retried. */
+export const CLIENT_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Conservative live-rate cost for a token-count pair. */
+export function estimateLiveCostUsd(inputTokens: number, outputTokens: number): number {
+  return (
+    (inputTokens / 1_000_000) * INPUT_COST_USD_PER_MTOKEN +
+    (outputTokens / 1_000_000) * OUTPUT_COST_USD_PER_MTOKEN
+  );
+}
+
+/** Clamp a requested `maxTokens` onto the runaway-request guard rail. */
+export function clampMaxTokens(requested?: number): number {
+  if (requested === undefined || !Number.isFinite(requested)) return DEFAULT_MAX_TOKENS;
+  return Math.min(Math.max(1, Math.floor(requested)), MAX_TOKENS_CAP);
+}
+
+/**
+ * Cumulative usage & cost ledger for one `MetaClient` lifetime.
+ *
+ * - `incurredCostUsd`: real spend — live-rate cost in `live` mode, always
+ *   `$0.00` in `simulated` mode (zero-cost development default).
+ * - `projectedLiveCostUsd`: what the session's tokens WOULD cost at live
+ *   rates, tracked in every mode so users see the exact projected live cost
+ *   of a simulated session before spending anything.
+ * - `estimatedCostUsd` / `runtimeConsumptionUsd` mirror `incurredCostUsd`
+ *   (conservative incurred-cost estimate / runtime API consumption).
+ * - `providerReportedUsage` is sticky: true once any call's tokens came from
+ *   the live API `usage` payload instead of local `estimateTokens`.
+ */
+export interface UsageTelemetry {
+  totalRequests: number;
+  failedRequests: number;
+  retriedRequests: number;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCostUsd: number;
+  providerReportedUsage: boolean;
+  runtimeConsumptionUsd: number;
+  codingAgentBudgetUsd: number;
+  incurredCostUsd: number;
+  projectedLiveCostUsd: number;
+}
+
+/** Zeroed ledger (keeps the informational coding-agent allocation). */
+export function emptyTelemetry(): UsageTelemetry {
+  return {
+    totalRequests: 0,
+    failedRequests: 0,
+    retriedRequests: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+    providerReportedUsage: false,
+    runtimeConsumptionUsd: 0,
+    codingAgentBudgetUsd: CODING_AGENT_BUDGET_USD,
+    incurredCostUsd: 0,
+    projectedLiveCostUsd: 0,
+  };
+}
+
+/** Budget-monitor snapshot derived from a `UsageTelemetry` ledger. */
+export interface CostLedgerSnapshot {
+  startingBalanceUsd: number;
+  authorizedBudgetUsd: number;
+  targetReserveUsd: number;
+  safetyThresholdUsd: number;
+  codingAgentBudgetUsd: number;
+  runtimeConsumptionUsd: number;
+  remainingBudgetUsd: number;
+  projectedReserveUsd: number;
+  safetyThresholdBreached: boolean;
+  reserveBreached: boolean;
+}
+
+/** Derive the promotional-credit budget snapshot for the UI banner. */
+export function buildCostLedger(telemetry: UsageTelemetry): CostLedgerSnapshot {
+  const runtimeConsumptionUsd = telemetry.runtimeConsumptionUsd;
+  const projectedReserveUsd = STARTING_PROMOTIONAL_BALANCE_USD - runtimeConsumptionUsd;
+  return {
+    startingBalanceUsd: STARTING_PROMOTIONAL_BALANCE_USD,
+    authorizedBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD,
+    targetReserveUsd: TARGET_RESERVE_USD,
+    safetyThresholdUsd: BUDGET_SAFETY_THRESHOLD_USD,
+    codingAgentBudgetUsd: telemetry.codingAgentBudgetUsd,
+    runtimeConsumptionUsd,
+    remainingBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD - runtimeConsumptionUsd,
+    projectedReserveUsd,
+    safetyThresholdBreached: runtimeConsumptionUsd >= BUDGET_SAFETY_THRESHOLD_USD,
+    reserveBreached: projectedReserveUsd < TARGET_RESERVE_USD,
+  };
+}
+
+/** Provider `usage` payload shape (`/chat/completions` and the local proxy). */
+export interface ProviderUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
+/** True when `err` is a transient HTTP 502/503/504 worth exactly one retry. */
+export function isRetryableChatError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // The proxy's key-missing 503 is a configuration state, never transient.
+  if (msg.includes('not configured on the local server proxy')) return false;
+  return /HTTP (502|503|504)\b/.test(msg);
+}
+
+/** Race a promise against a bounded timeout (timeouts are never retried). */
+function withRequestTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} request timed out after ${ms} ms.`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 /** JSON-schema subset used for tool parameter definitions. */
 export interface JsonSchema {
   type: 'object';
@@ -305,6 +451,8 @@ export interface ProxyChatResult {
   content: string;
   toolCalls: ToolCall[];
   model?: string;
+  /** Forwarded upstream token counts when the proxy observed them. */
+  usage?: ProviderUsage;
 }
 
 function isBrowserRuntime(): boolean {
@@ -414,6 +562,8 @@ export class MetaClient {
   private readonly proxyBaseUrl?: string;
   /** Set only after a verified real response arrives (gates `LIVE_API`). */
   private verifiedLiveApi = false;
+  /** Cumulative runtime ledger (Milestone B). */
+  private telemetry: UsageTelemetry = emptyTelemetry();
 
   constructor(options: MetaClientOptions = {}) {
     // SECURITY: `META_API_KEY` is read from the process environment ONLY on
@@ -480,6 +630,59 @@ export class MetaClient {
       samMode: this.samOperationalMode(),
       liveVerified: this.verifiedLiveApi,
     };
+  }
+
+  /** Cumulative usage & cost ledger snapshot (a copy; mutate via calls). */
+  getTelemetry(): UsageTelemetry {
+    return { ...this.telemetry };
+  }
+
+  /** Zero the cumulative ledger (keeps the coding-agent allocation). */
+  resetTelemetry(): void {
+    this.telemetry = emptyTelemetry();
+  }
+
+  /** Promotional-credit budget snapshot for the UI monitor banner. */
+  getCostLedger(): CostLedgerSnapshot {
+    return buildCostLedger(this.telemetry);
+  }
+
+  /**
+   * Fold one attempt's token counts into the ledger. `liveSpend` marks
+   * whether the tokens bill real money (`live` mode) or only project it
+   * (`simulated` mode: incurred stays `$0.00` while the projected live cost
+   * still accrues so users see exact session pricing before spending).
+   */
+  private accumulateTokens(
+    inputTokens: number,
+    outputTokens: number,
+    providerReported: boolean,
+    liveSpend: boolean,
+  ): void {
+    this.telemetry.inputTokens += inputTokens;
+    this.telemetry.outputTokens += outputTokens;
+    if (providerReported) this.telemetry.providerReportedUsage = true;
+    const liveCost = estimateLiveCostUsd(inputTokens, outputTokens);
+    this.telemetry.projectedLiveCostUsd += liveCost;
+    if (liveSpend) {
+      this.telemetry.incurredCostUsd += liveCost;
+      this.telemetry.estimatedCostUsd = this.telemetry.incurredCostUsd;
+      this.telemetry.runtimeConsumptionUsd = this.telemetry.incurredCostUsd;
+    }
+  }
+
+  /** Prefer provider `usage` counts; fall back to local estimates. */
+  private resolveUsage(
+    usage: ProviderUsage | undefined,
+    fallbackInput: number,
+    fallbackOutput: number,
+  ): { input: number; output: number; providerReported: boolean } {
+    const prompt = usage?.prompt_tokens;
+    const completion = usage?.completion_tokens;
+    if (typeof prompt === 'number' && Number.isFinite(prompt) && typeof completion === 'number' && Number.isFinite(completion)) {
+      return { input: Math.max(0, Math.floor(prompt)), output: Math.max(0, Math.floor(completion)), providerReported: true };
+    }
+    return { input: fallbackInput, output: fallbackOutput, providerReported: false };
   }
 
   /**
@@ -603,60 +806,136 @@ export class MetaClient {
     return [...DEFAULT_SIMULATED_TRACES];
   }
 
+  /**
+   * Chat completion with cumulative telemetry and bounded retry.
+   *
+   * - `maxTokens` is clamped to `MAX_TOKENS_CAP` (default 1024) so runaway
+   *   requests cannot occur.
+   * - At most one retry, only on transient HTTP 502/503/504. Never retried:
+   *   4xx/401/403, timeouts, and the proxy's key-missing 503 (a
+   *   configuration state, not a transient failure).
+   * - Every attempt folds input tokens into the ledger; successful attempts
+   *   add output tokens (provider `usage` counts when present).
+   */
   async chat(request: ChatRequest): Promise<ChatResponse> {
-    if (this.mode === 'simulated') return this.simulatedChat(request);
+    if (this.mode === 'simulated') {
+      const response = await this.simulatedChat(request);
+      this.telemetry.totalRequests += 1;
+      this.accumulateTokens(
+        estimateTokens(request.messages.map((m) => m.content).join('\n')),
+        estimateTokens(response.content),
+        false,
+        false,
+      );
+      return response;
+    }
+    const capped: ChatRequest = {
+      ...request,
+      model: request.model ?? this.model,
+      maxTokens: clampMaxTokens(request.maxTokens),
+    };
     const fetchFn = this.fetchFn ?? globalThis.fetch.bind(globalThis);
-    if (this.usesProxyRoute()) {
-      // Browser live mode: POST to the local server proxy WITHOUT any
-      // `Authorization` header. The proxy attaches `META_API_KEY`
-      // server-side and never echoes it back.
-      const res = await fetchFn(`${this.proxyBaseUrl}/chat`, {
+    let attempts = 0;
+    for (;;) {
+      attempts += 1;
+      try {
+        const response = this.usesProxyRoute()
+          ? await this.chatViaProxy(capped, fetchFn)
+          : await this.chatDirect(capped, fetchFn);
+        if (attempts > 1) this.telemetry.retriedRequests += 1;
+        this.telemetry.totalRequests += 1;
+        return response;
+      } catch (err) {
+        const mayRetry = attempts <= MAX_CHAT_RETRIES && isRetryableChatError(err);
+        if (!mayRetry) {
+          if (attempts > 1) this.telemetry.retriedRequests += 1;
+          this.telemetry.totalRequests += 1;
+          this.telemetry.failedRequests += 1;
+          throw err;
+        }
+        // Single bounded retry: loop once more.
+      }
+    }
+  }
+
+  /** Browser live mode: POST to the local server proxy WITHOUT any `Authorization` header. */
+  private async chatViaProxy(request: ChatRequest, fetchFn: FetchFn): Promise<ChatResponse> {
+    // The proxy attaches `META_API_KEY` server-side and never echoes it back.
+    const bodyText = JSON.stringify({
+      model: request.model ?? this.model,
+      messages: request.messages,
+      tools: request.tools,
+      responseFormat: request.responseFormat,
+      effort: request.effort,
+      maxTokens: request.maxTokens,
+    });
+    const res = await withRequestTimeout(
+      fetchFn(`${this.proxyBaseUrl}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: request.model ?? this.model,
-          messages: request.messages,
-          tools: request.tools,
-          responseFormat: request.responseFormat,
-          effort: request.effort,
-          maxTokens: request.maxTokens,
-        }),
-      });
-      if (res.status === 503) {
-        throw new Error('Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.');
-      }
-      if (!res.ok) throw new Error(`Meta Model API error: HTTP ${res.status}`);
-      const data = (await res.json()) as Partial<ProxyChatResult> & {
-        choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
-      };
-      const toolCalls: ToolCall[] = Array.isArray(data.toolCalls)
-        ? data.toolCalls
-        : (data.choices?.[0]?.message?.tool_calls ?? []).map((t) => ({
-            id: t.id,
-            name: t.function.name as ToolCall['name'],
-            arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
-          }));
-      this.verifiedLiveApi = true;
-      return {
-        model: request.model ?? this.model,
-        mode: 'live',
-        content: data.content ?? data.choices?.[0]?.message?.content ?? '',
-        toolCalls,
-        simulated: false,
-      };
+        body: bodyText,
+      }),
+      CLIENT_REQUEST_TIMEOUT_MS,
+      'Meta proxy',
+    );
+    if (res.status === 503) {
+      this.accumulateTokens(estimateTokens(bodyText), 0, false, true);
+      throw new Error('Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.');
     }
+    if (!res.ok) {
+      this.accumulateTokens(estimateTokens(bodyText), 0, false, true);
+      throw new Error(`Meta Model API error: HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as Partial<ProxyChatResult> & {
+      choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+    };
+    const toolCalls: ToolCall[] = Array.isArray(data.toolCalls)
+      ? data.toolCalls
+      : (data.choices?.[0]?.message?.tool_calls ?? []).map((t) => ({
+          id: t.id,
+          name: t.function.name as ToolCall['name'],
+          arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
+        }));
+    const content = data.content ?? data.choices?.[0]?.message?.content ?? '';
+    const usage = this.resolveUsage(
+      data.usage,
+      estimateTokens(bodyText),
+      estimateTokens(content + JSON.stringify(toolCalls)),
+    );
+    this.accumulateTokens(usage.input, usage.output, usage.providerReported, true);
+    this.verifiedLiveApi = true;
+    return {
+      model: request.model ?? this.model,
+      mode: 'live',
+      content,
+      toolCalls,
+      simulated: false,
+    };
+  }
+
+  /** Node/server live mode: direct upstream call with server-side Bearer [REDACTED] */
+  private async chatDirect(request: ChatRequest, fetchFn: FetchFn): Promise<ChatResponse> {
     const payload = buildToolCallPayload({ ...request, model: request.model ?? this.model });
-    const res = await fetchFn(`${this.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
-      },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) throw new Error(`Meta Model API error: HTTP ${res.status}`);
+    const bodyText = JSON.stringify(payload);
+    const res = await withRequestTimeout(
+      fetchFn(`${this.baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+        },
+        body: bodyText,
+      }),
+      CLIENT_REQUEST_TIMEOUT_MS,
+      'Meta Model API',
+    );
+    if (!res.ok) {
+      this.accumulateTokens(estimateTokens(bodyText), 0, false, true);
+      throw new Error(`Meta Model API error: HTTP ${res.status}`);
+    }
     const data = (await res.json()) as {
       choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+      usage?: ProviderUsage;
     };
     const message = data.choices?.[0]?.message;
     const toolCalls: ToolCall[] = (message?.tool_calls ?? []).map((t) => ({
@@ -664,11 +943,18 @@ export class MetaClient {
       name: t.function.name as ToolCall['name'],
       arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
     }));
+    const content = message?.content ?? '';
+    const usage = this.resolveUsage(
+      data.usage,
+      estimateTokens(bodyText),
+      estimateTokens(content + JSON.stringify(toolCalls)),
+    );
+    this.accumulateTokens(usage.input, usage.output, usage.providerReported, true);
     this.verifiedLiveApi = true;
     return {
       model: request.model ?? this.model,
       mode: 'live',
-      content: message?.content ?? '',
+      content,
       toolCalls,
       simulated: false,
     };

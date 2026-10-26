@@ -21,6 +21,59 @@ export const META_PROXY_SEGMENT_PATH = '/api/meta/segment';
 export const PROXY_KEY_MISSING_MESSAGE =
   'Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.';
 
+/** Default `max_tokens` applied when the caller omits it (runaway guard). */
+export const META_PROXY_DEFAULT_MAX_TOKENS = 1024;
+/** Hard ceiling: upstream `max_tokens` is always clamped to this value. */
+export const META_PROXY_MAX_TOKENS_CAP = 1024;
+/** Largest accepted JSON request body (bytes/chars); larger bodies get HTTP 413. */
+export const META_PROXY_MAX_BODY_BYTES = 256_000;
+/** Bounded upstream timeout; exceeded waits answer HTTP 504, never hang. */
+export const META_PROXY_UPSTREAM_TIMEOUT_MS = 30_000;
+
+export const PROXY_BODY_TOO_LARGE_MESSAGE =
+  `Meta proxy request body exceeds the ${META_PROXY_MAX_BODY_BYTES}-byte limit.`;
+
+/** Clamp a caller-supplied `maxTokens` onto the proxy guard rail. */
+export function clampProxyMaxTokens(requested: unknown): number {
+  if (typeof requested !== 'number' || !Number.isFinite(requested)) return META_PROXY_DEFAULT_MAX_TOKENS;
+  return Math.min(Math.max(1, Math.floor(requested)), META_PROXY_MAX_TOKENS_CAP);
+}
+
+/** Upstream token counts forwarded verbatim (never the API key). */
+export interface UpstreamUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
+/** Pick only finite numeric usage fields out of an upstream payload. */
+function pickUsage(value: unknown): UpstreamUsage | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const src = value as Record<string, unknown>;
+  const out: UpstreamUsage = {};
+  for (const key of ['prompt_tokens', 'completion_tokens', 'total_tokens'] as const) {
+    const v = src[key];
+    if (typeof v === 'number' && Number.isFinite(v)) out[key] = Math.max(0, Math.floor(v));
+  }
+  return out.prompt_tokens !== undefined || out.completion_tokens !== undefined || out.total_tokens !== undefined
+    ? out
+    : undefined;
+}
+
+/** Race an upstream call against the bounded proxy timeout. */
+function withUpstreamTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Meta Model API upstream request timed out after ${META_PROXY_UPSTREAM_TIMEOUT_MS} ms.`)),
+      META_PROXY_UPSTREAM_TIMEOUT_MS,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
 /** Minimal structural request (covers real dev-server requests and test doubles). */
 export interface ProxyRequest {
   method?: string;
@@ -58,12 +111,19 @@ function readApiKeyFromServerEnv(): string | undefined {
 }
 
 async function readJsonBody(req: ProxyRequest): Promise<unknown> {
-  if (req.body !== undefined) return req.body;
+  if (req.body !== undefined) {
+    const text = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+    if (text.length > META_PROXY_MAX_BODY_BYTES) throw new Error(PROXY_BODY_TOO_LARGE_MESSAGE);
+    return req.body;
+  }
   if (typeof req.on !== 'function') return undefined;
   const text = await new Promise<string>((resolve, reject) => {
     let acc = '';
     req.on!('data', (chunk) => {
       acc += String(chunk);
+      if (acc.length > META_PROXY_MAX_BODY_BYTES) {
+        reject(new Error(PROXY_BODY_TOO_LARGE_MESSAGE));
+      }
     });
     req.on!('end', () => resolve(acc));
     req.on!('error', (err) => reject(err instanceof Error ? err : new Error(String(err))));
@@ -131,21 +191,37 @@ export async function handleMetaProxyRequest(
       sendJson(res, 503, { error: PROXY_KEY_MISSING_MESSAGE });
       return true;
     }
-    const body = (await readJsonBody(req)) as ChatProxyBody & SegmentProxyBody & Record<string, unknown>;
+    let body: (ChatProxyBody & SegmentProxyBody & Record<string, unknown>) | undefined;
+    try {
+      body = (await readJsonBody(req)) as ChatProxyBody & SegmentProxyBody & Record<string, unknown>;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('exceeds')) {
+        // Oversized request body: refuse before touching the upstream API.
+        sendJson(res, 413, { error: message });
+        return true;
+      }
+      sendJson(res, 400, { error: message });
+      return true;
+    }
     try {
       if (path === META_PROXY_CHAT_PATH) {
-        const upstream = await fetchFn(`${baseUrl}/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify({
-            model: body?.model ?? 'muse-spark-1.3',
-            messages: body?.messages ?? [],
-            ...(body?.tools ? { tools: body.tools } : {}),
-            ...(body?.responseFormat === 'json' ? { response_format: { type: 'json_object' } } : {}),
-            ...(body?.effort ? { reasoning: { effort: body.effort } } : {}),
-            ...(body?.maxTokens ? { max_tokens: body.maxTokens } : {}),
+        // Runaway-request guard: always send a bounded `max_tokens`.
+        const maxTokens = clampProxyMaxTokens(body?.maxTokens);
+        const upstream = await withUpstreamTimeout(
+          fetchFn(`${baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify({
+              model: body?.model ?? 'muse-spark-1.3',
+              messages: body?.messages ?? [],
+              ...(body?.tools ? { tools: body.tools } : {}),
+              ...(body?.responseFormat === 'json' ? { response_format: { type: 'json_object' } } : {}),
+              ...(body?.effort ? { reasoning: { effort: body.effort } } : {}),
+              max_tokens: maxTokens,
+            }),
           }),
-        });
+        );
         if (!upstream.ok) {
           sendJson(res, 502, { error: `Meta Model API error: HTTP ${upstream.status}` });
           return true;
@@ -157,8 +233,12 @@ export async function handleMetaProxyRequest(
               tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
             };
           }>;
+          usage?: unknown;
         };
         const message = data.choices?.[0]?.message;
+        // Fresh object with known fields only: the key is never echoed, and
+        // provider token counts ride along in `usage` when present.
+        const usage = pickUsage(data.usage);
         sendJson(res, 200, {
           content: message?.content ?? '',
           toolCalls: (message?.tool_calls ?? []).map((t) => ({
@@ -167,14 +247,17 @@ export async function handleMetaProxyRequest(
             arguments: JSON.parse(t.function.arguments || '{}'),
           })),
           model: body?.model ?? 'muse-spark-1.3',
+          ...(usage ? { usage } : {}),
         });
         return true;
       }
-      const upstream = await fetchFn(`${baseUrl}/v1/responses`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: 'sam-3.1', input: body?.image ?? {} }),
-      });
+      const upstream = await withUpstreamTimeout(
+        fetchFn(`${baseUrl}/v1/responses`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: 'sam-3.1', input: body?.image ?? {} }),
+        }),
+      );
       if (!upstream.ok) {
         sendJson(res, 502, { error: `SAM 3.1 segmentation error: HTTP ${upstream.status}` });
         return true;
@@ -186,7 +269,12 @@ export async function handleMetaProxyRequest(
       });
       return true;
     } catch (err) {
-      sendJson(res, 502, { error: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes('timed out')) {
+        sendJson(res, 504, { error: message });
+        return true;
+      }
+      sendJson(res, 502, { error: message });
       return true;
     }
   }

@@ -1,8 +1,19 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Header } from './components/Header';
 import { PcbCanvas } from './components/PcbCanvas';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
-import { MetaClient, assembleDatasheetPayload, TOOL_DEFINITIONS, VIRTUAL_LAB_TOOL_DEFINITIONS } from './lib/meta-client';
+import {
+  AUTHORIZED_ADDITIONAL_BUDGET_USD,
+  BUDGET_SAFETY_THRESHOLD_USD,
+  MetaClient,
+  STARTING_PROMOTIONAL_BALANCE_USD,
+  TARGET_RESERVE_USD,
+  assembleDatasheetPayload,
+  buildCostLedger,
+  TOOL_DEFINITIONS,
+  VIRTUAL_LAB_TOOL_DEFINITIONS,
+} from './lib/meta-client';
+import { runAgenticDiagnosis, type AgentStep } from './lib/diagnostic-agent';
 import { verifyRailReading, checkContinuityReading, formatVolts, formatOhms, RAIL_SPECS } from './lib/electrical';
 import {
   parseEvidenceTranscript,
@@ -11,7 +22,7 @@ import {
   type ProbeMeasurement,
 } from './lib/diagnostic-parser';
 import { SAMPLE_BOARDS, getBoard } from './data/samples';
-import type { ClientMode } from './lib/meta-client';
+import type { ClientMode, UsageTelemetry } from './lib/meta-client';
 import {
   createVirtualSession,
   getReferenceBoard,
@@ -45,9 +56,59 @@ const FAULT_TYPE_OPTIONS: FaultType[] = [
   'reverse_polarity_leakage',
 ];
 
+function fmtUsd(n: number): string {
+  return `$${n.toFixed(n > 0 && n < 0.01 ? 4 : 2)}`;
+}
+
+/**
+ * Promotional-credit & budget monitor banner (Milestone D). All figures come
+ * from the shared ledger constants plus the live `UsageTelemetry` snapshot —
+ * never hardcoded per-render guesses.
+ */
+export function BudgetMonitor({ telemetry }: { telemetry: UsageTelemetry }) {
+  const ledger = buildCostLedger(telemetry);
+  return (
+    <div className="tf-card" style={{ margin: '12px 18px 0' }}>
+      <h3>PROMOTIONAL CREDIT &amp; BUDGET MONITOR</h3>
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontFamily: 'var(--mono)', fontSize: 11 }}>
+        <span className="tf-chip">Starting balance: <strong>{fmtUsd(STARTING_PROMOTIONAL_BALANCE_USD)}</strong></span>
+        <span className="tf-chip">Authorized budget: <strong>{fmtUsd(AUTHORIZED_ADDITIONAL_BUDGET_USD)}</strong></span>
+        <span className="tf-chip">Target reserve: <strong>{fmtUsd(TARGET_RESERVE_USD)}</strong></span>
+        <span className="tf-chip">Safety threshold: <strong>{fmtUsd(BUDGET_SAFETY_THRESHOLD_USD)}</strong></span>
+        <span className={ledger.safetyThresholdBreached ? 'tf-chip unavailable' : 'tf-chip sim'}>
+          Runtime API incurred: <strong>{fmtUsd(telemetry.incurredCostUsd)}</strong>
+        </span>
+        <span className="tf-chip">
+          Session tokens: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
+          {' '}· Projected live cost: <strong>{fmtUsd(telemetry.projectedLiveCostUsd)}</strong>
+          {telemetry.providerReportedUsage ? ' (provider-reported)' : ' (local estimate)'}
+        </span>
+        <span className="tf-chip">
+          Requests: <strong>{telemetry.totalRequests}</strong>
+          {' '}· Retried: <strong>{telemetry.retriedRequests}</strong>
+          {' '}· Failed: <strong>{telemetry.failedRequests}</strong>
+        </span>
+        <span className="tf-chip">Remaining budget: <strong>{fmtUsd(ledger.remainingBudgetUsd)}</strong></span>
+      </div>
+    </div>
+  );
+}
+
+function agentStepClass(step: AgentStep): string {
+  if (step.kind === 'tool_call') return 'k-tool';
+  if (step.kind === 'tool_result') return step.summary.includes('ERROR') ? 'k-rule-bad' : 'k-rule-ok';
+  if (step.summary.includes('Submitting evidence-backed diagnosis')) return 'k-dx';
+  return 'k-reasoning';
+}
+
 export function App() {
   const [mode, setMode] = useState<ClientMode>('simulated');
   const client = useMemo(() => new MetaClient({ mode }), [mode]);
+  const [telemetry, setTelemetry] = useState<UsageTelemetry>(() => client.getTelemetry());
+  // A mode toggle builds a fresh client with a fresh ledger — re-sync.
+  useEffect(() => {
+    setTelemetry(client.getTelemetry());
+  }, [client]);
   const [boardId, setBoardId] = useState(SAMPLE_BOARDS[0]!.id);
   const board = getBoard(boardId) ?? SAMPLE_BOARDS[0]!;
   const [faultSel, setFaultSel] = useState<string>('random');
@@ -229,6 +290,78 @@ export function App() {
         pushLine('k-rule-ok', '▸ All probed rails nominal — no continuity follow-up indicated.');
       }
       pushLine('k-reasoning', '▸ Sweep evidence is logged below. Pick a suspect component + fault class, then Score diagnosis.');
+    } finally {
+      syncSessionState();
+      setRunning(false);
+    }
+  }
+
+  /**
+   * One-click autonomous AI investigation (Milestone D/E): runs
+   * `runAgenticDiagnosis` end-to-end on the current board/fault, streams
+   * each turn into the diagnostic stream, unlocks the withheld ground
+   * truth, and populates the objective scoreboard + classified evidence.
+   */
+  async function runAgentInvestigation() {
+    setRunning(true);
+    setLines([]);
+    try {
+      const view = session.getAgentView();
+      pushLine('k-reasoning', `▸ Autonomous investigation armed: ${view.boardName} · Muse Spark 1.3 (${client.mode}) · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`);
+      const run = await runAgenticDiagnosis(session, client, {
+        onStep: (step) => pushLine(agentStepClass(step), step.summary),
+      });
+      syncSessionState();
+      setTelemetry(client.getTelemetry());
+      const gt = session.getGroundTruth();
+      if (gt && run.score) {
+        setScore(run.score);
+        setRevealed(true);
+        pushLine(
+          run.score.totalScore >= 70 ? 'k-dx' : 'k-rule-bad',
+          `■ AGENTIC GROUND-TRUTH EVALUATION [${run.operationalMode}]: ${run.score.totalScore}/100 — ${run.score.summary}`,
+        );
+        pushLine(
+          'k-cite',
+          `■ AGENT VERDICT: ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} (${run.proposedDiagnosis.verificationStatus}) — ${run.proposedDiagnosis.explanation}`,
+        );
+      } else {
+        pushLine('k-rule-ok', `▸ Nominal session: agent reports healthy — ${run.proposedDiagnosis.explanation}`);
+      }
+      const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
+        point: p.target,
+        value: `[Simulated measurement (MNA)] ${p.detail ?? p.kind}`,
+        status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
+      }));
+      const evidence: ClassifiedEvidence = {
+        observedEvidence: [view.symptom],
+        probeMeasurements: measurements,
+        datasheetSpecs: view.nominalSpecs.map((s) => ({
+          section: `Nominal spec ${s.node}`,
+          spec: `${s.nominalVolts.toFixed(3)} V ±${(s.toleranceFrac * 100).toFixed(0)}%`,
+        })),
+        hypotheses: [
+          {
+            claim: `Agentic diagnosis (Muse Spark 1.3, ${run.operationalMode}): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`,
+            likelihood: run.proposedDiagnosis.verificationStatus === 'confirmed' ? 'high' : 'medium',
+            falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
+          },
+        ],
+        nextVerificationSteps: [
+          `Turns used: ${run.turns}; probes logged: ${session.getProbeLog().length}.`,
+          'Re-probe suspect nets on the virtual bench before rework.',
+        ],
+      };
+      setDiagnosis({
+        evidence,
+        verification: diagnosisVerificationStatus({
+          probeMeasurements: evidence.probeMeasurements,
+          hypotheses: evidence.hypotheses,
+        }),
+      });
+    } catch (err) {
+      pushLine('k-rule-bad', `⏚ Investigation failed: ${err instanceof Error ? err.message : String(err)}`);
+      setTelemetry(client.getTelemetry());
     } finally {
       syncSessionState();
       setRunning(false);
@@ -421,7 +554,8 @@ export function App() {
 
   return (
     <div className="tf-app">
-      <Header client={client} onToggleMode={() => setMode((m) => (m === 'live' ? 'simulated' : 'live'))} />
+      <Header client={client} onToggleMode={() => setMode((m) => (m === 'live' ? 'simulated' : 'live'))} telemetry={telemetry} />
+      <BudgetMonitor telemetry={telemetry} />
       <div className="tf-main">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
           <PcbCanvas
@@ -508,6 +642,15 @@ export function App() {
                 {running ? 'Probing…' : 'Run virtual probe sweep'}
               </button>
             </div>
+            <div className="tf-row" style={{ marginTop: 8 }}>
+              <button className="primary" onClick={runAgentInvestigation} disabled={running}>
+                {running ? 'Investigating…' : 'Run Autonomous AI Investigation (Muse Spark 1.3)'}
+              </button>
+            </div>
+            <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)', marginTop: 8 }}>
+              Board overlays run as STATIC_FIXTURE (KiCad reference geometry) — live SAM 3.1 calls are deferred,
+              so 100% of the live runtime budget is reserved for Muse Spark 1.3 circuit reasoning.
+            </p>
             <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 12 }}>
               {truth ? (
                 revealed ? (

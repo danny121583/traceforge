@@ -1,4 +1,4 @@
-import type { MetaClient, OperationalMode } from '../lib/meta-client';
+import type { MetaClient, OperationalMode, UsageTelemetry } from '../lib/meta-client';
 
 const MODE_LABEL: Record<OperationalMode, string> = {
   LIVE_API: 'Live API',
@@ -15,7 +15,9 @@ function chipClass(mode: OperationalMode): string {
   return 'tf-chip unavailable';
 }
 
-export function Header({ client, onToggleMode }: { client: MetaClient; onToggleMode: () => void }) {
+export function Header(
+  { client, onToggleMode, telemetry }: { client: MetaClient; onToggleMode: () => void; telemetry?: UsageTelemetry },
+) {
   const s = client.status();
   return (
     <header className="tf-header">
@@ -31,6 +33,17 @@ export function Header({ client, onToggleMode }: { client: MetaClient; onToggleM
         <span className={chipClass(s.samMode)} title="SAM 3.1 segmentation capability mode">
           Segmentation: <strong>{s.samMode === 'STATIC_FIXTURE' ? 'Static Fixture (KiCad)' : MODE_LABEL[s.samMode]}</strong>
         </span>
+        {telemetry && (
+          <span
+            className={s.sparkMode === 'LIVE_API' ? 'tf-chip live' : 'tf-chip sim'}
+            title="Session token telemetry: input / output tokens, incurred vs projected live cost"
+          >
+            Tokens: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
+            {' '}· Cost: <strong>${telemetry.incurredCostUsd.toFixed(2)} incurred (${telemetry.projectedLiveCostUsd.toFixed(4)} projected)</strong>
+            {' '}· Req: <strong>{telemetry.totalRequests}</strong>
+            {' '}· Retry: <strong>{telemetry.retriedRequests}</strong>
+          </span>
+        )}
         <button onClick={onToggleMode} title="Toggle live / simulated mode">
           {s.mode === 'live' ? 'Go simulated' : 'Go live'}
         </button>
