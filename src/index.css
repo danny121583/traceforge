@@ -31,6 +31,7 @@ body {
 .tf-header {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 16px;
   padding: 10px 18px;
   background: var(--panel);
@@ -83,10 +84,11 @@ body {
   color: var(--ink-dim);
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
 }
 
-.tf-canvas-wrap { position: relative; flex: 1; min-height: 420px; background: #0a0c10; }
+.tf-canvas-wrap { position: relative; flex: 1; min-height: 340px; background: #0a0c10; }
 .tf-canvas-wrap svg { display: block; width: 100%; height: 100%; cursor: grab; }
 .tf-canvas-tools { display: flex; gap: 6px; margin-left: auto; }
 
@@ -214,10 +216,121 @@ button:disabled { opacity: 0.45; cursor: default; }
 .tf-ev-chip.mute { color: var(--ink-dim); }
 .tf-falsify { font-family: var(--mono); font-size: 11px; color: var(--cyan); margin-top: 2px; }
 
-@media (max-width: 960px) {
-  .tf-main { grid-template-columns: 1fr; }
+.sr-only, .tf-card .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+
+/* Guided 3-step flow */
+.tf-steps {
+  display: flex;
+  gap: 8px;
+  list-style: none;
+  margin: 12px 18px 0;
+  padding: 0;
 }
+.tf-steps li {
+  flex: 1;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink-dim);
+}
+.tf-steps li.current { border-color: var(--accent); color: var(--ink); }
+.tf-steps li.done { border-color: var(--ok); }
+.tf-steps li.todo { opacity: 0.75; }
+.tf-step-num {
+  font-family: var(--mono);
+  font-weight: 700;
+  font-size: 13px;
+  min-width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-2);
+}
+.tf-steps li.current .tf-step-num { border-color: var(--accent); color: var(--accent); }
+.tf-steps li.done .tf-step-num { border-color: var(--ok); color: var(--ok); }
+.tf-step-text { display: flex; flex-direction: column; gap: 2px; font-size: 12px; }
+.tf-step-text strong { font-family: var(--mono); font-size: 12px; }
+
+.tf-tagline {
+  display: block;
+  font-family: var(--sans);
+  font-weight: 400;
+  font-size: 12px;
+  letter-spacing: 0;
+  color: var(--ink-dim);
+  margin-top: 2px;
+}
+
+.tf-step h4 {
+  margin: 12px 0 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-dim);
+}
+
+.tf-board-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.tf-board-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  white-space: normal;
+}
+.tf-board-card strong { font-family: var(--mono); font-size: 12px; }
+.tf-board-symptom { font-family: var(--sans); font-size: 12px; color: var(--ink-dim); }
+.tf-board-card.selected { border-color: var(--accent); }
+
+.tf-checklist { margin: 10px 0 0; padding-left: 22px; color: var(--ink-dim); font-size: 13px; }
+.tf-checklist li { margin-bottom: 6px; }
+
+.tf-note { font-size: 13px; color: var(--ink-dim); }
+.tf-card details summary { cursor: pointer; font-family: var(--mono); font-size: 12px; color: var(--cyan); }
+
+.tf-tech-drawer { margin: 0 18px 18px; }
+.tf-tech-drawer summary { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); cursor: pointer; }
+.tf-tech-drawer .tf-card { border: none; background: transparent; padding: 12px 0 0; margin: 0; }
+
+.tf-advanced-tools summary { font-family: var(--mono); font-size: 12px; color: var(--ink-dim); cursor: pointer; }
+.tf-advanced-tools h4 {
+  margin: 12px 0 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-dim);
+}
+.tf-meter-inner {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.tf-meter-inner .reading { font-size: 20px; color: var(--ok); }
+.tf-meter-inner .reading.fault { color: var(--fault); }
 
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+}
+
+@media (max-width: 960px) {
+  .tf-main { grid-template-columns: minmax(0, 1fr); padding: 10px 12px; }
+  .tf-steps { flex-direction: column; margin: 10px 12px 0; }
+  .tf-tech-drawer { margin: 0 12px 12px; }
+  .tf-chip { white-space: normal; }
+  .tf-board-cards { grid-template-columns: minmax(0, 1fr); }
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Header } from './components/Header';
 import { PcbCanvas } from './components/PcbCanvas';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
@@ -37,6 +37,16 @@ import {
   type DiagnosisScore,
   type FaultType,
 } from './lib/circuit-simulator';
+import {
+  aiModeBadge,
+  formatActivitySummary,
+  getActiveStep,
+  isInvestigationComplete,
+  plainSymptomForBoard,
+  primaryWorkflowAction,
+  reworkWithheldReason,
+  shouldShowRework,
+} from './lib/guided-ux';
 
 interface Diagnosis {
   evidence: ClassifiedEvidence;
@@ -140,6 +150,13 @@ export function App() {
   const [submitRef, setSubmitRef] = useState('');
   const [submitFault, setSubmitFault] = useState<FaultType>('solder_bridge');
   const [score, setScore] = useState<DiagnosisScore | null>(null);
+  const [agentVerdict, setAgentVerdict] = useState<{
+    componentRef: string;
+    faultType: string;
+    verificationStatus: string;
+    explanation: string;
+    operationalMode: string;
+  } | null>(null);
 
   const selected = board.components.find((c) => c.ref === selectedRef) ?? null;
   const pointA = board.probePoints.find((p) => p.id === probeA) ?? null;
@@ -159,6 +176,7 @@ export function App() {
     setSubmitRef('');
     setScore(null);
     setDiagnosis(null);
+    setAgentVerdict(null);
   }
 
   function switchBoard(id: string) {
@@ -174,6 +192,15 @@ export function App() {
 
   function switchFault(sel: string) {
     setFaultSel(sel);
+    resetLabState();
+  }
+
+  /** Post-run reset: re-roll a fresh hidden fault so another investigation can start immediately. */
+  function tryAnotherFault() {
+    setFaultSel('random');
+    setRunId((n) => n + 1);
+    setLines([]);
+    setSelectedRef(null);
     resetLabState();
   }
 
@@ -331,6 +358,13 @@ export function App() {
       } else {
         pushLine('k-rule-ok', `▸ Nominal session: agent reports healthy — ${run.proposedDiagnosis.explanation}`);
       }
+      setAgentVerdict({
+        componentRef: run.proposedDiagnosis.componentRef,
+        faultType: run.proposedDiagnosis.faultType,
+        verificationStatus: run.proposedDiagnosis.verificationStatus,
+        explanation: run.proposedDiagnosis.explanation,
+        operationalMode: run.operationalMode,
+      });
       const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
         point: p.target,
         value: `[Simulated measurement (MNA)] ${p.detail ?? p.kind}`,
@@ -371,6 +405,18 @@ export function App() {
     }
   }
 
+  // Zero-cost browser-QA auto-run: `?autorun=1` triggers one simulated
+  // investigation on mount. Guarded to simulated mode so it never makes a
+  // live API call; the ref keeps StrictMode double-effects to a single run.
+  const autorunFired = useRef(false);
+  useEffect(() => {
+    if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('autorun') === '1' && mode === 'simulated' && !autorunFired.current) {
+      autorunFired.current = true;
+      void runAgentInvestigation();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   function submitDiagnosis() {
     const gt = session.getGroundTruth();
     if (!gt) {
@@ -386,6 +432,13 @@ export function App() {
     const result = scoreDiagnosis(submission, gt, session.getProbeLog());
     setScore(result);
     setRevealed(true);
+    setAgentVerdict({
+      componentRef: submission.componentRef,
+      faultType: submission.faultType,
+      verificationStatus: submission.verificationStatus,
+      explanation: `Manual suspect scored ${result.totalScore}/100 — ${result.summary}`,
+      operationalMode: client.status().sparkMode,
+    });
     pushLine(
       result.totalScore >= 70 ? 'k-dx' : 'k-rule-bad',
       `■ GROUND-TRUTH EVALUATION: ${result.totalScore}/100 — ${result.summary}`,
@@ -555,12 +608,102 @@ export function App() {
       )
     : [];
 
+  // Guided 3-step flow state (pure rules live in src/lib/guided-ux.ts).
+  const complete = isInvestigationComplete({ diagnosis, score });
+  const hasActivity = lines.length > 0 || probeLog.length > 0;
+  const activeStep = getActiveStep({ running, complete, hasActivity });
+  const primaryAction = primaryWorkflowAction({ running, complete });
+  const sparkStatus = client.status();
+  const modeBadge = aiModeBadge(sparkStatus.sparkMode);
+  const activitySummary = formatActivitySummary(probeLog);
+  const verificationStatus = diagnosis?.verification.status ?? null;
+  const showRework = shouldShowRework({ complete, verificationStatus });
+  const isHealthy = !truth;
+  const reworkNote = reworkWithheldReason({ complete, isHealthy, verificationStatus });
+  const scoreMatch = score ? score.componentMatch && score.faultTypeMatch : false;
+
+  const GUIDE_STEPS = [
+    { n: 1 as const, title: 'Choose Circuit', desc: 'Select a sample circuit with a secretly injected fault' },
+    { n: 2 as const, title: 'Investigate', desc: 'Watch the AI probe test points and measure the circuit' },
+    { n: 3 as const, title: 'Review Results', desc: 'Compare the AI diagnosis against the hidden fault' },
+  ];
+
   return (
     <div className="tf-app">
-      <Header client={client} onToggleMode={() => setMode((m) => (m === 'live' ? 'simulated' : 'live'))} telemetry={telemetry} />
-      <BudgetMonitor telemetry={telemetry} />
+      <Header client={client} onToggleMode={() => setMode((m) => (m === 'live' ? 'simulated' : 'live'))} />
+      <ol className="tf-steps" aria-label="Guided diagnostic steps">
+        {GUIDE_STEPS.map((s) => (
+          <li
+            key={s.n}
+            className={s.n === activeStep ? 'current' : s.n < activeStep ? 'done' : 'todo'}
+            aria-current={s.n === activeStep ? 'step' : undefined}
+          >
+            <span className="tf-step-num">{s.n}</span>
+            <span className="tf-step-text">
+              <strong>Step {s.n}: {s.title}</strong>
+              <span>{s.desc}</span>
+            </span>
+          </li>
+        ))}
+      </ol>
       <div className="tf-main">
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+          <section className="tf-card tf-step" aria-label="Step 1: Choose circuit">
+            <h3>STEP 1 · CHOOSE CIRCUIT</h3>
+            <div className="tf-board-cards">
+              {SAMPLE_BOARDS.map((b) => (
+                <button
+                  key={b.id}
+                  className={b.id === boardId ? 'tf-board-card selected' : 'tf-board-card'}
+                  aria-pressed={b.id === boardId}
+                  onClick={() => switchBoard(b.id)}
+                  disabled={running}
+                >
+                  <strong>{b.name}</strong>
+                  <span className="tf-board-symptom">{plainSymptomForBoard(b.id, b.symptoms[0] ?? '')}</span>
+                  <span className="tf-chip">Example circuit · Virtual testing</span>
+                </button>
+              ))}
+            </div>
+            <div className="tf-row">
+              <label className="sr-only" style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+                Select circuit:{' '}
+                <select aria-label="Select circuit" className="sr-only" value={boardId} onChange={(e) => switchBoard(e.target.value)} disabled={running}>
+                  {SAMPLE_BOARDS.map((b) => (
+                    <option key={b.id} value={b.id}>{b.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+                Fault scenario:{' '}
+                <select value={faultSel} onChange={(e) => switchFault(e.target.value)} disabled={running}>
+                  {faultOptions.map((o) => (
+                    <option key={o.value} value={o.value}>{o.label}</option>
+                  ))}
+                </select>
+              </label>
+              {faultSel === 'random' && (
+                <button onClick={() => { setRunId((n) => n + 1); resetLabState(); }} disabled={running}>
+                  Re-roll random fault
+                </button>
+              )}
+            </div>
+            <p className="tf-note">
+              TraceForge secretly introduces a hidden electrical fault into the virtual circuit.
+              The AI must find it using measurements alone.
+            </p>
+            <p className="tf-note">Reported symptom: {symptom}</p>
+            <details>
+              <summary>How it works</summary>
+              <p className="tf-note">
+                TraceForge is a virtual electronics workbench. First, pick a practice circuit —
+                we secretly add one hidden electrical fault to it. Next, the AI investigates:
+                it looks at the board layout, picks test points, and uses a virtual multimeter
+                to measure voltages and continuity. Finally, compare the AI diagnosis against
+                the hidden fault to see whether it found the right cause.
+              </p>
+            </details>
+          </section>
           <PcbCanvas
             board={board}
             selectedRef={selectedRef}
@@ -594,7 +737,119 @@ export function App() {
                 <span style={{ color: 'var(--ink-dim)' }}>Click a component overlay to inspect part number + pinout.</span>
               )}
             </div>
-            <div className="tf-meter">
+          </div>
+        </div>
+
+        <div className="tf-right">
+          <section className="tf-card tf-step" aria-label="Step 2: Investigate">
+            <h3>STEP 2 · INVESTIGATE</h3>
+            {primaryAction && (
+              <div className="tf-row">
+                <button className="primary" onClick={runAgentInvestigation} disabled={primaryAction.disabled || running}>
+                  {primaryAction.label}
+                </button>
+              </div>
+            )}
+            {!complete && !hasActivity && !running && (
+              <ol className="tf-checklist">
+                <li>AI inspects the circuit layout and reported symptom</li>
+                <li>AI selects test points and virtual multimeter measures voltages &amp; continuity</li>
+                <li>AI updates its hypothesis and identifies the likely fault</li>
+              </ol>
+            )}
+            {(running || hasActivity) && (
+              <>
+                {activitySummary.length > 0 && (
+                  <>
+                    <h4>Activity Summary</h4>
+                    <ul className="tf-ev-list">
+                      {activitySummary.map((s, i) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                <h4>Investigation Activity</h4>
+                <div className="tf-stream">
+                  {lines.length === 0 && <span className="k-reasoning">Probing the virtual bench — measurements will stream here.</span>}
+                  {lines.filter((l) => l.text.trim()).map((l, i) => (
+                    <div key={i} className={l.cls}>{l.text.replace('__stream__', '')}</div>
+                  ))}
+                </div>
+              </>
+            )}
+            {complete && (
+              <p className="tf-note">Investigation finished — see Step 3 for the diagnosis and ground-truth comparison.</p>
+            )}
+          </section>
+          <section className="tf-card tf-step" aria-label="Step 3: Review results">
+            <h3>STEP 3 · REVIEW RESULTS</h3>
+            {!complete ? (
+              <p className="tf-note">{reworkNote}</p>
+            ) : (
+              <>
+                <h4>Investigation Results</h4>
+                {truth && agentVerdict ? (
+                  <div>
+                    <p>
+                      <strong>Identified Fault:</strong> {agentVerdict.componentRef} · {agentVerdict.faultType}{' '}
+                      <span className={agentVerdict.verificationStatus === 'confirmed' ? 'tf-chip live' : 'tf-chip unverified'}>
+                        {agentVerdict.verificationStatus === 'confirmed'
+                          ? 'Confirmed by Electrical Measurement'
+                          : 'Unverified Hypothesis — Not Confirmed'}
+                      </span>
+                    </p>
+                    <p className="tf-note">{agentVerdict.explanation}</p>
+                  </div>
+                ) : (
+                  <p className="tf-note">No fault identified — the board was reported healthy.</p>
+                )}
+                <h4>Ground-Truth Verification</h4>
+                {truth ? (
+                  revealed ? (
+                    <div>
+                      <p>
+                        Hidden fault was <strong>{truth.faultId}</strong> · {truth.faultType} @ {truth.targetComponentRef} — {truth.description}
+                      </p>
+                      <p>
+                        <span className={scoreMatch ? 'tf-chip live' : 'tf-chip unverified'}>
+                          {scoreMatch ? 'Diagnosis Correct — Matched Hidden Fault' : 'Diagnosis Mismatch'}
+                        </span>
+                      </p>
+                      {score && (
+                        <p className="tf-note">
+                          Objective score: {score.totalScore}/100 · component {score.componentMatch ? 'MATCH' : 'MISS'} ·{' '}
+                          fault-type {score.faultTypeMatch ? 'MATCH' : 'MISS'} · evidence{' '}
+                          {score.evidenceConfirmed ? 'CONFIRMED' : 'NOT confirmed'} · probes {score.probeCount} ·{' '}
+                          efficiency {score.efficiencyScore} · {score.summary}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="tf-note">Withheld Ground Truth 🔒 — fault injected, identity hidden during probing.</p>
+                  )
+                ) : (
+                  <p className="tf-note">Nominal session — no fault was injected (healthy board).</p>
+                )}
+                <h4>Session Telemetry Summary</h4>
+                <p className="tf-note">
+                  Virtual probes used: {probeLog.length}/{MAX_TOOL_CALLS} ·{' '}
+                  <span className={modeBadge.className}>{modeBadge.label}</span> ·{' '}
+                  Est. AI cost: {fmtUsd(telemetry.projectedLiveCostUsd)} (incurred {fmtUsd(telemetry.incurredCostUsd)})
+                </p>
+                <div className="tf-row">
+                  <button className="primary" onClick={tryAnotherFault} disabled={running}>
+                    Try another fault
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
+
+          <details className="tf-card tf-advanced-tools">
+            <summary>Advanced Tools &amp; Manual Bench Controls</summary>
+            <h4>Manual Multimeter Probing</h4>
+            <div className="tf-meter-inner">
               <div>
                 <button className={probeArmed ? 'active' : ''} onClick={() => setProbeArmed((v) => !v)}>
                   {probeArmed ? 'Probes: ARMED (click pads)' : 'Probes: OFF'}
@@ -619,42 +874,14 @@ export function App() {
                 Logged probes count against the tool budget ({toolsUsed}/{MAX_TOOL_CALLS} used).
               </div>
             </div>
-          </div>
-        </div>
-
-        <div className="tf-right">
-          <div className="tf-card">
-            <h3>VIRTUAL CIRCUIT LAB (MNA SOLVER) · HARDWARE-FREE</h3>
-            <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
-              Hidden fault scenario:{' '}
-              <select value={faultSel} onChange={(e) => switchFault(e.target.value)} disabled={running}>
-                {faultOptions.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
-            </label>
-            {faultSel === 'random' && (
-              <div style={{ marginTop: 6 }}>
-                <button onClick={() => { setRunId((n) => n + 1); resetLabState(); }} disabled={running}>
-                  Re-roll random fault
-                </button>
-              </div>
-            )}
-            <div className="tf-row" style={{ marginTop: 8 }}>
-              <button className="primary" onClick={runVirtualSweep} disabled={running}>
+            <h4>Virtual Probe Sweep</h4>
+            <div className="tf-row">
+              <button onClick={runVirtualSweep} disabled={running}>
                 {running ? 'Probing…' : 'Run virtual probe sweep'}
               </button>
             </div>
-            <div className="tf-row" style={{ marginTop: 8 }}>
-              <button className="primary" onClick={runAgentInvestigation} disabled={running}>
-                {running ? 'Investigating…' : 'Run Autonomous AI Investigation (Muse Spark 1.3)'}
-              </button>
-            </div>
-            <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)', marginTop: 8 }}>
-              Board overlays run as STATIC_FIXTURE (KiCad reference geometry) — live SAM 3.1 calls are deferred,
-              so 100% of the live runtime budget is reserved for Muse Spark 1.3 circuit reasoning.
-            </p>
-            <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 12 }}>
+            <h4>Ground Truth (Manual Reveal)</h4>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
               {truth ? (
                 revealed ? (
                   <span>Ground-truth evaluation result: <strong>{truth.faultId}</strong> · {truth.faultType} @ {truth.targetComponentRef} — {truth.description}</span>
@@ -667,22 +894,8 @@ export function App() {
                 <span>Nominal session — no fault injected (healthy board).</span>
               )}
             </div>
-            {probeLog.length > 0 && (
-              <div style={{ marginTop: 8 }}>
-                <h4 style={{ margin: '4px 0' }}>PROBE LOG · Simulated measurements (MNA)</h4>
-                <ul className="tf-ev-list">
-                  {probeLog.map((p, i) => (
-                    <li key={i}>
-                      <span className={p.abnormal ? 'tf-ev-chip warn' : 'tf-ev-chip ok'}>
-                        {p.abnormal ? 'abnormal' : p.kind}
-                      </span>{' '}
-                      <strong>{p.target}</strong> · {p.detail}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <h4>Manual Suspect Scoring</h4>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
               <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
                 Suspect:{' '}
                 <select value={submitRef} onChange={(e) => setSubmitRef(e.target.value)}>
@@ -700,25 +913,9 @@ export function App() {
                   ))}
                 </select>
               </label>
-              <button className="primary" onClick={submitDiagnosis} disabled={running || !truth}>Score diagnosis</button>
+              <button onClick={submitDiagnosis} disabled={running || !truth}>Score diagnosis</button>
             </div>
-            {score && (
-              <div style={{ marginTop: 8, fontFamily: 'var(--mono)', fontSize: 12 }}>
-                <strong>Objective score: {score.totalScore}/100</strong>
-                <div>component {score.componentMatch ? 'MATCH' : 'MISS'} · fault-type {score.faultTypeMatch ? 'MATCH' : 'MISS'} · evidence {score.evidenceConfirmed ? 'CONFIRMED' : 'NOT confirmed'}</div>
-                <div>probes {score.probeCount} · efficiency {score.efficiencyScore} · {score.summary}</div>
-              </div>
-            )}
-          </div>
-
-          <div className="tf-card">
-            <h3>SYMPTOM INPUT · DATASHEET SELECTOR</h3>
-            <select value={boardId} onChange={(e) => switchBoard(e.target.value)}>
-              {SAMPLE_BOARDS.map((b) => (
-                <option key={b.id} value={b.id}>{b.name}</option>
-              ))}
-            </select>
-            <div style={{ height: 8 }} />
+            <h4>Custom Symptom &amp; Datasheet Upload</h4>
             <textarea value={symptom} onChange={(e) => setSymptom(e.target.value)} aria-label="Symptom input" />
             <div className="tf-row">
               <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
@@ -731,42 +928,63 @@ export function App() {
               </label>
             </div>
             {customDoc && <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--cyan)' }}>Custom doc loaded ({customDoc.length} chars).</div>}
+            <h4>Legacy Datasheet Analysis</h4>
             <div className="tf-row">
-              <button className="primary" onClick={runDiagnosis} disabled={running}>
-                {running ? 'Diagnosing…' : 'Run diagnosis'}
+              <button onClick={runDiagnosis} disabled={running}>
+                {running ? 'Diagnosing…' : 'Run datasheet analysis'}
               </button>
               <button onClick={() => setLines([])} disabled={running}>Clear stream</button>
             </div>
-          </div>
+          </details>
 
-          <div className="tf-card">
-            <h3>LIVE DIAGNOSTIC STREAM · MUSE SPARK 1.3</h3>
-            <div className="tf-stream">
-              {lines.length === 0 && <span className="k-reasoning">Awaiting run — symptom + datasheet context will stream here.</span>}
-              {lines.filter((l) => l.text.trim()).map((l, i) => (
-                <div key={i} className={l.cls}>{l.text.replace('__stream__', '')}</div>
-              ))}
-            </div>
-          </div>
-
-          {diagnosis && (
+          {complete && diagnosis && (
             <DiagnosticPanel boardName={board.name} evidence={diagnosis.evidence} verification={diagnosis.verification} />
           )}
 
-          <div className="tf-card tf-rework">
-            <h3>REWORK GUIDANCE CARD</h3>
-            <div className="temp">{board.rework.ironTempC} °C · {board.rework.tip}</div>
-            <ol>
-              {board.rework.steps.map((s, i) => <li key={i}>{s}</li>)}
-            </ol>
-            {board.rework.replacementPart && <p><strong>Replacement:</strong> {board.rework.replacementPart}</p>}
-            <p><strong>Safety:</strong> {board.rework.safetyChecks.join(' · ')}</p>
-            <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)' }}>
-              Actual measurements · Datasheet specifications · Model-generated hypotheses · Verified faults · Recommended tests · Ground-truth evaluation results are kept distinct in the panels above.
-            </p>
-          </div>
+          {showRework ? (
+            <div className="tf-card tf-rework">
+              <h3>REWORK GUIDANCE CARD</h3>
+              <div className="temp">{board.rework.ironTempC} °C · {board.rework.tip}</div>
+              <ol>
+                {board.rework.steps.map((s, i) => <li key={i}>{s}</li>)}
+              </ol>
+              {board.rework.replacementPart && <p><strong>Replacement:</strong> {board.rework.replacementPart}</p>}
+              <p><strong>Safety:</strong> {board.rework.safetyChecks.join(' · ')}</p>
+              <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)' }}>
+                Actual measurements · Datasheet specifications · Model-generated hypotheses · Verified faults · Recommended tests · Ground-truth evaluation results are kept distinct in the panels above.
+              </p>
+            </div>
+          ) : (
+            complete && (
+              <div className="tf-card tf-rework">
+                <h3>REWORK GUIDANCE CARD</h3>
+                <p className="tf-note">{reworkNote}</p>
+              </div>
+            )
+          )}
         </div>
       </div>
+      <details className="tf-card tf-tech-drawer">
+        <summary>Technology, Telemetry &amp; Budget Details (Development / Hackathon Verification)</summary>
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontFamily: 'var(--mono)', fontSize: 11 }}>
+          <span className="tf-chip">Model: <strong>Muse Spark 1.3 ({sparkStatus.model})</strong></span>
+          <span className="tf-chip">Context: <strong>1M Tokens</strong></span>
+          <span className="tf-chip">Segmentation: <strong>Static Fixture (KiCad)</strong></span>
+          <span className={modeBadge.className}><strong>{modeBadge.label}</strong></span>
+          <span className="tf-chip">
+            Tokens: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
+            {' '}· Cost: <strong>${telemetry.incurredCostUsd.toFixed(2)} incurred (${telemetry.projectedLiveCostUsd.toFixed(4)} projected)</strong>
+            {' '}· Req: <strong>{telemetry.totalRequests}</strong>
+            {' '}· Retry: <strong>{telemetry.retriedRequests}</strong>
+            {' '}· Failed: <strong>{telemetry.failedRequests}</strong>
+          </span>
+        </div>
+        <p className="tf-note">
+          Board overlays run as STATIC_FIXTURE (KiCad reference geometry) — live SAM 3.1 calls are deferred,
+          so 100% of the live runtime budget is reserved for Muse Spark 1.3 circuit reasoning.
+        </p>
+        <BudgetMonitor telemetry={telemetry} />
+      </details>
     </div>
   );
 }

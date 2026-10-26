@@ -36,7 +36,7 @@ export function PcbCanvas({ board, selectedRef, probeA, probeB, probeArmed, segm
   return (
     <div className="tf-pane">
       <div className="tf-pane-head">
-        <span>{board.name} — SAM 3.1 overlay</span>
+        <span>{board.name} — Interactive Circuit Layout</span>
         <span className="tf-chip" title="Segmentation source: fixture masks are not live model output">
           {segmentationMode === 'live_api' ? 'Live SAM 3.1' : 'Static Fixture (KiCad)'}
         </span>
