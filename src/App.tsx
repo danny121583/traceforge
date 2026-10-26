@@ -67,28 +67,28 @@ function fmtUsd(n: number): string {
  */
 export function BudgetMonitor({ telemetry }: { telemetry: UsageTelemetry }) {
   const ledger = buildCostLedger(telemetry);
+  const tokenSource = telemetry.providerReportedUsage ? '(tokens: provider-reported)' : '(tokens: local estimate)';
   return (
     <div className="tf-card" style={{ margin: '12px 18px 0' }}>
       <h3>PROMOTIONAL CREDIT &amp; BUDGET MONITOR</h3>
       <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontFamily: 'var(--mono)', fontSize: 11 }}>
-        <span className="tf-chip">Starting balance: <strong>{fmtUsd(STARTING_PROMOTIONAL_BALANCE_USD)}</strong></span>
+        <span className="tf-chip">Last observed balance: <strong>{fmtUsd(STARTING_PROMOTIONAL_BALANCE_USD)} (unverified snapshot)</strong></span>
         <span className="tf-chip">Authorized budget: <strong>{fmtUsd(AUTHORIZED_ADDITIONAL_BUDGET_USD)}</strong></span>
         <span className="tf-chip">Target reserve: <strong>{fmtUsd(TARGET_RESERVE_USD)}</strong></span>
         <span className="tf-chip">Safety threshold: <strong>{fmtUsd(BUDGET_SAFETY_THRESHOLD_USD)}</strong></span>
         <span className={ledger.safetyThresholdBreached ? 'tf-chip unavailable' : 'tf-chip sim'}>
-          Runtime API incurred: <strong>{fmtUsd(telemetry.incurredCostUsd)}</strong>
+          Est. runtime API cost (unverified): <strong>{fmtUsd(telemetry.incurredCostUsd)}</strong>
         </span>
         <span className="tf-chip">
-          Session tokens: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
-          {' '}· Projected live cost: <strong>{fmtUsd(telemetry.projectedLiveCostUsd)}</strong>
-          {telemetry.providerReportedUsage ? ' (provider-reported)' : ' (local estimate)'}
+          Session tokens {tokenSource}: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
+          {' '}· Est. live cost (unverified local rate estimate): <strong>{fmtUsd(telemetry.projectedLiveCostUsd)}</strong>
         </span>
         <span className="tf-chip">
           Requests: <strong>{telemetry.totalRequests}</strong>
           {' '}· Retried: <strong>{telemetry.retriedRequests}</strong>
           {' '}· Failed: <strong>{telemetry.failedRequests}</strong>
         </span>
-        <span className="tf-chip">Remaining budget: <strong>{fmtUsd(ledger.remainingBudgetUsd)}</strong></span>
+        <span className="tf-chip">Est. remaining budget (unverified): <strong>{fmtUsd(ledger.remainingBudgetUsd)}</strong></span>
       </div>
     </div>
   );
@@ -103,7 +103,10 @@ function agentStepClass(step: AgentStep): string {
 
 export function App() {
   const [mode, setMode] = useState<ClientMode>('simulated');
-  const client = useMemo(() => new MetaClient({ mode }), [mode]);
+  // SAM 3.1 is deferred per AGENTS.md §8b: board overlays always run as a
+  // STATIC_FIXTURE, so toggling 'Go live' for Muse Spark 1.3 reasoning must
+  // never flip the segmentation badge to LIVE_API/UNVERIFIED.
+  const client = useMemo(() => new MetaClient({ mode, segmentationMode: 'static_fixture' }), [mode]);
   const [telemetry, setTelemetry] = useState<UsageTelemetry>(() => client.getTelemetry());
   // A mode toggle builds a fresh client with a fresh ledger — re-sync.
   useEffect(() => {

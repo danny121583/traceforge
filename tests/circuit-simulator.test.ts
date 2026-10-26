@@ -497,7 +497,7 @@ describe('AI transparency modes (OperationalMode)', () => {
       const client = new MetaClient({
         mode: 'live',
         fetchFn: async (url, init) => {
-          calls.push({ url, headers: init.headers, body: init.body });
+          calls.push({ url, headers: init.headers, body: init.body ?? '' });
           return { ok: true, status: 200, json: async () => ({ content: 'proxied', toolCalls: [] }) };
         },
       });
@@ -521,7 +521,7 @@ describe('AI transparency modes (OperationalMode)', () => {
     try {
       const client = new MetaClient({
         mode: 'live',
-        fetchFn: async () => ({ ok: false, status: 503, json: async () => ({}) }),
+        fetchFn: async () => ({ ok: false, status: 503, json: async () => ({ error: PROXY_KEY_MISSING_MESSAGE }) }),
       });
       await expect(client.chat({ messages: [{ role: 'user', content: 'hi' }] })).rejects.toThrow(
         /not configured on the local server proxy/,

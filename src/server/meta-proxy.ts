@@ -110,6 +110,264 @@ function readApiKeyFromServerEnv(): string | undefined {
   return key && key.length > 0 ? key : undefined;
 }
 
+/**
+ * Safely parse `tool_calls[].function.arguments`: returns `{}` on invalid
+ * JSON and passes already-parsed objects through untouched.
+ */
+export function safeParseToolArguments(args: unknown): Record<string, unknown> {
+  if (args === null || args === undefined) return {};
+  if (typeof args === 'object') return args as Record<string, unknown>;
+  if (typeof args !== 'string') return {};
+  if (args.trim() === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(args);
+    return parsed !== null && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+interface NormalizedToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+/** One normalized assistant `tool_calls` entry in OpenAI wire shape. */
+function normalizeOneToolCall(t: unknown): NormalizedToolCall | null {
+  if (!t || typeof t !== 'object') return null;
+  const rec = t as Record<string, unknown>;
+  const fn = rec['function'];
+  if (fn !== null && typeof fn === 'object') {
+    // Already OpenAI-wrapped: re-stringify object arguments, keep strings.
+    const fnRec = fn as Record<string, unknown>;
+    const raw = fnRec['arguments'];
+    const args = typeof raw === 'string' ? raw : JSON.stringify((raw ?? {}) as Record<string, unknown>);
+    return {
+      id: typeof rec['id'] === 'string' ? (rec['id'] as string) : '',
+      type: 'function',
+      function: { name: typeof fnRec['name'] === 'string' ? (fnRec['name'] as string) : '', arguments: args },
+    };
+  }
+  // Internal ToolCall shape: { id, name, arguments }.
+  const raw = rec['arguments'];
+  const args = typeof raw === 'string' ? raw : JSON.stringify((raw ?? {}) as Record<string, unknown>);
+  return {
+    id: typeof rec['id'] === 'string' ? (rec['id'] as string) : '',
+    type: 'function',
+    function: { name: typeof rec['name'] === 'string' ? (rec['name'] as string) : '', arguments: args },
+  };
+}
+
+/**
+ * Normalize assistant `tool_calls` to OpenAI Chat Completions wire shape:
+ * `{ id, type: 'function', function: { name, arguments: '<json>' } }`.
+ * Accepts internal `{ id, name, arguments }` items and already-wrapped
+ * items alike.
+ */
+export function normalizeProxyToolCalls(toolCalls: unknown): NormalizedToolCall[] {
+  if (!Array.isArray(toolCalls)) return [];
+  const out: NormalizedToolCall[] = [];
+  for (const t of toolCalls) {
+    const n = normalizeOneToolCall(t);
+    if (n) out.push(n);
+  }
+  return out;
+}
+
+export interface NormalizedTool {
+  type: 'function';
+  function: { name: string; description: string; parameters: unknown };
+}
+
+/**
+ * Normalize `tools` so the upstream payload ALWAYS wraps every tool as
+ * `{ type: 'function', function: { name, description, parameters } }`,
+ * whether callers sent flat `{ name, description, parameters }` items or
+ * already-wrapped OpenAI items.
+ */
+export function normalizeProxyTools(tools: unknown): NormalizedTool[] | undefined {
+  if (tools === undefined || tools === null) return undefined;
+  if (!Array.isArray(tools)) return undefined;
+  return tools.map((t) => {
+    if (t !== null && typeof t === 'object') {
+      const rec = t as Record<string, unknown>;
+      const fn = rec['function'];
+      if (fn !== null && typeof fn === 'object') {
+        const fnRec = fn as Record<string, unknown>;
+        return {
+          type: 'function' as const,
+          function: {
+            name: typeof fnRec['name'] === 'string' ? (fnRec['name'] as string) : '',
+            description: typeof fnRec['description'] === 'string' ? (fnRec['description'] as string) : '',
+            parameters: fnRec['parameters'],
+          },
+        };
+      }
+      return {
+        type: 'function' as const,
+        function: {
+          name: typeof rec['name'] === 'string' ? (rec['name'] as string) : '',
+          description: typeof rec['description'] === 'string' ? (rec['description'] as string) : '',
+          parameters: rec['parameters'],
+        },
+      };
+    }
+    return { type: 'function' as const, function: { name: '', description: '', parameters: undefined } };
+  });
+}
+
+export interface NormalizedMessage {
+  role: string;
+  content: string;
+  tool_call_id?: string;
+  tool_calls?: NormalizedToolCall[];
+}
+
+/**
+ * Normalize chat messages to OpenAI Chat Completions wire shape:
+ * assistant `tool_calls` in internal `{ id, name, arguments }` shape are
+ * serialized to `{ id, type: 'function', function: { name, arguments } }`,
+ * and assistant `content` defaults to `''` when null/undefined (the API
+ * requires a string or null when tool calls are present; `''` is safest).
+ */
+export function normalizeProxyMessages(messages: unknown): NormalizedMessage[] {
+  if (!Array.isArray(messages)) return [];
+  return messages.map((m) => {
+    if (!m || typeof m !== 'object') return { role: 'user', content: '' };
+    const rec = m as Record<string, unknown>;
+    const role = typeof rec['role'] === 'string' ? (rec['role'] as string) : 'user';
+    let content: string;
+    if (rec['content'] === null || rec['content'] === undefined) {
+      content = role === 'assistant' ? '' : '';
+    } else if (typeof rec['content'] === 'string') {
+      content = rec['content'] as string;
+    } else {
+      try {
+        content = JSON.stringify(rec['content']);
+      } catch {
+        content = '';
+      }
+    }
+    const out: NormalizedMessage = { role, content };
+    if (typeof rec['tool_call_id'] === 'string') out.tool_call_id = rec['tool_call_id'] as string;
+    if (rec['tool_calls'] !== undefined) out.tool_calls = normalizeProxyToolCalls(rec['tool_calls']);
+    return out;
+  });
+}
+
+/** Pull a human-readable message out of an upstream error payload. */
+export function extractUpstreamErrorMessage(body: unknown): string {
+  if (!body || typeof body !== 'object') {
+    return typeof body === 'string' ? body : '';
+  }
+  const rec = body as Record<string, unknown>;
+  const err = rec['error'];
+  if (typeof err === 'string') return err;
+  if (err !== null && typeof err === 'object') {
+    const msg = (err as Record<string, unknown>)['message'];
+    if (typeof msg === 'string') return msg;
+  }
+  if (typeof rec['message'] === 'string') return rec['message'] as string;
+  return '';
+}
+
+/** Scrub the API key out of an error string in case it ever appears. */
+export function scrubApiKeyFromText(text: string, apiKey: string | undefined): string {
+  if (!apiKey || apiKey.length === 0) return text;
+  return text.split(apiKey).join('[REDACTED]');
+}
+
+/**
+ * Parse a `.env` file body for `META_API_KEY=<value>`: strips optional
+ * quotes/whitespace and ignores comments and other lines.
+ */
+export function parseDotEnvApiKey(text: string): string | undefined {
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim().replace(/^\uFEFF/, '');
+    if (!line || line.startsWith('#')) continue;
+    const match = line.match(/^META_API_KEY\s*=\s*(.*)$/);
+    if (!match) continue;
+    let value = (match[1] ?? '').trim();
+    if (value.startsWith('"') || value.startsWith("'")) {
+      const quote = value[0]!;
+      const end = value.indexOf(quote, 1);
+      value = end !== -1 ? value.slice(1, end) : value.slice(1);
+    } else {
+      const hash = value.indexOf('#');
+      if (hash !== -1) value = value.slice(0, hash).trim();
+    }
+    value = value.trim();
+    if (value.length > 0) return value;
+    // Present-but-empty: never cache — keep scanning, resolve as missing.
+  }
+  return undefined;
+}
+
+/**
+ * Best-effort live `.env` read (Node server side only). Uses a dynamic
+ * `node:fs` import so browser bundles never resolve it; any failure
+ * resolves to `undefined` (zero-cost mode) instead of throwing.
+ */
+async function readDotEnvApiKey(): Promise<string | undefined> {
+  try {
+    const proc = (globalThis as { process?: { cwd?: () => string } }).process;
+    if (!proc || typeof proc.cwd !== 'function') return undefined;
+    let fs: { readFileSync?: (path: string, encoding: string) => string } | undefined;
+    try {
+      // Indirect dynamic import: the specifier never appears as a static
+      // module reference, so browser type-checks/bundles never resolve
+      // `node:fs` (no @types/node needed) and non-Node runtimes just fail
+      // into the catch below.
+      const dynamicImport = new Function('spec', 'return import(spec)') as (
+        spec: string,
+      ) => Promise<unknown>;
+      const mod = (await dynamicImport('node:fs')) as
+        | { readFileSync?: (path: string, encoding: string) => string; default?: { readFileSync?: (path: string, encoding: string) => string } };
+      fs = mod.default ?? mod;
+    } catch {
+      return undefined;
+    }
+    if (!fs || typeof fs.readFileSync !== 'function') return undefined;
+    const cwd = proc.cwd();
+    const dotenvPath = `${cwd.replace(/\/$/, '')}/.env`;
+    let text: string;
+    try {
+      text = fs.readFileSync(dotenvPath, 'utf8');
+    } catch {
+      return undefined;
+    }
+    return parseDotEnvApiKey(text);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Resolve the effective server API key WITHOUT caching: explicit override
+ * first, then `process.env.META_API_KEY`, then a fresh `.env` read — so if
+ * the owner drops `META_API_KEY` into `.env` while the Vite server is
+ * already running, the very next `/api/meta/status` or `/api/meta/chat`
+ * request picks it up immediately. Never resolves to an empty string.
+ */
+export async function resolveServerApiKey(
+  explicitGetApiKey?: () => string | undefined,
+): Promise<string | undefined> {
+  // An explicitly provided getter is authoritative (even when it resolves to
+  // missing) so test doubles stay hermetic; only when NO getter is provided
+  // — the real Vite middleware path — do we consult process.env and `.env`.
+  if (explicitGetApiKey) {
+    const explicit = explicitGetApiKey();
+    return explicit && explicit.length > 0 ? explicit : undefined;
+  }
+  const fromEnv = readApiKeyFromServerEnv();
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  const fromDotEnv = await readDotEnvApiKey();
+  return fromDotEnv && fromDotEnv.length > 0 ? fromDotEnv : undefined;
+}
+
 async function readJsonBody(req: ProxyRequest): Promise<unknown> {
   if (req.body !== undefined) {
     const text = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
@@ -144,11 +402,34 @@ function sendJson(res: ProxyResponse, status: number, payload: Record<string, un
 
 interface ChatProxyBody {
   model?: string;
-  messages?: Array<{ role: string; content: string }>;
+  messages?: Array<{ role: string; content?: unknown; tool_calls?: unknown; tool_call_id?: unknown }>;
   tools?: unknown[];
   responseFormat?: 'text' | 'json';
   effort?: string;
+  /** Top-level passthrough (preferred upstream wire key). */
+  reasoning_effort?: string;
+  /** Legacy nested shape — resolved, never forwarded (upstream answers HTTP 400). */
+  reasoning?: { effort?: string };
   maxTokens?: number;
+}
+
+/**
+ * Resolve the concise-thinking effort for POST /api/meta/chat from any
+ * accepted caller shape: `effort`, top-level `reasoning_effort`, or the
+ * legacy nested `reasoning: { effort }`. Returns `undefined` when none is
+ * supplied (both wire keys are then omitted upstream).
+ */
+export function resolveProxyEffort(body: ChatProxyBody | undefined): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const direct = body.effort;
+  if (typeof direct === 'string' && direct.length > 0) return direct;
+  const flat = body.reasoning_effort;
+  if (typeof flat === 'string' && flat.length > 0) return flat;
+  const nested = body.reasoning;
+  if (nested && typeof nested === 'object' && typeof nested.effort === 'string' && nested.effort.length > 0) {
+    return nested.effort;
+  }
+  return undefined;
 }
 
 interface SegmentProxyBody {
@@ -169,7 +450,10 @@ export async function handleMetaProxyRequest(
   if (path !== META_PROXY_STATUS_PATH && path !== META_PROXY_CHAT_PATH && path !== META_PROXY_SEGMENT_PATH) {
     return false;
   }
-  const apiKey = env?.getApiKey ? env.getApiKey() : readApiKeyFromServerEnv();
+  // Resolved fresh on EVERY request (never cached): explicit override, then
+  // `process.env.META_API_KEY`, then a live `.env` read — so a key dropped
+  // into `.env` while the Vite server runs takes effect on the next request.
+  const apiKey = await resolveServerApiKey(env?.getApiKey);
   const baseUrl = (env?.baseUrl ?? 'https://api.meta.ai/v1').replace(/\/$/, '');
   const fetchFn: UpstreamFetch =
     env?.fetchFn ??
@@ -208,29 +492,49 @@ export async function handleMetaProxyRequest(
       if (path === META_PROXY_CHAT_PATH) {
         // Runaway-request guard: always send a bounded `max_tokens`.
         const maxTokens = clampProxyMaxTokens(body?.maxTokens);
+        // Normalize to OpenAI Chat Completions wire shape: flat tools get
+        // wrapped, and internal-shape assistant tool_calls get serialized.
+        const normalizedTools = normalizeProxyTools(body?.tools);
+        const normalizedMessages = normalizeProxyMessages(body?.messages ?? []);
+        // Meta's OpenAI-compatible endpoint requires top-level
+        // `reasoning_effort` and rejects `reasoning` with HTTP 400, so the
+        // nested shape is resolved here and NEVER forwarded upstream.
+        const effort = resolveProxyEffort(body);
         const upstream = await withUpstreamTimeout(
           fetchFn(`${baseUrl}/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
             body: JSON.stringify({
               model: body?.model ?? 'muse-spark-1.3',
-              messages: body?.messages ?? [],
-              ...(body?.tools ? { tools: body.tools } : {}),
+              messages: normalizedMessages,
+              ...(normalizedTools ? { tools: normalizedTools } : {}),
               ...(body?.responseFormat === 'json' ? { response_format: { type: 'json_object' } } : {}),
-              ...(body?.effort ? { reasoning: { effort: body.effort } } : {}),
+              ...(effort ? { reasoning_effort: effort } : {}),
               max_tokens: maxTokens,
             }),
           }),
         );
         if (!upstream.ok) {
-          sendJson(res, 502, { error: `Meta Model API error: HTTP ${upstream.status}` });
+          // Forward the upstream status verbatim for 400..599 (a 400/401/403
+          // is a client/auth error, NOT a retryable 502) plus any upstream
+          // error detail — scrubbed of the key in case it ever appears.
+          const status = upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502;
+          let detail = '';
+          try {
+            detail = extractUpstreamErrorMessage(await upstream.json());
+          } catch {
+            detail = '';
+          }
+          let message = `Meta Model API error: HTTP ${upstream.status}`;
+          if (detail) message += ` — ${detail}`;
+          sendJson(res, status, { error: scrubApiKeyFromText(message, apiKey) });
           return true;
         }
         const data = (await upstream.json()) as {
           choices?: Array<{
             message?: {
               content?: string;
-              tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }>;
+              tool_calls?: Array<{ id: string; function: { name: string; arguments: unknown } }>;
             };
           }>;
           usage?: unknown;
@@ -244,7 +548,7 @@ export async function handleMetaProxyRequest(
           toolCalls: (message?.tool_calls ?? []).map((t) => ({
             id: t.id,
             name: t.function.name,
-            arguments: JSON.parse(t.function.arguments || '{}'),
+            arguments: safeParseToolArguments(t.function.arguments),
           })),
           model: body?.model ?? 'muse-spark-1.3',
           ...(usage ? { usage } : {}),
@@ -259,7 +563,16 @@ export async function handleMetaProxyRequest(
         }),
       );
       if (!upstream.ok) {
-        sendJson(res, 502, { error: `SAM 3.1 segmentation error: HTTP ${upstream.status}` });
+        const segStatus = upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502;
+        let segDetail = '';
+        try {
+          segDetail = extractUpstreamErrorMessage(await upstream.json());
+        } catch {
+          segDetail = '';
+        }
+        let segMessage = `SAM 3.1 segmentation error: HTTP ${upstream.status}`;
+        if (segDetail) segMessage += ` — ${segDetail}`;
+        sendJson(res, segStatus, { error: scrubApiKeyFromText(segMessage, apiKey) });
         return true;
       }
       const data = (await upstream.json()) as { masks?: unknown[]; confidence?: number };

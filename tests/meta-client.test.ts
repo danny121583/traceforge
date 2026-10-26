@@ -154,7 +154,7 @@ describe('MetaClient simulation mode', () => {
       mode: 'live',
       apiKey: 'test-key',
       fetchFn: async (url, init) => {
-        calls.push({ url, body: init.body, headers: init.headers });
+        calls.push({ url, body: init.body ?? '', headers: init.headers });
         return {
           ok: true,
           status: 200,

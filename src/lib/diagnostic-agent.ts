@@ -80,6 +80,12 @@ export interface AgenticDiagnosisRun {
   score: DiagnosisScore | null;
   telemetry: UsageTelemetry;
   operationalMode: OperationalMode;
+  /**
+   * Whether the final verdict came directly from the model's
+   * `FINAL_DIAGNOSIS:` JSON output (`model_final_diagnosis`) or from the
+   * deterministic evidence classifier (`evidence_fallback`).
+   */
+  diagnosisSource: 'model_final_diagnosis' | 'evidence_fallback';
 }
 
 export interface AgenticDiagnosisOptions {
@@ -94,22 +100,66 @@ export interface AgenticDiagnosisOptions {
  * ------------------------------------------------------------------------- */
 
 function describeComponent(c: CircuitComponent): string {
-  if (c.type === 'resistor') return `${c.id}: R ${c.ohms}Ω [${c.nodeA}--${c.nodeB}]`;
-  if (c.type === 'voltage_source') return `${c.id}: Vsrc ${c.volts}V [${c.positiveNode}(+) ${c.negativeNode}(-)]`;
-  return `${c.id}: Isrc ${c.amps}A [${c.fromNode}->${c.toNode}]`;
+  const role = c.description ? ` (${c.description})` : '';
+  if (c.type === 'resistor') return `${c.id}: R ${c.ohms}Ω [${c.nodeA}--${c.nodeB}]${role}`;
+  if (c.type === 'voltage_source') return `${c.id}: Vsrc ${c.volts}V [${c.positiveNode}(+) ${c.negativeNode}(-)]${role}`;
+  return `${c.id}: Isrc ${c.amps}A [${c.fromNode}->${c.toNode}]${role}`;
 }
 
 /** Short role + protocol instructions shared by both modes. */
 export function buildAgentSystemPrompt(maxToolCalls: number): string {
   return [
     'You are TraceForge, a hardware diagnostic agent driving a deterministic virtual bench.',
-    `Rules: (1) First probe every node in the nominal-spec table with measure_node_voltage.`,
-    `(2) For any abnormal rail, run check_continuity against GND (and across suspect nets) to separate shorts from opens; use measure_branch_current to confirm leakage paths.`,
-    `(3) lookup_pinout is context only, never electrical evidence.`,
-    `(4) Commit within your tool budget of ${maxToolCalls} calls.`,
-    `Final message must end with: ${FINAL_DIAGNOSIS_MARKER} {"componentRef": "<id from the nominal netlist>", "faultType": "<${VALID_FAULT_TYPES.join('|')}>", "verificationStatus": "confirmed|hypothesis", "explanation": "<one sentence grounded in readings>"}.`,
+    `Turn 1: Call measure_node_voltage ONLY on the nodes listed in 'Nominal specs' (never probe GND or unlisted nodes).`,
+    `Turn 2: For any node whose measured voltage is outside spec, call check_continuity between that node and GND to distinguish a short from an open/drift.`,
+    `Turn 3 (once abnormal voltage and continuity are measured): output NO tool calls and begin your response immediately on line 1 with ${FINAL_DIAGNOSIS_MARKER} {"componentRef": "<ref from Candidate component refs>", "faultType": "<valid faultType>", "verificationStatus": "confirmed", "explanation": "<concise 1-sentence evidence summary>"}. Keep reasoning concise (1-2 sentences) so the verdict is never truncated.`,
+    `Tool budget: ${maxToolCalls} calls. lookup_pinout is context only, never electrical evidence.`,
+    `Attribution: a <10 Ω short between an IC pin (e.g. U1-15) and GND is faultType solder_bridge on that IC (e.g. U1); a <10 Ω short on a protected connector line (e.g. CC1) to GND is shorted_component on its protection diode (e.g. D2). Report physical board designators only, never synthetic MNA leakage ids.`,
+    `Final message must end with: ${FINAL_DIAGNOSIS_MARKER} {"componentRef": "<ref from Candidate component refs>", "faultType": "<${VALID_FAULT_TYPES.join('|')}>", "verificationStatus": "confirmed|hypothesis", "explanation": "<one sentence grounded in readings>"}.`,
     `Use "confirmed" only with abnormal electrical evidence on the reported net.`,
   ].join(' ');
+}
+
+/**
+ * Synthetic MNA leakage-model ids: solver-internal shunt resistors, not
+ * physical board components, so they must never appear as candidate refs.
+ * (`D2_TVS` still contributes the `D2` prefix below — the physical diode.)
+ */
+export const SYNTHETIC_MNA_LEAKAGE_IDS: ReadonlySet<string> = new Set([
+  'R_NRSTPD',
+  'D2_TVS',
+  'D3_TVS',
+]);
+
+/**
+ * Board reference designators the model may report, derived ONLY from the
+ * ground-truth-free agent view: every physical nominal component id plus any
+ * IC/capacitor/diode designator prefix (`U1`, `U2`, `C4`, `D2`, `D3`, …)
+ * appearing in node names, probe aliases, or component ids (`D2_TVS` →
+ * `D2`). Synthetic MNA leakage-model ids are excluded. The withheld
+ * `HiddenFault` is never consulted, so `assertGroundTruthIsolated` keeps
+ * passing: this returns plain ref strings, never fault ids or forbidden
+ * keys.
+ */
+export function candidateComponentRefs(view: AgentCircuitView): string[] {
+  const refs = new Set<string>();
+  for (const c of view.nominalComponents) {
+    if (!SYNTHETIC_MNA_LEAKAGE_IDS.has(c.id)) refs.add(c.id);
+  }
+  const sources = [
+    ...view.nodes,
+    ...Object.keys(view.probeAliases),
+    ...Object.values(view.probeAliases),
+    ...view.nominalComponents.map((c) => c.id),
+  ];
+  for (const s of sources) {
+    for (const token of s.split(/[-_]/)) {
+      const m = token.match(/^([UCD]\d+)$/);
+      if (m?.[1]) refs.add(m[1]);
+    }
+  }
+  for (const id of SYNTHETIC_MNA_LEAKAGE_IDS) refs.delete(id);
+  return [...refs].sort();
 }
 
 /** Compact board brief built ONLY from the ground-truth-free agent view. */
@@ -128,6 +178,7 @@ export function buildAgentUserPrompt(view: AgentCircuitView): string {
     `Nominal specs:\n${specs}`,
     `Nominal netlist:\n${netlist}`,
     `Probe aliases: ${aliases || 'none'}`,
+    `Candidate component refs: ${candidateComponentRefs(view).join(', ')}`,
     `Tool budget: ${view.maxToolCalls} calls. Ground truth is withheld — diagnose from measurements alone.`,
   ].join('\n');
 }
@@ -644,6 +695,50 @@ function nextAgentToolId(): string {
   return `ag-tc-${agentToolSeq}`;
 }
 
+/**
+ * Final synthesis attempt for live mode: when the turn/tool budget is spent
+ * without a parsed `FINAL_DIAGNOSIS`, ask the model once more WITHOUT tools
+ * for a verdict grounded solely in the recorded measurements. Returns the
+ * parsed model verdict, or null when the model still does not emit
+ * `FINAL_DIAGNOSIS` (the caller then falls back to `classifyFromEvidence`).
+ * Never throws: a failed synthesis resolves to null so the deterministic
+ * fallback still produces a verdict.
+ */
+async function synthesizeFinalDiagnosis(
+  session: VirtualLabSession,
+  client: MetaClient,
+  messages: ChatMessage[],
+  maxTokens: number,
+): Promise<ProposedDiagnosis | null> {
+  const voltages = readVoltageEvidence(messages);
+  const continuities = readContinuityEvidence(messages);
+  try {
+    assertGroundTruthIsolated(
+      { messages, tools: VIRTUAL_LAB_TOOL_DEFINITIONS },
+      session.getGroundTruth(),
+    );
+    const res = await client.chat({
+      messages: [
+        ...messages,
+        {
+          role: 'user',
+          content: [
+            'All probing is complete. Do NOT call any tool.',
+            `Recorded virtual-bench measurements: voltages=${JSON.stringify(voltages)} continuity=${JSON.stringify(continuities)}`,
+            `Output 1-2 sentences of reasoning, then end with: ${FINAL_DIAGNOSIS_MARKER} {"componentRef": "<ref from Candidate component refs>", "faultType": "<${VALID_FAULT_TYPES.join('|')}>", "verificationStatus": "confirmed|hypothesis", "explanation": "<one sentence grounded in the readings above>"}.`,
+          ].join('\n'),
+        },
+      ],
+      // Concise internal thinking: the verdict must fit before max_tokens.
+      effort: 'low',
+      maxTokens,
+    });
+    return parseFinalDiagnosis(res.content);
+  } catch {
+    return null;
+  }
+}
+
 function assistantSummary(turn: number, content: string, toolCount: number): string {
   if (toolCount > 0) return `Turn ${turn}: issuing ${toolCount} tool call(s) — ${content.slice(0, 100)}`;
   return `Turn ${turn}: ${content.slice(0, 140)}`;
@@ -681,6 +776,7 @@ export async function runAgenticDiagnosis(
 
   let turn = 0;
   let proposed: ProposedDiagnosis | null = null;
+  let diagnosisSource: AgenticDiagnosisRun['diagnosisSource'] = 'evidence_fallback';
 
   if (client.mode === 'simulated') {
     while (turn < maxTurns && !proposed) {
@@ -693,7 +789,7 @@ export async function runAgenticDiagnosis(
           ? `No probe data yet — nothing to diagnose. ${FINAL_DIAGNOSIS_MARKER} ${JSON.stringify({ ...proposed })}`
           : `Evidence review: ${proposed.explanation} ${FINAL_DIAGNOSIS_MARKER} ${JSON.stringify({ ...proposed })}`;
         assertGroundTruthIsolated({ messages, tools }, groundTruth);
-        await client.chat({ messages, tools, maxTokens });
+        await client.chat({ messages, tools, effort: 'low', maxTokens });
         messages.push({ role: 'assistant', content });
         emit({ turn, kind: 'assistant', summary: `Turn ${turn}: Submitting evidence-backed diagnosis...` });
         break;
@@ -705,7 +801,7 @@ export async function runAgenticDiagnosis(
       assertGroundTruthIsolated({ messages, tools }, groundTruth);
       // Routed through the client so token/cost telemetry reflects the real
       // conversation; probe decisions come from the reactive policy above.
-      await client.chat({ messages, tools, maxTokens });
+      await client.chat({ messages, tools, effort: 'low', maxTokens });
       messages.push({ role: 'assistant', content: reasoning, tool_calls: toolCalls });
       emit({ turn, kind: 'assistant', summary: reasoning });
       for (const tc of toolCalls) {
@@ -729,10 +825,26 @@ export async function runAgenticDiagnosis(
       proposed = classifyFromEvidence(view, readVoltageEvidence(messages), readContinuityEvidence(messages));
     }
   } else {
+    // Commit path once the turn/tool budget is spent without a model verdict:
+    // one final tool-free synthesis request, then the deterministic fallback.
+    // Returns (rather than assigns) the verdict so `proposed` keeps narrowing.
+    const commitFromRemainingEvidence = async (reason: string): Promise<ProposedDiagnosis> => {
+      const synth = await synthesizeFinalDiagnosis(session, client, messages, maxTokens);
+      if (synth) {
+        diagnosisSource = 'model_final_diagnosis';
+        emit({ turn, kind: 'assistant', summary: `Turn ${turn}: ${reason} — model synthesis returned FINAL_DIAGNOSIS.` });
+        return synth;
+      }
+      const fallback = classifyFromEvidence(view, readVoltageEvidence(messages), readContinuityEvidence(messages));
+      emit({ turn, kind: 'assistant', summary: `Turn ${turn}: ${reason} — committing from collected evidence...` });
+      return fallback;
+    };
     while (turn < maxTurns && !proposed) {
       turn += 1;
       assertGroundTruthIsolated({ messages, tools }, groundTruth);
-      const res = await client.chat({ messages, tools, maxTokens });
+      // `low` effort keeps muse-spark-1.3's internal thinking concise so the
+      // Turn-3 FINAL_DIAGNOSIS verdict is never truncated at max_tokens.
+      const res = await client.chat({ messages, tools, effort: 'low', maxTokens });
       const assistant: ChatMessage = {
         role: 'assistant',
         content: res.content,
@@ -756,6 +868,7 @@ export async function runAgenticDiagnosis(
       }
       if (parsed) {
         proposed = parsed;
+        diagnosisSource = 'model_final_diagnosis';
         break;
       }
       if (res.toolCalls.length === 0) {
@@ -765,16 +878,15 @@ export async function runAgenticDiagnosis(
             content: 'Continue: probe the bench with the provided tools, or commit your conclusion now with FINAL_DIAGNOSIS: {...} JSON.',
           });
         } else {
-          proposed = classifyFromEvidence(view, readVoltageEvidence(messages), readContinuityEvidence(messages));
+          proposed = await commitFromRemainingEvidence('turn budget spent');
         }
       }
       if (!proposed && session.getToolCallsUsed() >= session.maxToolCalls) {
-        proposed = classifyFromEvidence(view, readVoltageEvidence(messages), readContinuityEvidence(messages));
-        emit({ turn, kind: 'assistant', summary: `Turn ${turn}: tool budget spent — committing from collected evidence...` });
+        proposed = await commitFromRemainingEvidence('tool budget spent');
       }
     }
     if (!proposed) {
-      proposed = classifyFromEvidence(view, readVoltageEvidence(messages), readContinuityEvidence(messages));
+      proposed = await commitFromRemainingEvidence('turn budget spent');
     }
   }
 
@@ -797,6 +909,7 @@ export async function runAgenticDiagnosis(
     score,
     telemetry: client.getTelemetry(),
     operationalMode: client.status().sparkMode,
+    diagnosisSource,
   };
 }
 

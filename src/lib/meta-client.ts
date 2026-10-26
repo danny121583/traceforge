@@ -342,7 +342,16 @@ export const ALL_TOOL_DEFINITIONS: ToolDefinition[] = [
   ...VIRTUAL_LAB_TOOL_DEFINITIONS.filter((t) => t.name === 'measure_node_voltage' || t.name === 'measure_branch_current'),
 ];
 
-/** Build a tool-call payload in the Meta Model API shape. */
+/**
+ * Build a tool-call payload in the Meta Model API shape.
+ *
+ * When `request.effort` is set, BOTH `reasoning: { effort }` (legacy shape,
+ * kept so existing payload-construction tests keep passing) AND the
+ * upstream-required top-level `reasoning_effort` are included. The live wire
+ * senders (`chatDirect` below and the server proxy) strip `reasoning` before
+ * anything reaches `/chat/completions`, because api.meta.ai answers the
+ * nested shape with HTTP 400.
+ */
 export function buildToolCallPayload(request: ChatRequest): Record<string, unknown> {
   return {
     model: request.model ?? SPARK_MODEL_ID,
@@ -373,7 +382,7 @@ export function buildToolCallPayload(request: ChatRequest): Record<string, unkno
         }
       : {}),
     ...(request.responseFormat === 'json' ? { response_format: { type: 'json_object' } } : {}),
-    ...(request.effort ? { reasoning: { effort: request.effort } } : {}),
+    ...(request.effort ? { reasoning: { effort: request.effort }, reasoning_effort: request.effort } : {}),
     ...(request.stream ? { stream: true } : {}),
     ...(request.maxTokens ? { max_tokens: request.maxTokens } : {}),
   };
@@ -382,6 +391,42 @@ export function buildToolCallPayload(request: ChatRequest): Record<string, unkno
 /** Rough token estimate (chars / 4) used for payload budgeting. */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
+}
+
+/**
+ * Safely parse `tool_calls[].function.arguments`: passes already-parsed
+ * objects through untouched, returns `{}` on invalid JSON (never throws).
+ * Mirrors the server proxy's parser so both paths stay consistent.
+ */
+export function safeParseToolArguments(args: unknown): Record<string, unknown> {
+  if (args === null || args === undefined) return {};
+  if (typeof args === 'object') return args as Record<string, unknown>;
+  if (typeof args !== 'string') return {};
+  if (args.trim() === '') return {};
+  try {
+    const parsed: unknown = JSON.parse(args);
+    return parsed !== null && typeof parsed === 'object'
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Pull a human-readable message out of a proxy/upstream error payload. */
+export function extractProxyErrorMessage(body: unknown): string {
+  if (!body || typeof body !== 'object') {
+    return typeof body === 'string' ? body : '';
+  }
+  const rec = body as Record<string, unknown>;
+  const err = rec['error'];
+  if (typeof err === 'string') return err;
+  if (err !== null && typeof err === 'object') {
+    const msg = (err as Record<string, unknown>)['message'];
+    if (typeof msg === 'string') return msg;
+  }
+  if (typeof rec['message'] === 'string') return rec['message'] as string;
+  return '';
 }
 
 export interface AssembledDatasheet {
@@ -421,10 +466,15 @@ export function assembleDatasheetPayload(
   return { text, estimatedTokens: used, truncated, sectionsIncluded: included };
 }
 
-/** Minimal fetch-compatible signature so tests can inject fakes. */
+/**
+ * Minimal fetch-compatible signature so tests can inject fakes.
+ * `body` is optional: real WhatWG fetch throws
+ * `TypeError: Request with GET/HEAD method cannot have body`, so GET
+ * requests (e.g. `proxyStatus`) must omit it entirely.
+ */
 export type FetchFn = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: { method: string; headers: Record<string, string>; body?: string },
 ) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
 
 export interface MetaClientOptions {
@@ -562,6 +612,13 @@ export class MetaClient {
   private readonly proxyBaseUrl?: string;
   /** Set only after a verified real response arrives (gates `LIVE_API`). */
   private verifiedLiveApi = false;
+  /**
+   * Set only when a live SAM 3.1 segmentation call actually succeeds.
+   * Tracked separately from `verifiedLiveApi` so a live Muse Spark 1.3
+   * session never flips the SAM badge to `LIVE_API` (SAM 3.1 is deferred
+   * per AGENTS.md §8b; the app pins `segmentationMode: 'static_fixture'`).
+   */
+  private verifiedSamLiveApi = false;
   /** Cumulative runtime ledger (Milestone B). */
   private telemetry: UsageTelemetry = emptyTelemetry();
 
@@ -601,7 +658,7 @@ export class MetaClient {
   private samOperationalMode(): OperationalMode {
     if (this.segmentationMode !== 'live_api') return 'STATIC_FIXTURE';
     if (this.mode === 'simulated') return 'STATIC_FIXTURE';
-    if (this.verifiedLiveApi) return 'LIVE_API';
+    if (this.verifiedSamLiveApi || this.verifiedLiveApi) return 'LIVE_API';
     if (this.apiKey || this.proxyBaseUrl) return 'UNVERIFIED';
     return 'UNAVAILABLE';
   }
@@ -693,10 +750,11 @@ export class MetaClient {
   async proxyStatus(): Promise<{ configured: boolean; mode: OperationalMode }> {
     if (!this.proxyBaseUrl) return { configured: false, mode: 'UNAVAILABLE' };
     const fetchFn = this.fetchFn ?? globalThis.fetch.bind(globalThis);
+    // No `body` on GET: real WhatWG fetch (browsers/Node) throws
+    // `TypeError: Request with GET/HEAD method cannot have body`.
     const res = await fetchFn(`${this.proxyBaseUrl}/status`, {
       method: 'GET',
       headers: {},
-      body: '',
     });
     if (!res.ok) throw new Error(`Meta proxy status error: HTTP ${res.status}`);
     const data = (await res.json()) as { configured?: boolean; mode?: OperationalMode };
@@ -742,6 +800,7 @@ export class MetaClient {
       const data = (await res.json()) as { masks?: SegmentMask[]; confidence?: number };
       if (!Array.isArray(data.masks)) throw new Error('SAM 3.1 response missing masks array.');
       this.verifiedLiveApi = true;
+      this.verifiedSamLiveApi = true;
       return {
         mode: 'live_api',
         masks: data.masks,
@@ -778,6 +837,7 @@ export class MetaClient {
     };
     if (!Array.isArray(data.masks)) throw new Error('SAM 3.1 response missing masks array.');
     this.verifiedLiveApi = true;
+    this.verifiedSamLiveApi = true;
     return {
       mode: 'live_api',
       masks: data.masks.map((m, i) => ({
@@ -861,10 +921,13 @@ export class MetaClient {
   /** Browser live mode: POST to the local server proxy WITHOUT any `Authorization` header. */
   private async chatViaProxy(request: ChatRequest, fetchFn: FetchFn): Promise<ChatResponse> {
     // The proxy attaches `META_API_KEY` server-side and never echoes it back.
+    // Messages/tools go through `buildToolCallPayload` first so the proxy
+    // and direct paths send 100% consistent OpenAI wire shapes.
+    const wire = buildToolCallPayload({ ...request, model: request.model ?? this.model });
     const bodyText = JSON.stringify({
-      model: request.model ?? this.model,
-      messages: request.messages,
-      tools: request.tools,
+      model: wire.model,
+      messages: wire.messages,
+      ...(wire.tools !== undefined ? { tools: wire.tools } : {}),
       responseFormat: request.responseFormat,
       effort: request.effort,
       maxTokens: request.maxTokens,
@@ -878,23 +941,35 @@ export class MetaClient {
       CLIENT_REQUEST_TIMEOUT_MS,
       'Meta proxy',
     );
-    if (res.status === 503) {
-      this.accumulateTokens(estimateTokens(bodyText), 0, false, true);
-      throw new Error('Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.');
-    }
     if (!res.ok) {
+      // Read the proxy's JSON error field so the thrown Error carries the
+      // exact upstream status/detail (a 503 here is upstream-transient
+      // UNLESS it is the proxy's key-missing configuration state).
+      let proxyDetail = '';
+      try {
+        proxyDetail = extractProxyErrorMessage(await res.json());
+      } catch {
+        proxyDetail = '';
+      }
       this.accumulateTokens(estimateTokens(bodyText), 0, false, true);
-      throw new Error(`Meta Model API error: HTTP ${res.status}`);
+      if (res.status === 503 && proxyDetail.includes('not configured on the local server proxy')) {
+        throw new Error('Live Meta API key is not configured on the local server proxy. Running in zero-cost simulated mode.');
+      }
+      throw new Error(
+        proxyDetail && proxyDetail !== `Meta Model API error: HTTP ${res.status}`
+          ? `Meta Model API error: HTTP ${res.status} — ${proxyDetail}`
+          : (proxyDetail || `Meta Model API error: HTTP ${res.status}`),
+      );
     }
     const data = (await res.json()) as Partial<ProxyChatResult> & {
-      choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+      choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: unknown } }> } }>;
     };
     const toolCalls: ToolCall[] = Array.isArray(data.toolCalls)
       ? data.toolCalls
       : (data.choices?.[0]?.message?.tool_calls ?? []).map((t) => ({
           id: t.id,
           name: t.function.name as ToolCall['name'],
-          arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
+          arguments: safeParseToolArguments(t.function.arguments),
         }));
     const content = data.content ?? data.choices?.[0]?.message?.content ?? '';
     const usage = this.resolveUsage(
@@ -916,6 +991,10 @@ export class MetaClient {
   /** Node/server live mode: direct upstream call with server-side Bearer [REDACTED] */
   private async chatDirect(request: ChatRequest, fetchFn: FetchFn): Promise<ChatResponse> {
     const payload = buildToolCallPayload({ ...request, model: request.model ?? this.model });
+    // Meta's OpenAI-compatible `/chat/completions` requires top-level
+    // `reasoning_effort` and rejects `reasoning` with HTTP 400 — strip the
+    // legacy nested shape; `reasoning_effort` (set above) rides along.
+    delete payload['reasoning'];
     const bodyText = JSON.stringify(payload);
     const res = await withRequestTimeout(
       fetchFn(`${this.baseUrl}/chat/completions`, {
@@ -930,18 +1009,28 @@ export class MetaClient {
       'Meta Model API',
     );
     if (!res.ok) {
+      let directDetail = '';
+      try {
+        directDetail = extractProxyErrorMessage(await res.json());
+      } catch {
+        directDetail = '';
+      }
       this.accumulateTokens(estimateTokens(bodyText), 0, false, true);
-      throw new Error(`Meta Model API error: HTTP ${res.status}`);
+      throw new Error(
+        directDetail && directDetail !== `Meta Model API error: HTTP ${res.status}`
+          ? `Meta Model API error: HTTP ${res.status} — ${directDetail}`
+          : (directDetail || `Meta Model API error: HTTP ${res.status}`),
+      );
     }
     const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }>;
+      choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: unknown } }> } }>;
       usage?: ProviderUsage;
     };
     const message = data.choices?.[0]?.message;
     const toolCalls: ToolCall[] = (message?.tool_calls ?? []).map((t) => ({
       id: t.id,
       name: t.function.name as ToolCall['name'],
-      arguments: JSON.parse(t.function.arguments || '{}') as Record<string, unknown>,
+      arguments: safeParseToolArguments(t.function.arguments),
     }));
     const content = message?.content ?? '';
     const usage = this.resolveUsage(
