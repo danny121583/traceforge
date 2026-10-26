@@ -1,15 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
   aiModeBadge,
+  extractProbeTargetFromStepSummary,
   formatActivitySummary,
   getActiveStep,
   isInvestigationComplete,
+  mapProbeRecordsToPcbHighlights,
   plainSymptomForBoard,
   primaryWorkflowAction,
   reworkWithheldReason,
   shouldShowRework,
 } from '../src/lib/guided-ux';
-import type { ProbeRecord } from '../src/lib/circuit-simulator';
+import { getBoard } from '../src/data/samples';
+import { getReferenceBoard, type ProbeRecord } from '../src/lib/circuit-simulator';
 
 describe('guided step highlighting', () => {
   it('starts on Step 1 before any activity', () => {
@@ -114,6 +117,111 @@ describe('AI mode badge', () => {
       expect(aiModeBadge(mode).label).not.toContain('Muse');
       expect(aiModeBadge(mode).label).not.toContain('Spark');
     }
+  });
+});
+
+describe('mapProbeRecordsToPcbHighlights', () => {
+  const f405 = getBoard('f405-flight-controller')!;
+  const f405Aliases = getReferenceBoard('f405-flight-controller')!.probeAliases;
+  const usbc = getBoard('usbc-pd-trigger')!;
+  const usbcAliases = getReferenceBoard('usbc-pd-trigger')!.probeAliases;
+  const esp32 = getBoard('esp32s3-sensor-node')!;
+  const esp32Aliases = getReferenceBoard('esp32s3-sensor-node')!.probeAliases;
+
+  it('maps a voltage probe to its test point with the computed reading', () => {
+    const log: ProbeRecord[] = [
+      { kind: 'voltage', target: 'TP_3V3', abnormal: false, detail: '3.050 V vs nominal 3.267 V' },
+    ];
+    const h = mapProbeRecordsToPcbHighlights(f405, f405Aliases, log, null);
+    expect(h.measuredPoints['TP_3V3']).toMatchObject({
+      reading: '3.050 V vs nominal 3.267 V',
+      abnormal: false,
+      kind: 'voltage',
+    });
+    // No live target: the most recent measurement location becomes active.
+    expect(h.activePointIds).toContain('TP_3V3');
+    expect(h.activeContinuityLine).toBeNull();
+  });
+
+  it("resolves aliases both ways ('U1-15' -> 'U1-15' & 'TP_NRST')", () => {
+    const log: ProbeRecord[] = [
+      { kind: 'voltage', target: 'U1-15', abnormal: true, detail: '0.020 V vs nominal 3.240 V' },
+    ];
+    const h = mapProbeRecordsToPcbHighlights(f405, f405Aliases, log, null);
+    expect(h.measuredPoints['U1-15']?.abnormal).toBe(true);
+    expect(h.measuredPoints['TP_NRST']?.reading).toContain('0.020 V');
+    expect(h.activePointIds).toEqual(expect.arrayContaining(['U1-15', 'TP_NRST']));
+  });
+
+  it("resolves label aliases ('TP_CC1' label <-> 'CC1' id, 'TP_5V' <-> 'C4-POS')", () => {
+    const usbcLog: ProbeRecord[] = [
+      { kind: 'voltage', target: 'TP_CC1', abnormal: true, detail: '0.000 V vs nominal 0.417 V' },
+    ];
+    const hu = mapProbeRecordsToPcbHighlights(usbc, usbcAliases, usbcLog, null);
+    expect(hu.measuredPoints['CC1']?.abnormal).toBe(true);
+
+    const espLog: ProbeRecord[] = [
+      { kind: 'voltage', target: 'TP_5V', abnormal: true, detail: '4.200 V vs nominal 4.956 V' },
+    ];
+    const he = mapProbeRecordsToPcbHighlights(esp32, esp32Aliases, espLog, null);
+    expect(he.measuredPoints['TP_5V']?.abnormal).toBe(true);
+    expect(he.measuredPoints['C4-POS']?.reading).toContain('4.200 V');
+  });
+
+  it("builds a continuity vector for 'U1-15↔GND' between real pad coordinates", () => {
+    const log: ProbeRecord[] = [
+      { kind: 'voltage', target: 'U1-15', abnormal: true, detail: '0.020 V vs nominal 3.240 V' },
+      { kind: 'resistance', target: 'U1-15↔GND', abnormal: true, detail: '0.400 Ω' },
+    ];
+    const h = mapProbeRecordsToPcbHighlights(f405, f405Aliases, log, 'U1-15↔GND');
+    const line = h.activeContinuityLine;
+    expect(line).not.toBeNull();
+    // U1-15 pad (350, 410) → GND pad (120, 850) per src/data/samples.ts.
+    expect(line).toMatchObject({ x1: 350, y1: 410, x2: 120, y2: 850, abnormal: true });
+    expect(line!.label).toContain('0.400 Ω');
+    expect(h.activePointIds).toEqual(expect.arrayContaining(['U1-15', 'GND']));
+    expect(h.measuredPoints['GND']?.kind).toBe('resistance');
+  });
+
+  it('keeps the most recent continuity vector once the probe goes idle', () => {
+    const log: ProbeRecord[] = [
+      { kind: 'resistance', target: 'U1-15↔GND', abnormal: true, detail: '0.400 Ω' },
+    ];
+    const h = mapProbeRecordsToPcbHighlights(f405, f405Aliases, log, null);
+    expect(h.activeContinuityLine).not.toBeNull();
+    expect(h.activeContinuityLine).toMatchObject({ x1: 350, y1: 410, x2: 120, y2: 850 });
+  });
+
+  it('produces zero highlights when no measurements occurred', () => {
+    const h = mapProbeRecordsToPcbHighlights(f405, f405Aliases, [], null);
+    expect(h).toEqual({ activePointIds: [], measuredPoints: {}, activeContinuityLine: null });
+  });
+
+  it('ignores lookup/context records (no fake measurement highlights)', () => {
+    const log: ProbeRecord[] = [
+      { kind: 'lookup', target: 'STM32F405 pin 15', abnormal: false, detail: 'pinout context lookup' },
+    ];
+    const h = mapProbeRecordsToPcbHighlights(f405, f405Aliases, log, null);
+    expect(h).toEqual({ activePointIds: [], measuredPoints: {}, activeContinuityLine: null });
+  });
+});
+
+describe('extractProbeTargetFromStepSummary', () => {
+  it('extracts the node from a voltage tool call/result', () => {
+    expect(extractProbeTargetFromStepSummary('Tool Call: measure_node_voltage(node=U1-15, ref_node=GND) -> 0.020 V')).toBe(
+      'U1-15',
+    );
+  });
+
+  it('extracts an A↔B pair from a continuity tool call/result', () => {
+    expect(
+      extractProbeTargetFromStepSummary('Tool Call: check_continuity(probe_a=U1-15, probe_b=GND) -> 0.400 Ω SHORT (beep)'),
+    ).toBe('U1-15↔GND');
+  });
+
+  it('returns null for reasoning and diagnosis lines that touch no pad', () => {
+    expect(extractProbeTargetFromStepSummary('▸ Autonomous investigation armed: FPV Drone')).toBeNull();
+    expect(extractProbeTargetFromStepSummary('■ AGENT VERDICT: U1 · solder_bridge (confirmed)')).toBeNull();
   });
 });
 

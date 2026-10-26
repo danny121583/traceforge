@@ -39,9 +39,11 @@ import {
 } from './lib/circuit-simulator';
 import {
   aiModeBadge,
+  extractProbeTargetFromStepSummary,
   formatActivitySummary,
   getActiveStep,
   isInvestigationComplete,
+  mapProbeRecordsToPcbHighlights,
   plainSymptomForBoard,
   primaryWorkflowAction,
   reworkWithheldReason,
@@ -145,6 +147,9 @@ export function App() {
   const [probeArmed, setProbeArmed] = useState(true);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const [probeLog, setProbeLog] = useState<ProbeRecord[]>([]);
+  // Live pad(s) for the currently executing real measurement (tool_call /
+  // tool_result step), driving the animated PCB highlights. Null when idle.
+  const [activeProbeTarget, setActiveProbeTarget] = useState<string | null>(null);
   const [toolsUsed, setToolsUsed] = useState(0);
   const [revealed, setRevealed] = useState(false);
   const [submitRef, setSubmitRef] = useState('');
@@ -171,6 +176,7 @@ export function App() {
     setProbeA(null);
     setProbeB(null);
     setProbeLog([]);
+    setActiveProbeTarget(null);
     setToolsUsed(0);
     setRevealed(false);
     setSubmitRef('');
@@ -249,6 +255,7 @@ export function App() {
 
   function logVoltageProbe() {
     if (!probeA) return;
+    setActiveProbeTarget(probeA);
     try {
       const rd = session.measureVoltage(probeA);
       pushLine('k-rule-ok', `▸ [Simulated measurement (MNA)] ${probeA} = ${rd.formatted} (powered, vs GND)`);
@@ -260,6 +267,7 @@ export function App() {
 
   function logContinuityProbe() {
     if (!probeA || !probeB) return;
+    setActiveProbeTarget(`${probeA}↔${probeB}`);
     try {
       const rd = session.measureContinuity(probeA, probeB);
       pushLine(
@@ -291,6 +299,8 @@ export function App() {
       for (const spec of view.nominalSpecs) {
         try {
           const rd = session.measureVoltage(spec.node);
+          setActiveProbeTarget(spec.node);
+          syncSessionState();
           const abnormal = Math.abs(rd.volts - spec.nominalVolts) > Math.abs(spec.nominalVolts) * spec.toleranceFrac + 1e-9;
           pushLine(
             abnormal ? 'k-rule-bad' : 'k-rule-ok',
@@ -307,6 +317,8 @@ export function App() {
         for (const other of [`GND`, ...others].slice(0, 2)) {
           try {
             const rd = session.measureContinuity(abnormal.target, other);
+            setActiveProbeTarget(`${abnormal.target}↔${other}`);
+            syncSessionState();
             pushLine(
               rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
               `▸ [Simulated measurement (MNA)] ${abnormal.target} ↔ ${other} = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ''}`,
@@ -339,7 +351,16 @@ export function App() {
       const view = session.getAgentView();
       pushLine('k-reasoning', `▸ Autonomous investigation armed: ${view.boardName} · Muse Spark 1.3 (${client.mode}) · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`);
       const run = await runAgenticDiagnosis(session, client, {
-        onStep: (step) => pushLine(agentStepClass(step), step.summary),
+        onStep: (step) => {
+          pushLine(agentStepClass(step), step.summary);
+          // Live PCB sync: highlight the real pad(s) as each tool call
+          // executes and refresh the probe log on every step.
+          if (step.kind === 'tool_call' || step.kind === 'tool_result') {
+            const target = extractProbeTargetFromStepSummary(step.summary);
+            if (target) setActiveProbeTarget(target);
+            syncSessionState();
+          }
+        },
       });
       syncSessionState();
       setTelemetry(client.getTelemetry());
@@ -616,6 +637,14 @@ export function App() {
   const sparkStatus = client.status();
   const modeBadge = aiModeBadge(sparkStatus.sparkMode);
   const activitySummary = formatActivitySummary(probeLog);
+  // Real measurement → PCB highlight mapping (pulse ring, readout callouts,
+  // continuity vector). Empty probe log + idle target yields zero highlights.
+  const pcbHighlights = mapProbeRecordsToPcbHighlights(
+    board,
+    session.getAgentView().probeAliases ?? {},
+    probeLog,
+    activeProbeTarget,
+  );
   const verificationStatus = diagnosis?.verification.status ?? null;
   const showRework = shouldShowRework({ complete, verificationStatus });
   const isHealthy = !truth;
@@ -711,6 +740,9 @@ export function App() {
             probeB={probeB}
             probeArmed={probeArmed}
             segmentationMode={client.status().segmentationMode}
+            activePointIds={pcbHighlights.activePointIds}
+            measuredPoints={pcbHighlights.measuredPoints}
+            activeContinuityLine={pcbHighlights.activeContinuityLine}
             onSelectComponent={setSelectedRef}
             onProbePoint={handleProbePoint}
           />
@@ -776,6 +808,40 @@ export function App() {
                     <div key={i} className={l.cls}>{l.text.replace('__stream__', '')}</div>
                   ))}
                 </div>
+                {probeLog.length > 0 && (
+                  <>
+                    <h4>Measurement History Timeline</h4>
+                    <table className="tf-measure-table" aria-label="Measurement history timeline">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Test Point / Node</th>
+                          <th>Type</th>
+                          <th>Computed Value</th>
+                          <th>Status</th>
+                          <th>Source</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {probeLog.map((p, i) => {
+                          const isElectrical = p.kind === 'voltage' || p.kind === 'resistance' || p.kind === 'current';
+                          return (
+                            <tr key={i}>
+                              <td className="mute">{i + 1}</td>
+                              <td>{p.target}</td>
+                              <td className="mute">{p.kind}</td>
+                              <td>{p.detail ?? '—'}</td>
+                              <td className={p.abnormal ? 'bad' : 'ok'}>
+                                {isElectrical ? (p.abnormal ? 'Abnormal' : 'Nominal') : '—'}
+                              </td>
+                              <td className="mute">{isElectrical ? 'Simulated MNA' : 'Context'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </>
+                )}
               </>
             )}
             {complete && (
