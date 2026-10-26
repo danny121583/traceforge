@@ -14,23 +14,22 @@
 - Can change any operating rule at any time.
 
 ### ANTIGRAVITY — LEAD COORDINATOR
-- Owns planning and task delegation.
-- Performs research and architecture reviews.
+- Owns project planning, strategy, and task delegation.
+- Performs research, requirements analysis, and architecture reviews.
 - Reviews code and Git diffs.
-- Runs builds, tests, and browser verification.
+- Runs independent quality assurance, builds, tests, and browser verification.
 - Identifies defects and creates corrective prompts.
-- Manages task sequencing and implementation branches.
+- Tracks promotional credit budget consumption across Muse Code and TraceForge runtime.
 - Maintains research and governance documentation.
-- Reports results, limitations, and blockers.
+- Reports milestone results, budget status, limitations, and blockers to the Project Owner.
 - **Never directly writes or modifies application implementation code.**
 
 ### MUSE CODE — EXCLUSIVE IMPLEMENTATION AGENT
-- Writes and modifies application source code (`src/`).
-- Implements UI, services, integrations, and simulation engines.
-- Creates and modifies automated tests (`tests/`).
-- Maintains implementation configuration and dependencies (`package.json`, `vite.config.ts`, `tsconfig.json`, etc.).
-- Fixes bugs identified during Antigravity review.
-- Implements changes only within the assigned scope.
+- Creates directories, source files (`src/`), and test files (`tests/`).
+- Writes and modifies application source code, UI, services, integrations, and simulation engines.
+- Installs dependencies and maintains project configuration (`package.json`, `vite.config.ts`, `tsconfig.json`, etc.).
+- Creates and modifies automated tests (`tests/`), runs implementation verification (`npm test`, `npm run build`), and fixes defects.
+- Performs authorized local development and local Git workflow operations (branching, staging, committing) when instructed within the assigned scope.
 - **CLI Requirement:** For coding tasks, invoke the installed Muse CLI with the tested model `muse-spark-1.3` unless directed otherwise. Do not invent Muse CLI flags; verify available arguments using `muse --help` when necessary.
 - **Mandatory Onboarding:** Every Muse Code task must begin by reading this root `/Users/danny/Desktop/muse hackathon/AGENTS.md` file.
 
@@ -162,14 +161,47 @@ Keep the following concepts strictly distinct in data structures, prompts, and U
 
 ---
 
-## 8. Budget Control
+## 8. Budget Control & Promotional Credit Policy
 
-- Keep API spending at **zero ($0.00)** without explicit Project Owner approval.
-- Prefer free, local, or deterministic mock testing during development and Phase 1.5 verification.
-- Do not automatically enable paid cloud resources.
-- Record cost estimates separately from actual incurred charges.
-- Prevent unbounded tool loops and model requests (enforce strict `maxIterations` / `maxToolCalls` limits).
-- Do not treat a spending notification as a hard cap.
+- **Baseline & Ceiling (Recorded 2026-10-26T15:56:48-05:00):**
+  - **Starting Promotional Balance:** **$147.26**
+  - **Maximum Authorized Additional Consumption:** **$100.00**
+  - **Mandatory Target Ending Promotional Balance:** **$47.26 or more**
+  - **Internal Safety Threshold:** **$95.00** of incremental reported/estimated consumption (stop discretionary model usage at $95.00 to preserve a $5.00 buffer against billing delay).
+  - **Out-of-Pocket Charges:** **$0.00** (Strictly prohibited — never charge a credit card, enable paid subscriptions, or purchase additional credits).
+- **Planned $100 Allocation:**
+  - Muse Code implementation: **$60.00**
+  - Debugging, corrections, testing: **$20.00**
+  - Live Muse Spark application testing: **$10.00**
+  - Final demonstration and contingency: **$10.00**
+- **No Arbitrary Request-Count Limit:**
+  - There is **no fixed 100-request API limit**. Dollar consumption is the governing constraint, not request count.
+- **Usage Tracking & Efficiency:**
+  - Track total model requests, input/output tokens, estimated cost, provider-reported usage, coding-agent consumption vs. runtime API consumption, failed/retried requests, remaining project budget, and remaining promotional credits.
+  - Do not assume the Muse Code CLI and Meta Model API share a single billing bucket without verification; track both conservatively.
+  - Keep deterministic circuit solving local (MNA engine) and use compact, structured prompts and bounded tool loops (`MAX_TOOL_CALLS = 8`) so Muse Spark focuses on probe selection, measurement interpretation, hypothesis revision, and fault explanation.
+  - Do not treat a spending notification as a provider-enforced hard cap.
+
+---
+
+## 8b. Focused TraceForge Scope (One Excellent Workflow)
+
+- **Retain (Critical Demo Path):**
+  1. Interactive PCB visualization (`PcbCanvas.tsx`).
+  2. Deterministic Linear DC MNA virtual circuit simulation (`circuit-simulator.ts`).
+  3. Reproducible hidden fault injection (`HiddenFault`).
+  4. Virtual multimeter measurements (node voltage, branch current, unpowered continuity/resistance).
+  5. Real Muse Spark 1.3 (`muse-spark-1.3`) multi-turn diagnostic reasoning & structured tool calling via the local server proxy.
+  6. Evidence-backed fault hypotheses and datasheet spec comparison.
+  7. Objective evaluation against withheld ground truth (`scoreDiagnosis`).
+  8. Explicit UI badges distinguishing `SIMULATED`, `STATIC_FIXTURE`, `UNVERIFIED`, `UNAVAILABLE`, and `LIVE_API`.
+  9. Diagnostic accuracy, probe efficiency, and token/cost telemetry reporting.
+- **Defer (Excluded from Critical Demo Path — Do Not Delete Existing Working Code Unnecessarily):**
+  - Live SAM 3.1 image segmentation API calls (keep static KiCad fixture overlays labeled `STATIC_FIXTURE`).
+  - Large multi-hundred-page PDF/datasheet ingestion.
+  - Full nonlinear/transient SPICE component coverage.
+  - Physical hardware connections or peripherals.
+  - Multiuser accounts, cloud databases, or secondary AI models.
 
 ---
 
