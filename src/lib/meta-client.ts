@@ -12,6 +12,8 @@ export const SPARK_CONTEXT_TOKENS = 1_048_576;
 
 export type ModelId = typeof SPARK_MODEL_ID | typeof SAM_MODEL_ID;
 export type ClientMode = 'live' | 'simulated';
+/** How segmentation masks are sourced. `simulated` is the legacy chat-mode alias of `static_fixture`. */
+export type SegmentationMode = 'static_fixture' | 'simulated' | 'live_api';
 export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'max';
 
 /** JSON-schema subset used for tool parameter definitions. */
@@ -223,10 +225,36 @@ export interface MetaClientOptions {
   baseUrl?: string;
   /** Force a mode; defaults to `live` when an API key is present. */
   mode?: ClientMode;
+  /** Force a segmentation source; defaults to `live_api` in live mode, else `static_fixture`. */
+  segmentationMode?: SegmentationMode;
   model?: ModelId;
   fetchFn?: FetchFn;
   /** Override simulated tool handlers per tool name. */
   simulatedTools?: Partial<Record<ToolDefinition['name'], (args: Record<string, unknown>) => unknown>>;
+}
+
+export interface SegmentPoint {
+  x: number;
+  y: number;
+}
+
+export interface SegmentImageInput {
+  url?: string;
+  base64?: string;
+  points?: SegmentPoint[];
+}
+
+export interface SegmentMask {
+  id: string;
+  label: string;
+  polygon: number[][];
+}
+
+export interface SegmentImageResult {
+  /** Never `live_api` unless a live SAM 3.1 call actually succeeded. */
+  mode: 'static_fixture' | 'live_api';
+  masks: SegmentMask[];
+  confidence: number;
 }
 
 export interface SimulatedTrace {
@@ -290,8 +318,16 @@ function nextToolId(): string {
   return `tc-sim-${toolCallSeq}`;
 }
 
+/** Deterministic KiCad-derived fixture masks used when SAM 3.1 is unreachable. */
+export const STATIC_FIXTURE_MASKS: SegmentMask[] = [
+  { id: 'fixture-u1', label: 'U1 QFP package (fixture)', polygon: [[120, 120], [360, 120], [360, 360], [120, 360]] },
+  { id: 'fixture-c4', label: 'C4 capacitor (fixture)', polygon: [[420, 200], [520, 200], [520, 280], [420, 280]] },
+  { id: 'fixture-d2', label: 'D2 diode (fixture)', polygon: [[600, 400], [680, 400], [680, 460], [600, 460]] },
+];
+
 export class MetaClient {
   readonly mode: ClientMode;
+  readonly segmentationMode: SegmentationMode;
   readonly model: ModelId;
   private readonly apiKey?: string;
   private readonly baseUrl: string;
@@ -302,6 +338,8 @@ export class MetaClient {
     const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
     this.apiKey = options.apiKey ?? env?.['META_API_KEY'];
     this.mode = options.mode ?? (this.apiKey ? 'live' : 'simulated');
+    this.segmentationMode =
+      options.segmentationMode ?? (this.mode === 'live' ? 'live_api' : 'static_fixture');
     this.model = options.model ?? SPARK_MODEL_ID;
     this.baseUrl = (options.baseUrl ?? 'https://api.meta.ai/v1').replace(/\/$/, '');
     this.fetchFn = options.fetchFn;
@@ -309,8 +347,81 @@ export class MetaClient {
   }
 
   /** Active status snapshot for the workbench header. */
-  status(): { model: ModelId; contextTokens: number; segmenter: 'sam-3.1'; mode: ClientMode } {
-    return { model: this.model, contextTokens: SPARK_CONTEXT_TOKENS, segmenter: 'sam-3.1', mode: this.mode };
+  status(): {
+    model: ModelId;
+    contextTokens: number;
+    segmenter: 'sam-3.1';
+    mode: ClientMode;
+    segmentationMode: SegmentationMode;
+  } {
+    return {
+      model: this.model,
+      contextTokens: SPARK_CONTEXT_TOKENS,
+      segmenter: 'sam-3.1',
+      mode: this.mode,
+      segmentationMode: this.segmentationMode,
+    };
+  }
+
+  /**
+   * Segment a board image with SAM 3.1.
+   *
+   * Offline / fixture modes transparently return the bundled KiCad
+   * fixture masks labeled `static_fixture` — never pretending live
+   * model execution happened. Live mode shapes a Meta Model API
+   * `/v1/responses` payload and propagates HTTP failures to the
+   * caller instead of fabricating masks.
+   */
+  async segmentImage(image: SegmentImageInput): Promise<SegmentImageResult> {
+    if (this.segmentationMode !== 'live_api' || this.mode !== 'live') {
+      return {
+        mode: 'static_fixture',
+        masks: STATIC_FIXTURE_MASKS.map((m) => ({ ...m, polygon: m.polygon.map((p) => [...p]) })),
+        confidence: 0.5,
+      };
+    }
+    if (!image.url && !image.base64) {
+      throw new Error('segmentImage requires an image url or base64 payload.');
+    }
+    const fetchFn = this.fetchFn ?? globalThis.fetch.bind(globalThis);
+    const res = await fetchFn(`${this.baseUrl}/v1/responses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: SAM_MODEL_ID,
+        input: [
+          {
+            role: 'user',
+            content: [
+              { type: 'input_text', text: 'Segment PCB components; return masks with labels and polygons.' },
+              ...(image.url ? [{ type: 'input_image', image_url: image.url }] : []),
+              ...(image.base64
+                ? [{ type: 'input_image', image_url: `data:image/png;base64,${image.base64}` }]
+                : []),
+              ...(image.points?.length ? [{ type: 'input_points', points: image.points }] : []),
+            ],
+          },
+        ],
+      }),
+    });
+    if (!res.ok) throw new Error(`SAM 3.1 segmentation error: HTTP ${res.status}`);
+    const data = (await res.json()) as {
+      masks?: Array<{ id?: string; label?: string; polygon?: number[][] }>;
+      confidence?: number;
+    };
+    if (!Array.isArray(data.masks)) throw new Error('SAM 3.1 response missing masks array.');
+    return {
+      mode: 'live_api',
+      masks: data.masks.map((m, i) => ({
+        id: typeof m.id === 'string' ? m.id : `sam-${i}`,
+        label: typeof m.label === 'string' ? m.label : `mask-${i}`,
+        polygon: Array.isArray(m.polygon) ? m.polygon : [],
+      })),
+      confidence: typeof data.confidence === 'number' ? data.confidence : 0,
+    };
   }
 
   /** Execute a single tool call (simulated fixture when offline). */

@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react';
 import type { SampleBoard } from '../data/samples';
+import type { SegmentationMode } from '../lib/meta-client';
 
 interface Props {
   board: SampleBoard;
@@ -7,6 +8,7 @@ interface Props {
   probeA: string | null;
   probeB: string | null;
   probeArmed: boolean;
+  segmentationMode?: SegmentationMode;
   onSelectComponent: (ref: string | null) => void;
   onProbePoint: (id: string) => void;
 }
@@ -21,7 +23,7 @@ const KIND_COLOR: Record<string, string> = {
 };
 
 /** Interactive PCB canvas: zoom/pan SVG with clickable SAM 3.1 overlays. */
-export function PcbCanvas({ board, selectedRef, probeA, probeB, probeArmed, onSelectComponent, onProbePoint }: Props) {
+export function PcbCanvas({ board, selectedRef, probeA, probeB, probeArmed, segmentationMode = 'static_fixture', onSelectComponent, onProbePoint }: Props) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const drag = useRef<{ x: number; y: number; px: number; py: number } | null>(null);
@@ -35,6 +37,9 @@ export function PcbCanvas({ board, selectedRef, probeA, probeB, probeArmed, onSe
     <div className="tf-pane">
       <div className="tf-pane-head">
         <span>{board.name} — SAM 3.1 overlay</span>
+        <span className="tf-chip" title="Segmentation source: fixture masks are not live model output">
+          {segmentationMode === 'live_api' ? 'Live SAM 3.1' : 'Static Fixture (KiCad)'}
+        </span>
         <span className="tf-canvas-tools">
           <button onClick={() => setZoom((z) => Math.min(4, +(z + 0.5).toFixed(2)))}>Zoom +</button>
           <button onClick={() => { setZoom((z) => Math.max(1, +(z - 0.5).toFixed(2))); if (zoom <= 1.5) setPan({ x: 0, y: 0 }); }}>Zoom −</button>

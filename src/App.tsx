@@ -1,10 +1,22 @@
 import { useMemo, useState } from 'react';
 import { Header } from './components/Header';
 import { PcbCanvas } from './components/PcbCanvas';
+import { DiagnosticPanel } from './components/DiagnosticPanel';
 import { MetaClient, assembleDatasheetPayload, TOOL_DEFINITIONS } from './lib/meta-client';
 import { verifyRailReading, checkContinuityReading, formatVolts, formatOhms, RAIL_SPECS } from './lib/electrical';
+import {
+  parseEvidenceTranscript,
+  diagnosisVerificationStatus,
+  type ClassifiedEvidence,
+  type ProbeMeasurement,
+} from './lib/diagnostic-parser';
 import { SIMULATED_CONTINUITY, SAMPLE_BOARDS, getBoard } from './data/samples';
 import type { ClientMode } from './lib/meta-client';
+
+interface Diagnosis {
+  evidence: ClassifiedEvidence;
+  verification: { status: 'confirmed' | 'hypothesis'; reason: string };
+}
 
 interface StreamLine {
   cls: string;
@@ -29,6 +41,7 @@ export function App() {
   const [probeA, setProbeA] = useState<string | null>(null);
   const [probeB, setProbeB] = useState<string | null>(null);
   const [probeArmed, setProbeArmed] = useState(true);
+  const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
 
   const selected = board.components.find((c) => c.ref === selectedRef) ?? null;
   const pointA = board.probePoints.find((p) => p.id === probeA) ?? null;
@@ -43,6 +56,7 @@ export function App() {
     setSelectedRef(null);
     setProbeA(null);
     setProbeB(null);
+    setDiagnosis(null);
   }
 
   function handleProbePoint(id: string) {
@@ -97,6 +111,7 @@ export function App() {
 
       // Local electrical rule checks (deterministic verification layer)
       push('k-reasoning', '▸ Running electrical rule checks…');
+      const measurements: ProbeMeasurement[] = [];
       for (const p of board.probePoints) {
         if (p.expectedVolts === undefined) continue;
         const spec = RAIL_SPECS[p.net];
@@ -106,6 +121,11 @@ export function App() {
           r.withinSpec ? 'k-rule-ok' : 'k-rule-bad',
           `${r.withinSpec ? '✓' : '⏚'} RAIL ${r.railName}: measured ${formatVolts(r.measuredVolts)} vs nominal ${formatVolts(r.nominalVolts)} (${(r.deviationPct * 100).toFixed(1)}%) — ${r.severity.toUpperCase()}`,
         );
+        measurements.push({
+          point: p.id,
+          value: `${formatVolts(r.measuredVolts)} vs nominal ${formatVolts(r.nominalVolts)}`,
+          status: r.withinSpec ? 'nominal' : 'abnormal',
+        });
       }
       for (const entry of board.expectedSteps.filter((s) => s.action === 'check_continuity')) {
         const m = entry.detail.match(/([\w-]+)\s*↔\s*([\w-]+)\s*reads\s*([\d.]+)\s*Ω/);
@@ -115,10 +135,48 @@ export function App() {
             'k-rule-bad',
             `⏚ CONTINUITY ${m[1]} ↔ ${m[2]}: ${formatOhms(Number(m[3]))} — ${r.continuous ? 'SHORT (beep)' : 'OPEN'}`,
           );
+          measurements.push({
+            point: `${m[1]} ↔ ${m[2]}`,
+            value: `${formatOhms(Number(m[3]))} — ${r.continuous ? 'SHORT (beep)' : 'OPEN'}`,
+            status: r.continuous ? 'abnormal' : 'nominal',
+          });
         }
       }
       for (const c of payload.sectionsIncluded) push('k-cite', `❚ CITATION [DATASHEET: ${c}]`);
       push('k-dx', `■ EXPECTED: ${board.faultSummary}`);
+
+      // Classified evidence panel: transcript-derived buckets merged with
+      // deterministic board data. The fault summary stays a hypothesis
+      // until probe measurements decisively back it.
+      const streamed = parseEvidenceTranscript(buffer);
+      const evidence: ClassifiedEvidence = {
+        observedEvidence: [...board.symptoms, ...streamed.observedEvidence],
+        probeMeasurements: [...measurements, ...streamed.probeMeasurements],
+        datasheetSpecs: [
+          ...board.datasheet.map((d) => ({ section: d.title, spec: d.title })),
+          ...streamed.datasheetSpecs,
+        ],
+        hypotheses: [
+          {
+            claim: board.faultSummary,
+            likelihood: measurements.some((m) => m.status === 'abnormal') ? 'high' : 'medium',
+            falsificationTest: 'Re-probe the listed points; a nominal reading on every point falsifies this fault.',
+          },
+          ...streamed.hypotheses,
+        ],
+        nextVerificationSteps: [
+          ...streamed.nextVerificationSteps,
+          'Re-probe suspect nets and compare against datasheet limits before rework.',
+          'Inspect the suspect component under magnification to confirm the visual flag.',
+        ],
+      };
+      setDiagnosis({
+        evidence,
+        verification: diagnosisVerificationStatus({
+          probeMeasurements: evidence.probeMeasurements,
+          hypotheses: evidence.hypotheses,
+        }),
+      });
     } catch (err) {
       push('k-rule-bad', `⏚ Diagnostic error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -146,6 +204,7 @@ export function App() {
             probeA={probeA}
             probeB={probeB}
             probeArmed={probeArmed}
+            segmentationMode={client.status().segmentationMode}
             onSelectComponent={setSelectedRef}
             onProbePoint={handleProbePoint}
           />
@@ -230,6 +289,10 @@ export function App() {
               ))}
             </div>
           </div>
+
+          {diagnosis && (
+            <DiagnosticPanel boardName={board.name} evidence={diagnosis.evidence} verification={diagnosis.verification} />
+          )}
 
           <div className="tf-card tf-rework">
             <h3>REWORK GUIDANCE CARD</h3>

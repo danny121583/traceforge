@@ -94,6 +94,97 @@ export const RAIL_SPECS: Record<string, RailSpec> = {
   CC1: { name: 'CC1', nominalVolts: 0, tolerance: 0 },
 };
 
+/**
+ * Parse a multimeter voltage input into volts.
+ *
+ * Accepts raw numbers (volts), numeric strings, and suffixed forms:
+ * `3.3V`, `3300mV`, `500uV` (also `µV`/`μV`), with optional
+ * whitespace and sign — negative rails like `-12V` are valid.
+ * Throws a descriptive Error on malformed input.
+ */
+export function parseVoltage(input: string | number): number {
+  if (typeof input === 'number') {
+    if (!Number.isFinite(input)) throw new Error(`Invalid voltage: ${String(input)}`);
+    return input;
+  }
+  const text = input.trim();
+  if (!text) throw new Error('Invalid voltage: empty input.');
+  const m = text.match(/^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(µV|μV|uV|mV|V|v)?$/);
+  if (!m) throw new Error(`Invalid voltage: "${input}"`);
+  const magnitude = Number(m[1]);
+  if (!Number.isFinite(magnitude)) throw new Error(`Invalid voltage: "${input}"`);
+  const unit = (m[2] ?? 'V').toLowerCase();
+  if (unit === 'v') return magnitude;
+  if (unit === 'mv') return magnitude / 1000;
+  if (unit === 'uv' || unit === 'µv' || unit === 'μv') return magnitude / 1_000_000;
+  throw new Error(`Invalid voltage: "${input}"`);
+}
+
+const OPEN_CIRCUIT_TOKENS = new Set(['inf', '+inf', '-inf', 'infinity', 'ol', 'o.l', 'open', '---', '------']);
+
+function normalizeOhmUnit(raw: string): string {
+  return raw
+    .replace(/Ω/g, 'ohm')
+    .replace(/ω/g, 'ohm')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Parse a multimeter resistance input into ohms.
+ *
+ * Accepts raw numbers (ohms), numeric strings, and suffixed forms:
+ * `Ω`/`ohm`, `kΩ`/`k`, `MΩ`/`M`, `mΩ`, plus open-circuit indicators
+ * (`inf`, `OL`, `open`, `---`) which map to `Infinity`.
+ * Throws on malformed input (`"abc"`) and on negative resistance,
+ * which is physically meaningless for a passive reading.
+ */
+export function parseResistance(input: string | number): number {
+  if (typeof input === 'number') {
+    if (Number.isNaN(input)) throw new Error(`Invalid resistance: ${String(input)}`);
+    if (input === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(input) || input < 0) {
+      throw new Error(`Invalid resistance: ${String(input)}`);
+    }
+    return input;
+  }
+  const text = input.trim();
+  if (!text) throw new Error('Invalid resistance: empty input.');
+  if (OPEN_CIRCUIT_TOKENS.has(text.toLowerCase())) return Number.POSITIVE_INFINITY;
+  const m = text.match(/^([+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(.+)?$/);
+  if (!m) throw new Error(`Invalid resistance: "${input}"`);
+  const magnitude = Number(m[1]);
+  if (!Number.isFinite(magnitude)) throw new Error(`Invalid resistance: "${input}"`);
+  if (magnitude < 0) throw new Error(`Invalid resistance (negative): "${input}"`);
+  const unitRaw = (m[2] ?? '').trim();
+  if (!unitRaw) return magnitude;
+  // Mega (`M`) vs milli (`m`) differ by case only — dispatch on the raw
+  // unit before lowercasing.
+  if (/^(Ω|ω|ohm|ohms|r)$/.test(unitRaw)) return magnitude;
+  if (/^(kΩ|KΩ|kohm|Kohm|kOhm|KOHM|kohms|Kohms|k|K)$/.test(unitRaw)) return magnitude * 1000;
+  if (/^(MΩ|Mohm|MOhm|MOHM|Mohms|M)$/.test(unitRaw)) return magnitude * 1_000_000;
+  if (/^(mΩ|mohm|mOhm|milliohm|milliohms|mohm)$/.test(unitRaw)) return magnitude / 1000;
+  const unit = normalizeOhmUnit(unitRaw);
+  if (unit === 'kohm' || unit === 'kohms' || unit === 'k') return magnitude * 1000;
+  if (unit === 'mohms' || unit === 'm') return magnitude * 1_000_000;
+  throw new Error(`Invalid resistance: "${input}"`);
+}
+
+/**
+ * Validate a pair of probe-point ids selected on the canvas.
+ * Throws when either end is missing/blank, unknown, or both ends
+ * are the same point (a self-measurement proves nothing).
+ */
+export function validateProbePair(a: string | null | undefined, b: string | null | undefined, knownIds?: readonly string[]): void {
+  if (!a || !a.trim()) throw new Error('Probe point A is missing: select a first pad.');
+  if (!b || !b.trim()) throw new Error('Probe point B is missing: select a second pad.');
+  if (a.trim() === b.trim()) throw new Error(`Invalid probe pair: both probes are on "${a.trim()}".`);
+  if (knownIds) {
+    if (!knownIds.includes(a.trim())) throw new Error(`Unknown probe point: "${a}".`);
+    if (!knownIds.includes(b.trim())) throw new Error(`Unknown probe point: "${b}".`);
+  }
+}
+
 export function formatVolts(v: number): string {
   return `${v.toFixed(2)} V`;
 }
