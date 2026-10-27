@@ -306,6 +306,16 @@ button:disabled { opacity: 0.45; cursor: default; }
   padding: 8px 10px;
   background: var(--panel-2);
   white-space: normal;
+  min-width: 0;
+  overflow: hidden;
+  max-width: 100%;
+}
+.tf-board-card .tf-chip {
+  white-space: normal;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  line-height: 1.3;
+  text-align: left;
 }
 .tf-board-card strong { font-family: var(--mono); font-size: 12px; }
 .tf-board-symptom { font-family: var(--sans); font-size: 12px; color: var(--ink-dim); }

@@ -20,6 +20,8 @@ import { sanitizeForAuditText } from '../src/maas/security';
 import {
   MaasToolError,
   TraceForgeMaasService,
+  decryptSignedToken,
+  encryptSignedToken,
   maasErrorStatus,
 } from '../src/maas/tools';
 import { MetaClient } from '../src/lib/meta-client';
@@ -949,7 +951,7 @@ describe('17. live mode with an injected liveClient', () => {
 /* --------------------------------------------------------------- area 18 -- */
 
 describe('18. verified billing checkpoint', () => {
-  it('budget.status surfaces the $147.26 baseline and the verified $132.38 checkpoint', async () => {
+  it('budget.status surfaces the $147.26 baseline and the verified $122.78 checkpoint', async () => {
     const service = new TraceForgeMaasService();
     const budget = (await service.executeTool('traceforge.budget.status', {}, {})) as {
       startingBalanceUsd: number;
@@ -961,16 +963,341 @@ describe('18. verified billing checkpoint', () => {
       lastVerifiedTimestamp: string;
       verifiedRemainingBudgetUsd: number;
       verifiedNote: string;
+      ledgerScopeNote: string;
     };
     expect(budget.startingBalanceUsd).toBe(147.26);
     expect(budget.authorizedCeilingUsd).toBe(100);
     expect(budget.mandatoryReserveUsd).toBe(47.26);
     expect(budget.safetyThresholdUsd).toBe(95);
-    expect(budget.lastVerifiedBalanceUsd).toBe(132.38);
-    expect(budget.lastVerifiedConsumedUsd).toBe(14.88);
-    expect(budget.lastVerifiedTimestamp).toBe('2026-10-26T18:49:40-05:00');
-    expect(budget.verifiedRemainingBudgetUsd).toBeCloseTo(85.12, 2);
-    expect(budget.verifiedNote).toContain('$132.38');
-    expect(budget.verifiedNote).toContain('$14.88');
+    expect(budget.lastVerifiedBalanceUsd).toBe(122.78);
+    expect(budget.lastVerifiedConsumedUsd).toBe(24.48);
+    expect(budget.lastVerifiedTimestamp).toBe('2026-10-26T20:08:24-05:00');
+    expect(budget.verifiedRemainingBudgetUsd).toBeCloseTo(75.52, 2);
+    expect(budget.verifiedNote).toContain('$122.78');
+    expect(budget.verifiedNote).toContain('$24.48');
+    expect(budget.ledgerScopeNote).toContain('lastVerifiedConsumedUsd');
   });
+});
+
+/* --------------------------------------------------------------- area 19 -- */
+
+function stubLiveClient(onCall: () => void): MetaClient {
+  return new MetaClient({
+    mode: 'live',
+    apiKey: 'tf-test-live-key',
+    segmentationMode: 'static_fixture',
+    fetchFn: async () => {
+      onCall();
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{
+            message: {
+              content: 'Stubbed live reasoning. FINAL_DIAGNOSIS: {"componentRef":"U1","faultType":"solder_bridge","verificationStatus":"confirmed","explanation":"Stubbed live verdict."}',
+            },
+          }],
+          usage: { prompt_tokens: 12, completion_tokens: 6 },
+        }),
+      };
+    },
+  });
+}
+
+describe('19. explicit live-AI spending control', () => {
+  it("omitted mode defaults to simulated ($0.00) even when a liveClient is attached", async () => {
+    let liveCalls = 0;
+    const service = new TraceForgeMaasService({ liveClient: stubLiveClient(() => { liveCalls += 1; }) });
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+      OPERATOR,
+    )) as { scenarioId: string };
+    const started = (await service.executeTool(
+      'traceforge.investigations.start',
+      { scenarioId: created.scenarioId },
+      OPERATOR,
+    )) as { operationalMode: string; executionSource: string; completed: boolean };
+    expect(started.completed).toBe(true);
+    expect(started.operationalMode).toBe('SIMULATED');
+    expect(started.executionSource).toBe('Deterministic Virtual Lab');
+    expect(liveCalls).toBe(0);
+  });
+
+  it('explicit mode live invokes the liveClient and records LIVE_API telemetry', async () => {
+    let liveCalls = 0;
+    const service = new TraceForgeMaasService({ liveClient: stubLiveClient(() => { liveCalls += 1; }) });
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+      OPERATOR,
+    )) as { scenarioId: string };
+    const started = (await service.executeTool(
+      'traceforge.investigations.start',
+      { scenarioId: created.scenarioId, mode: 'live' },
+      OPERATOR,
+    )) as { operationalMode: string; executionSource: string };
+    expect(started.operationalMode).toBe('LIVE_API');
+    expect(started.executionSource).toBe('Live Muse Spark 1.3');
+    expect(liveCalls).toBeGreaterThan(0);
+  });
+
+  it('read-only models.status NEVER invokes live inference', async () => {
+    let liveCalls = 0;
+    const service = new TraceForgeMaasService({ liveClient: stubLiveClient(() => { liveCalls += 1; }) });
+    const before = (await service.executeTool('traceforge.models.status', {}, OPERATOR)) as {
+      spark: { operationalMode: string; liveVerified: boolean; executionSource: string; liveCredentialConfigured: boolean };
+    };
+    expect(liveCalls).toBe(0);
+    expect(before.spark.operationalMode).toBe('UNVERIFIED');
+    expect(before.spark.liveVerified).toBe(false);
+    expect(before.spark.executionSource).toBe('Live Muse Spark 1.3');
+    expect(before.spark.liveCredentialConfigured).toBe(true);
+
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+      OPERATOR,
+    )) as { scenarioId: string };
+    await service.executeTool('traceforge.investigations.start', { scenarioId: created.scenarioId, mode: 'live' }, OPERATOR);
+    expect(liveCalls).toBeGreaterThan(0);
+    const after = (await service.executeTool('traceforge.models.status', {}, OPERATOR)) as {
+      spark: { operationalMode: string; liveVerified: boolean };
+    };
+    expect(after.spark.operationalMode).toBe('LIVE_API');
+    expect(after.spark.liveVerified).toBe(true);
+  });
+
+  it('enforces the $95.00 safety stop against verified + runtime spend', async () => {
+    const service = new TraceForgeMaasService({ initialIncurredCostUsd: 70 });
+    expect(service.isBudgetSafetyBreached()).toBe(false);
+    service.injectLiveSpendForTesting(25.5);
+    expect(service.isBudgetSafetyBreached()).toBe(true);
+    const budget = (await service.executeTool('traceforge.budget.status', {}, {})) as {
+      safetyThresholdBreached: boolean;
+      ledger: { incurredCostUsd: number };
+    };
+    expect(budget.safetyThresholdBreached).toBe(true);
+    expect(budget.ledger.incurredCostUsd).toBeCloseTo(95.5, 6);
+  });
+
+  it('recordExternalLiveUsage feeds the shared runtime ledger', async () => {
+    const service = new TraceForgeMaasService();
+    service.recordExternalLiveUsage({ inputTokens: 1000, outputTokens: 500, providerReported: true });
+    const budget = (await service.executeTool('traceforge.budget.status', {}, {})) as {
+      ledger: { incurredCostUsd: number; inputTokens: number; outputTokens: number; totalRequests: number };
+    };
+    expect(budget.ledger.totalRequests).toBe(1);
+    expect(budget.ledger.inputTokens).toBe(1000);
+    expect(budget.ledger.outputTokens).toBe(500);
+    expect(budget.ledger.incurredCostUsd).toBeGreaterThan(0);
+  });
+});
+
+/* --------------------------------------------------------------- area 20 -- */
+
+describe('20. AES-256-GCM session tokens', () => {
+  const SECRET = 'tf-test-session-secret-v2';
+
+  it('encrypts to the scn_/inv_ format with a randomized IV', async () => {
+    const payload = { b: 0, f: 0, o: 'actor_test', x: 123, q: 1 };
+    const first = await encryptSignedToken('scn_', payload, SECRET);
+    const second = await encryptSignedToken('scn_', payload, SECRET);
+    expect(first).toMatch(/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(second).toMatch(/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(first).not.toBe(second);
+    expect(await decryptSignedToken('scn_', first, SECRET)).toEqual(payload);
+    expect(await decryptSignedToken('scn_', second, SECRET)).toEqual(payload);
+    const inv = await encryptSignedToken('inv_', { s: 'x', o: 'y', q: 2 }, SECRET);
+    expect(inv).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+  });
+
+  it('rejects bit flips, truncation, and wrong-key decryption', async () => {
+    const token = await encryptSignedToken('scn_', { b: 0, f: 0, o: 'actor_test', x: 1, q: 1 }, SECRET);
+    const hex = token.slice('scn_'.length, token.lastIndexOf('_'));
+    const flipIndex = 30;
+    const flippedChar = hex[flipIndex] === 'a' ? 'b' : 'a';
+    const flipped = `scn_${hex.slice(0, flipIndex)}${flippedChar}${hex.slice(flipIndex + 1)}${token.slice(token.lastIndexOf('_'))}`;
+    expect(await decryptSignedToken('scn_', flipped, SECRET)).toBeNull();
+    expect(await decryptSignedToken('scn_', token.slice(0, token.length - 10), SECRET)).toBeNull();
+    expect(await decryptSignedToken('scn_', token, 'wrong-secret')).toBeNull();
+    expect(await decryptSignedToken('inv_', token, SECRET)).toBeNull();
+  });
+
+  it('rejects rotated-secret tokens on cold-isolate hydration', async () => {
+    const serviceA = new TraceForgeMaasService();
+    const created = (await serviceA.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+      AGENT,
+    )) as { scenarioId: string };
+    // Same isolate still serves the in-memory record after rotation.
+    serviceA.rotateSessionSecret('tf-rotated-secret-v2');
+    const same = (await serviceA.executeTool(
+      'traceforge.measurements.voltage',
+      { scenarioId: created.scenarioId, node: 'U1-14' },
+      AGENT,
+    )) as { volts: number };
+    expect(typeof same.volts).toBe('number');
+    // A cold isolate holding only the new secret cannot hydrate the token.
+    const cold = new TraceForgeMaasService();
+    cold.rotateSessionSecret('tf-rotated-secret-v2');
+    await expectToolError(
+      cold.executeTool('traceforge.measurements.voltage', { scenarioId: created.scenarioId, node: 'U1-14' }, AGENT),
+      'MAAS_RESOURCE_NOT_FOUND',
+    );
+  });
+
+  it('isolates OAuth clients per actorId with scoped access and revocation', async () => {
+    const service = new TraceForgeMaasService();
+    const fullScopes = [
+      'traceforge:discovery:read',
+      'traceforge:circuits:read',
+      'traceforge:scenarios:read',
+      'traceforge:scenarios:write',
+      'traceforge:measurements:read',
+      'traceforge:measurements:execute',
+      'traceforge:investigations:read',
+      'traceforge:investigations:execute',
+      'traceforge:evaluation:score',
+    ];
+    service.getAuthenticator().registerDynamicToken({
+      token: 'tf_oauth_client_a_token',
+      actorId: 'actor_oauth_clientA',
+      role: 'agent',
+      scopes: fullScopes,
+    });
+    service.getAuthenticator().registerDynamicToken({
+      token: 'tf_oauth_client_b_token',
+      actorId: 'actor_oauth_clientB',
+      role: 'agent',
+      scopes: fullScopes,
+    });
+    const headersA = { authorization: 'Bearer tf_oauth_client_a_token' };
+    const headersB = { authorization: 'Bearer tf_oauth_client_b_token' };
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'esp32s3-sensor-node', faultSelector: 'nominal' },
+      headersA,
+    )) as { scenarioId: string };
+    await expectToolError(
+      service.executeTool('traceforge.measurements.voltage', { scenarioId: created.scenarioId, node: 'TP_5V' }, headersB),
+      'MAAS_CROSS_TENANT_ACCESS_DENIED',
+    );
+    const own = (await service.executeTool(
+      'traceforge.measurements.voltage',
+      { scenarioId: created.scenarioId, node: 'TP_5V' },
+      headersA,
+    )) as { volts: number };
+    expect(typeof own.volts).toBe('number');
+
+    // Scope enforcement: a discovery-only token cannot create scenarios.
+    service.getAuthenticator().registerDynamicToken({
+      token: 'tf_oauth_narrow_token',
+      actorId: 'actor_oauth_narrow',
+      role: 'readonly',
+      scopes: ['traceforge:discovery:read'],
+    });
+    await expectToolError(
+      service.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'esp32s3-sensor-node' },
+        { authorization: 'Bearer tf_oauth_narrow_token' },
+      ),
+      'MAAS_AUTHORIZATION_DENIED',
+    );
+
+    // Revocation: the revoked token fails with MAAS_CREDENTIALS_REVOKED.
+    service.getKillSwitch().revokeToken('tf_oauth_client_a_token');
+    await expectToolError(
+      service.executeTool('traceforge.measurements.voltage', { scenarioId: created.scenarioId, node: 'TP_5V' }, headersA),
+      'MAAS_CREDENTIALS_REVOKED',
+    );
+    service.getKillSwitch().restoreToken('tf_oauth_client_a_token');
+  });
+});
+
+/* --------------------------------------------------------------- area 21 -- */
+
+describe('21. all-3-board fault matrix end to end', () => {
+  const MATRIX: Array<{ boardId: string; faultId: string; voltageNode: string; currentComponent: string; continuity: [string, string] }> = [
+    { boardId: 'f405-flight-controller', faultId: 'f405-nrst-gnd-short', voltageNode: 'U1-14', currentComponent: 'R_LOAD', continuity: ['U1-14', 'GND'] },
+    { boardId: 'f405-flight-controller', faultId: 'f405-pullup-open', voltageNode: 'TP_NRST', currentComponent: 'R_LOAD', continuity: ['TP_3V3', 'GND'] },
+    { boardId: 'f405-flight-controller', faultId: 'f405-pullup-drift', voltageNode: 'U1-15', currentComponent: 'R_PULLUP', continuity: ['U1-14', 'GND'] },
+    { boardId: 'esp32s3-sensor-node', faultId: 'esp32-c4-rev-leak', voltageNode: 'TP_5V', currentComponent: 'R_LOAD', continuity: ['C4-POS', 'GND'] },
+    { boardId: 'esp32s3-sensor-node', faultId: 'esp32-f1-blown', voltageNode: 'U2-OUT', currentComponent: 'F1', continuity: ['TP_5V', 'GND'] },
+    { boardId: 'esp32s3-sensor-node', faultId: 'esp32-div-drift', voltageNode: 'TP_5V', currentComponent: 'R_DIV1', continuity: ['C4-POS', 'GND'] },
+    { boardId: 'usbc-pd-trigger', faultId: 'usbc-d2-shorted', voltageNode: 'CC1', currentComponent: 'R_PU1', continuity: ['CC1', 'CC2'] },
+    { boardId: 'usbc-pd-trigger', faultId: 'usbc-cc1-pu-open', voltageNode: 'CC2', currentComponent: 'R_RD1', continuity: ['CC1', 'CC2'] },
+    { boardId: 'usbc-pd-trigger', faultId: 'usbc-rd-drift', voltageNode: 'CC1', currentComponent: 'R_PU2', continuity: ['CC2', 'GND'] },
+  ];
+
+  for (const entry of MATRIX) {
+    it(`${entry.boardId} / ${entry.faultId}: MCP tools match local MNA end to end`, async () => {
+      const service = new TraceForgeMaasService();
+      const created = (await service.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: entry.boardId, faultSelector: entry.faultId },
+        AGENT,
+      )) as { scenarioId: string; boardId: string };
+      expect(created.scenarioId).toMatch(/^scn_[0-9a-f]+_[0-9a-f]{8}$/);
+      expect(created.boardId).toBe(entry.boardId);
+
+      const localSession = createVirtualSession(entry.boardId, entry.faultId);
+      const localVolts = localSession.measureVoltage(entry.voltageNode).volts;
+      const localAmps = localSession.measureCurrent(entry.currentComponent).amps;
+      const volts = (await service.executeTool(
+        'traceforge.measurements.voltage',
+        { scenarioId: created.scenarioId, node: entry.voltageNode },
+        AGENT,
+      )) as { volts: number; abnormal: boolean };
+      expect(volts.volts).toBeCloseTo(localVolts, 9);
+
+      const current = (await service.executeTool(
+        'traceforge.measurements.current',
+        { scenarioId: created.scenarioId, componentId: entry.currentComponent },
+        AGENT,
+      )) as { amps: number };
+      expect(current.amps).toBeCloseTo(localAmps, 9);
+
+      const continuity = (await service.executeTool(
+        'traceforge.measurements.continuity',
+        { scenarioId: created.scenarioId, probeA: entry.continuity[0], probeB: entry.continuity[1] },
+        AGENT,
+      )) as { continuous: boolean };
+      expect(typeof continuity.continuous).toBe('boolean');
+
+      const started = (await service.executeTool(
+        'traceforge.investigations.start',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { investigationId: string; operationalMode: string; completed: boolean };
+      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+      expect(started.operationalMode).toBe('SIMULATED');
+      expect(started.completed).toBe(true);
+
+      const result = (await service.executeTool(
+        'traceforge.investigations.result',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { proposedDiagnosis: { componentRef: string; faultType: string } };
+      expect(result.proposedDiagnosis.componentRef.length).toBeGreaterThan(0);
+      expect(leakedKeys(result)).toEqual([]);
+
+      const score = (await service.executeTool(
+        'traceforge.evaluation.score',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { score: { totalScore: number } | null; groundTruth: { faultId?: string } };
+      expect(score.score === null || typeof score.score.totalScore === 'number').toBe(true);
+
+      const report = (await service.executeTool(
+        'traceforge.evaluation.report',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { scenarioId: string; boardId: string };
+      expect(report.scenarioId).toBe(created.scenarioId);
+      expect(report.boardId).toBe(entry.boardId);
+    });
+  }
 });

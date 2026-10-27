@@ -1,0 +1,24 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "vite",
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/meta/:path*",
+      "destination": "https://traceforge-mcp-staging.apd1034.workers.dev/api/meta/:path*"
+    },
+    {
+      "source": "/api/maas/:path*",
+      "destination": "https://traceforge-mcp-staging.apd1034.workers.dev/api/maas/:path*"
+    },
+    {
+      "source": "/mcp",
+      "destination": "https://traceforge-mcp-staging.apd1034.workers.dev/mcp"
+    },
+    {
+      "source": "/health",
+      "destination": "https://traceforge-mcp-staging.apd1034.workers.dev/health"
+    }
+  ]
+}

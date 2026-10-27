@@ -249,6 +249,15 @@ export class MaasAuthenticator {
   }
 
   /**
+   * Register a verified OAuth 2.1 PKCE access token with its actual actorId
+   * (`actor_oauth_<clientId>`) and granted scopes, so each OAuth client gets
+   * an isolated actor instead of sharing one operator token.
+   */
+  registerDynamicToken(record: MaasTokenRecord): void {
+    this.tokens.set(record.token, { ...record, scopes: [...record.scopes] });
+  }
+
+  /**
    * Enforce access for one capability: public capabilities allow anonymous
    * readers; every other capability needs a valid token plus `requiredScope`.
    */

@@ -160,6 +160,25 @@ Before every push:
 
 This policy applies permanently to all Antigravity and Muse Code sessions.
 
+### README & Documentation Maintenance Policy
+
+1. `README.md` is the authoritative public-facing technical overview of the current application, subject to factual implementation verification.
+2. Every development task must evaluate whether README changes are required.
+3. Any task that changes documented functionality, architecture, configuration, deployment, security, interfaces, or user workflows must update README in the same branch and implementation change set.
+4. Muse Code authors implementation-related README changes.
+5. Antigravity independently verifies documentation against the current source code.
+6. Documentation accuracy is required before a milestone is accepted.
+7. Documentation must distinguish implemented, partially implemented, planned, deferred, and unavailable capabilities.
+8. Never describe a deterministic diagnostic engine as live model inference.
+9. Never describe static PCB artwork as live SAM segmentation.
+10. Never claim unverified production readiness, benchmark performance, or provider costs.
+11. Do not hardcode frequently changing balances, timestamps, test totals, or deployment identifiers as timeless facts.
+12. No README may contain private credentials, API keys, bearer tokens, sensitive infrastructure details, or personal information.
+13. All meaningful feature changes must be accompanied by appropriate changelog entries.
+14. Before every Git push, Antigravity must evaluate README impact.
+15. Before a branch is approved for merge, Antigravity must confirm README accuracy.
+16. A task cannot be marked fully complete if required documentation is missing or stale.
+
 ---
 
 ## 5. Testing Requirements
@@ -173,6 +192,7 @@ Every implemented feature requires:
 6. **Error handling** (strict validation of invalid inputs, singular matrices, disconnected nodes, missing keys, etc.).
 7. **Security consideration** (ensuring API keys cannot leak into browser bundles or client-visible state).
 8. **Actual-versus-mock capability classification.**
+9. **README and documentation verification** (confirming `README.md` and `CHANGELOG.md` accurately reflect the current source code, capabilities, architecture, and limitations before any push or merge).
 
 - Antigravity must verify results independently rather than merely trusting Muse Code's completion statement.
 - **A passing test suite must NEVER be presented as proof that an external AI model or API is functioning if the tests use mocks.**
@@ -211,8 +231,9 @@ Keep the following concepts strictly distinct in data structures, prompts, and U
 
 ## 8. Budget Control & Promotional Credit Policy
 
-- **Baseline & Ceiling (Recorded 2026-10-26T15:56:48-05:00):**
+- **Baseline & Ceiling (Recorded 2026-10-26T15:56:48-05:00; Latest Verified Provider Snapshot 2026-10-26T20:08:24-05:00):**
   - **Starting Promotional Balance:** **$147.26**
+  - **Latest Verified Promotional Balance:** **$122.78** (**$24.48** cumulative consumed across Muse Code CLI and live runtime API; **$75.52** remaining of the **$100.00** authorized budget)
   - **Maximum Authorized Additional Consumption:** **$100.00**
   - **Mandatory Target Ending Promotional Balance:** **$47.26 or more**
   - **Internal Safety Threshold:** **$95.00** of incremental reported/estimated consumption (stop discretionary model usage at $95.00 to preserve a $5.00 buffer against billing delay).
@@ -250,6 +271,17 @@ Keep the following concepts strictly distinct in data structures, prompts, and U
   - Full nonlinear/transient SPICE component coverage.
   - Physical hardware connections or peripherals.
   - Multiuser accounts, cloud databases, or secondary AI models.
+
+---
+
+## 8c. Website Hosting & Deployment Policy (Vercel Hobby $0 Only)
+
+- **Vercel Hobby Plan Only ($0/month):** Frontend hosting must use the free Vercel Hobby plan only while the project remains eligible (personal, non-commercial hackathon demonstration).
+- **Zero-Cost Guarantee:** No paid plans (Pro/Enterprise), no Pro trials, no paid add-ons or subscriptions, no paid domains, no paid storage/database upgrades, and no usage-based billing or overage charges (`$0.00` monthly and incremental hosting cost).
+- **Pre-Deployment Cost Verification:** Verify plan eligibility and `$0.00` hosting cost before any deployment.
+- **Documentation Sync:** Update `README.md` and `CHANGELOG.md` whenever deployment configuration, URLs, or backend routing changes.
+- **Independent Verification:** Independently test the deployed website over HTTPS (desktop/mobile UI, all 3 reference circuits, virtual measurements, progressive probing, scoring, recorded replay, and backend connectivity) after every deployment.
+- **Project Isolation on Vercel:** Never modify or touch existing projects (`health-erecords-public`, `webcraft-studio`, etc.). Keep `META_API_KEY` strictly on the Cloudflare Worker server secret (`traceforge-mcp-staging`), never in `VITE_*` or frontend environment variables.
 
 ---
 
