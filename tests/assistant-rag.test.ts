@@ -12,6 +12,7 @@ import {
   sanitizeAssistantSessionContext,
 } from '../src/lib/rag-engine';
 import {
+  STANDARD_20_QA_BENCHMARK,
   handleAssistantChat,
   issueAssistantSessionTicket,
   verifyAssistantSessionTicket,
@@ -82,7 +83,7 @@ async function ticketFor(secret = CHAT_SECRET): Promise<string> {
 
 describe('knowledge base versioning and topic coverage', () => {
   it('pins KB_VERSION and covers all 18 required topics', () => {
-    expect(KB_VERSION).toBe('2026.10.27-v2');
+    expect(KB_VERSION).toBe('2026.10.27-v3');
     expect(KNOWLEDGE_BASE_ENTRIES).toHaveLength(18);
     const titles = KNOWLEDGE_BASE_ENTRIES.map((e) => e.title);
     for (const required of [
@@ -607,4 +608,126 @@ describe('authorized live inference path', () => {
     expect((handled.payload as { liveInvoked: boolean }).liveInvoked).toBe(true);
     expect(calls).toBe(1);
   });
+});
+
+/* ------------------------------------------------------------------ */
+
+describe('standard 20-question QA benchmark definition', () => {
+  it('defines 20 stable items covering all 18 topics plus a refusal probe', () => {
+    expect(STANDARD_20_QA_BENCHMARK).toHaveLength(20);
+    expect(STANDARD_20_QA_BENCHMARK.map((item) => item.id)).toEqual(
+      Array.from({ length: 20 }, (_, i) => i + 1),
+    );
+    const covered = new Set<string>();
+    let refusals = 0;
+    for (const item of STANDARD_20_QA_BENCHMARK) {
+      expect(item.question.length).toBeGreaterThan(0);
+      expect(item.mustContainTerms.length).toBeGreaterThan(0);
+      if (item.expectedPolicyRefusal === true) {
+        refusals += 1;
+      } else {
+        expect(item.expectedTopicIds?.length).toBeGreaterThan(0);
+        for (const topic of item.expectedTopicIds ?? []) covered.add(topic);
+      }
+    }
+    expect(refusals).toBe(1);
+    const entryIds = new Set(KNOWLEDGE_BASE_ENTRIES.map((e) => e.id));
+    expect(entryIds.size).toBe(18);
+    for (const id of entryIds) {
+      expect(covered.has(id)).toBe(true);
+    }
+  });
+
+  it('answers every benchmark question knowledge-only with grounding', () => {
+    const failures: string[] = [];
+    for (const item of STANDARD_20_QA_BENCHMARK) {
+      const rag = queryTraceForgeRAG(item.question, ACTIVE_SESSION);
+      const grounded = rag.sources.length > 0 || rag.blockedByPolicy;
+      const topicOk = item.expectedPolicyRefusal === true
+        ? rag.blockedByPolicy
+        : (item.expectedTopicIds ?? []).some((t) => rag.topicIds.includes(t));
+      if (!grounded || !topicOk) {
+        failures.push(
+          `#${item.id} coverage=${rag.coverage} topics=[${rag.topicIds.join(',')}] blocked=${rag.blockedByPolicy}`,
+        );
+      }
+    }
+    expect(failures).toEqual([]);
+  });
+});
+
+describe('MCP 20-question QA benchmark end to end', () => {
+  it('passes 20/20 knowledge-only at $0.00 with kbVersion v3', async () => {
+    const service = new TraceForgeMaasService();
+    const report = (await service.executeTool(
+      'traceforge.chat.ask',
+      { runStandard20QuestionQa: true },
+      { authorization: 'Bearer tf_agent_local_token' },
+    )) as {
+      qaMode: boolean;
+      kbVersion: string;
+      totalQuestions: number;
+      passedCount: number;
+      failedCount: number;
+      allPassed: boolean;
+      liveCallsInvoked: number;
+      totalInputTokens: number;
+      totalOutputTokens: number;
+      totalCostUsd: number;
+      results: Array<{
+        index: number;
+        question: string;
+        answer: string;
+        sources: Array<{ entryId: string; title: string; excerpt: string }>;
+        topicIds: string[];
+        mode: string;
+        liveInvoked: boolean;
+        tokens: { inputTokens: number; outputTokens: number };
+        costUsd: number;
+        groundingVerified: boolean;
+        accuracyVerified: boolean;
+        passed: boolean;
+      }>;
+    };
+    const failed = report.results.filter((r) => !r.passed);
+    expect({
+      qaMode: report.qaMode,
+      kbVersion: report.kbVersion,
+      total: report.totalQuestions,
+      passed: report.passedCount,
+      failed: report.failedCount,
+      allPassed: report.allPassed,
+      live: report.liveCallsInvoked,
+      cost: report.totalCostUsd,
+      failures: failed.map((r) => ({
+        index: r.index,
+        question: r.question,
+        answer: r.answer.slice(0, 300),
+        topics: r.topicIds,
+        grounding: r.groundingVerified,
+        accuracy: r.accuracyVerified,
+      })),
+    }).toEqual({
+      qaMode: true,
+      kbVersion: '2026.10.27-v3',
+      total: 20,
+      passed: 20,
+      failed: 0,
+      allPassed: true,
+      live: 0,
+      cost: 0,
+      failures: [],
+    });
+    expect(report.totalInputTokens).toBe(0);
+    expect(report.totalOutputTokens).toBe(0);
+    for (const result of report.results) {
+      expect(result.answer.length).toBeGreaterThan(0);
+      expect(result.liveInvoked).toBe(false);
+      expect(result.tokens).toEqual({ inputTokens: 0, outputTokens: 0 });
+      expect(result.costUsd).toBe(0);
+      const text = JSON.stringify({ answer: result.answer, sources: result.sources });
+      expect(text).not.toContain('hiddenFault');
+      expect(text).not.toContain('targetComponentRef');
+    }
+  }, 60000);
 });

@@ -11,7 +11,7 @@
  * costs $0.00 and never invokes live model inference.
  */
 
-export const KB_VERSION = '2026.10.27-v2';
+export const KB_VERSION = '2026.10.27-v3';
 
 export interface KnowledgeBaseEntry {
   /** Stable entry id (used in RAG source citations). */
@@ -203,9 +203,9 @@ export const KNOWLEDGE_BASE_ENTRIES: KnowledgeBaseEntry[] = [
     topics: ['mcp', 'oauth', 'integration', 'api', 'pkce'],
     keywords: ['mcp', 'oauth', 'pkce', 'token', 'scope', 'bearer', 'json-rpc', 'api', 'tools', 'register', 'authorize'],
     content: [
-      'The staging backend (traceforge-mcp-staging) serves the 18-tool MaaS/MCP surface over MCP 2025-06-18 streamable-HTTP JSON-RPC at /mcp, plus MaaS REST (/api/maas/*) and browser backend routes (/api/meta/*). Public tools (capabilities, status, models, budget, circuits) need no token; every other tool needs a Bearer token carrying its listed scope.',
-      'OAuth clients use RFC 7591 dynamic registration plus PKCE S256: POST /oauth/register, then GET /oauth/authorize with a code_challenge, then POST /oauth/token with the code_verifier (grant_type authorization_code, refresh via grant_type refresh_token, revoke via POST /oauth/revoke). Each issued token binds to its own actor_oauth_<clientId> actor with only its granted scopes, and scenarios stay strictly per-actor.',
-      'Session tokens (scn_… scenario ids, inv_… investigation ids) are self-contained AES-256-GCM authenticated tokens: any worker isolate holding the session secret can hydrate them, and committed probes, investigations, and scorecards synchronize through Edge Cache plus the TraceForgeStateDO Durable Object coordinator. Typical flow: scenarios.create, measurements.voltage/current/continuity, investigations.start, evaluation.score, evaluation.report.',
+      'The staging backend (traceforge-mcp-staging) serves the 25-tool MaaS/MCP surface over MCP 2025-06-18 streamable-HTTP JSON-RPC at /mcp, plus MaaS REST (/api/maas/*) and browser backend routes (/api/meta/*). Public tools (capabilities, status, models, budget, circuits) need no token (this includes kb.search and chat.status); the 7 assistant and knowledge base tools are traceforge.kb.search (public versioned knowledge search at zero cost), traceforge.chat.status (public assistant status and the shared $2.00 live-chat ledger), traceforge.chat.start (open a session-grounded conversation), traceforge.chat.ask (RAG-first answers plus the built-in 20-question QA benchmark via runStandard20QuestionQa), traceforge.chat.history, traceforge.chat.clear, and traceforge.chat.feedback; conversation tools accept traceforge:discovery:read, and traceforge:assistant:chat is also granted to agent and owner tokens. Every other tool needs a Bearer token carrying its listed scope.',
+      'OAuth 2.1 + PKCE S256 works for ChatGPT, Muse / Meta AI, and generic MCP clients via RFC 7591 dynamic registration (client_name optional): POST /oauth/register, then GET /oauth/authorize with a code_challenge, then POST /oauth/token with the code_verifier (grant_type authorization_code, refresh via grant_type refresh_token, revoke via POST /oauth/revoke). Each issued token binds to its own actor_oauth_<clientId> actor with only its granted scopes, and scenarios plus assistant conversations stay strictly per-actor. Discovery metadata lives at /.well-known/oauth-protected-resource (with resource_documentation pointing at GET /docs/mcp, which documents all 25 tools) and /.well-known/oauth-authorization-server.',
+      'Session tokens (scn_… scenario ids, inv_… investigation ids) are self-contained AES-256-GCM authenticated tokens: any worker isolate holding the session secret can hydrate them, and committed probes, investigations, scorecards, conversations, and feedback synchronize through Edge Cache plus the TraceForgeStateDO Durable Object coordinator. Typical flows: scenarios.create, measurements.voltage/current/continuity, investigations.start, evaluation.score, evaluation.report — and chat.start, chat.ask (optionally grounded in an owned scenarioId with HiddenFault strictly withheld), chat.history, chat.feedback, chat.clear, kb.search, chat.status.',
     ].join('\n\n'),
   },
   {

@@ -52,8 +52,8 @@ import {
 
 /** Worker name registered in `wrangler.toml`. */
 export const WORKER_NAME = 'traceforge-mcp-staging';
-/** Registered MaaS tool count served by this staging worker. */
-export const WORKER_TOOL_COUNT = 18;
+/** Registered MaaS tool count served by this staging worker (18 circuit-diagnostic + 7 assistant/KB). */
+export const WORKER_TOOL_COUNT = 25;
 /** Local operator token that PKCE-issued tokens map to. */
 export const WORKER_OPERATOR_TOKEN = 'tf_operator_live_token';
 /** Default OAuth scope string minted with PKCE access tokens. */
@@ -66,6 +66,7 @@ export const WORKER_DEFAULT_SCOPE = [
   'traceforge:investigations:read',
   'traceforge:investigations:execute',
   'traceforge:evaluation:score',
+  'traceforge:assistant:chat',
   'traceforge:live_inference:execute',
 ].join(' ');
 
@@ -80,6 +81,7 @@ export const WORKER_SCOPES = [
   'traceforge:investigations:read',
   'traceforge:investigations:execute',
   'traceforge:evaluation:score',
+  'traceforge:assistant:chat',
   'traceforge:live_inference:execute',
   'traceforge:audit:read',
 ];
@@ -147,6 +149,7 @@ interface OAuthClientRecord {
   clientId: string;
   redirectUris: string[];
   createdAtMs: number;
+  clientName?: string;
 }
 
 /** Persistent state record for an OAuth 2.1 refresh token (rotation + revocation). */
@@ -842,6 +845,18 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       case 'ping': {
         return ok({});
       }
+      case 'server/discover': {
+        return ok({
+          serverInfo: { name: WORKER_NAME, version: '0.1.0' },
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          tools: service.listCapabilities().map((t) => ({
+            name: t.name,
+            description: t.description,
+            inputSchema: t.inputSchema,
+            annotations: t.annotations,
+          })),
+        });
+      }
       case 'tools/list': {
         return ok({
           tools: service.listCapabilities().map((t) => ({
@@ -994,10 +1009,35 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       return jsonResponse(200, {
         resource: `${origin}/mcp`,
         resource_name: 'TraceForge MaaS',
+        resource_documentation: `${origin}/docs/mcp`,
         authorization_servers: [origin],
         scopes_supported: [...WORKER_SCOPES],
         bearer_methods_supported: ['header'],
         token_endpoint_auth_methods_supported: ['none'],
+      }, correlationId);
+    }
+
+    if (method === 'GET' && path === '/docs/mcp') {
+      return jsonResponse(200, {
+        name: 'TraceForge MaaS/MCP',
+        worker: WORKER_NAME,
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        transport: 'streamable-http',
+        mcpEndpoint: `${origin}/mcp`,
+        toolCount: WORKER_TOOL_COUNT,
+        tools: service.listCapabilities().map((t) => t.name),
+        oauth: {
+          dynamicRegistration: `${origin}/oauth/register (RFC 7591; client_name optional)`,
+          authorize: `${origin}/oauth/authorize (PKCE S256 code_challenge required)`,
+          token: `${origin}/oauth/token (grant_type authorization_code | refresh_token)`,
+          revoke: `${origin}/oauth/revoke`,
+          clients: [
+            'ChatGPT / OpenAI connectors (https redirect URIs)',
+            'Muse / Meta AI agents (https://agent.meta.ai/api/oauth/callback, https://agent.meta.ai/api/hatch/oauth/callback)',
+            'Generic standards-compliant MCP clients (https, or http://localhost for development)',
+          ],
+        },
+        notes: 'Public tools (capabilities, status, models, budget, circuits, kb.search, chat.status) need no token. Conversation and diagnostic tools accept traceforge:discovery:read; traceforge:assistant:chat is also granted. Assistant answers are RAG-first at $0.00 unless live inference is explicitly authorized.',
       }, correlationId);
     }
 
@@ -1028,14 +1068,22 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       if (!Array.isArray(redirectUris) || redirectUris.length === 0 || !redirectUris.every((u) => typeof u === 'string')) {
         return oauthError(400, 'invalid_request', 'redirect_uris must be a non-empty string array (RFC 7591).', correlationId);
       }
+      // `client_name` is optional metadata (ChatGPT, Muse / Meta AI, and
+      // generic MCP clients may send it or omit it); it never affects
+      // acceptance and is echoed back per RFC 7591 when provided.
+      const clientName = typeof record['client_name'] === 'string' && record['client_name'].length > 0
+        ? (record['client_name'] as string).slice(0, 200)
+        : undefined;
       const clientId = randomHex('tf_client', 12);
       oauthClients.set(clientId, {
         clientId,
         redirectUris: redirectUris as string[],
         createdAtMs: clock(),
+        ...(clientName !== undefined ? { clientName } : {}),
       });
       return jsonResponse(201, {
         client_id: clientId,
+        ...(clientName !== undefined ? { client_name: clientName } : {}),
         client_secret_expires_at: 0,
         redirect_uris: redirectUris,
         grant_types: ['authorization_code', 'refresh_token'],

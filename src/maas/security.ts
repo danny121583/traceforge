@@ -44,6 +44,7 @@ export const MAAS_LOCAL_TOKENS: MaasTokenRecord[] = [
       'traceforge:investigations:read',
       'traceforge:investigations:execute',
       'traceforge:evaluation:score',
+      'traceforge:assistant:chat',
     ],
   },
   {
@@ -60,6 +61,7 @@ export const MAAS_LOCAL_TOKENS: MaasTokenRecord[] = [
       'traceforge:investigations:read',
       'traceforge:investigations:execute',
       'traceforge:evaluation:score',
+      'traceforge:assistant:chat',
     ],
   },
   {
@@ -76,6 +78,7 @@ export const MAAS_LOCAL_TOKENS: MaasTokenRecord[] = [
       'traceforge:investigations:read',
       'traceforge:investigations:execute',
       'traceforge:evaluation:score',
+      'traceforge:assistant:chat',
       'traceforge:live_inference:execute',
       'traceforge:audit:read',
     ],

@@ -75,6 +75,7 @@ const ALL_MAAS_SCOPES = [
   'traceforge:investigations:read',
   'traceforge:investigations:execute',
   'traceforge:evaluation:score',
+  'traceforge:assistant:chat',
   'traceforge:live_inference:execute',
   'traceforge:audit:read',
 ];
@@ -158,8 +159,25 @@ async function handleMcpRpc(
       });
       return;
     }
+    case 'notifications/initialized': {
+      ok({});
+      return;
+    }
     case 'ping': {
       ok({});
+      return;
+    }
+    case 'server/discover': {
+      ok({
+        serverInfo: { name: 'traceforge-maas', version: '0.1.0' },
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        tools: service.listCapabilities().map((t) => ({
+          name: t.name,
+          description: t.description,
+          inputSchema: t.inputSchema,
+          annotations: t.annotations,
+        })),
+      });
       return;
     }
     case 'tools/list': {

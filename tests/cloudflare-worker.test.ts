@@ -128,7 +128,7 @@ describe('worker health and CORS', () => {
     const body = (await readJson(res)) as Record<string, unknown>;
     expect(body['worker']).toBe('traceforge-mcp-staging');
     expect(body['protocolVersion']).toBe('2025-06-18');
-    expect(body['toolCount']).toBe(18);
+    expect(body['toolCount']).toBe(25);
     expect(body['project']).toBe('TraceForge');
     expect(body['isolation']).toBe('independent-from-health-erecords');
   });
@@ -292,7 +292,7 @@ describe('authenticated MCP over the Worker', () => {
     expect((ping.envelope['result'] as Record<string, unknown>)).toEqual({});
 
     const listed = await mcpCall(worker, 'tools/list', {});
-    expect((listed.envelope['result'] as { tools: unknown[] }).tools).toHaveLength(18);
+    expect((listed.envelope['result'] as { tools: unknown[] }).tools).toHaveLength(25);
 
     const resources = await mcpCall(worker, 'resources/list', {});
     expect((resources.envelope['result'] as { resources: unknown[] }).resources).toHaveLength(3);
@@ -353,7 +353,7 @@ describe('authenticated MCP over the Worker', () => {
     expect(((await readJson(status)) as { service: string }).service).toBe('traceforge-maas');
 
     const catalog = await worker.fetch(new Request(workerUrl('/api/maas/catalog')));
-    expect(((await readJson(catalog)) as { count: number }).count).toBe(18);
+    expect(((await readJson(catalog)) as { count: number }).count).toBe(25);
 
     const anonymousAudit = await worker.fetch(new Request(workerUrl('/api/maas/audit')));
     expect(anonymousAudit.status).toBe(401);
@@ -407,7 +407,7 @@ describe('Phase 4: root and MCP discovery endpoints', () => {
     };
     expect(body.worker).toBe('traceforge-mcp-staging');
     expect(body.protocolVersion).toBe('2025-06-18');
-    expect(body.toolCount).toBe(18);
+    expect(body.toolCount).toBe(25);
     expect(body.project).toBe('TraceForge');
     expect(body.isolation).toBe('independent-from-health-erecords');
     expect(body.endpoints.mcp).toBe(`${ORIGIN}/mcp`);
@@ -426,7 +426,7 @@ describe('Phase 4: root and MCP discovery endpoints', () => {
       expect(body['protocolVersion']).toBe('2025-06-18');
       expect(body['transport']).toBe('streamable-http');
       expect(body['endpoint']).toBe(`${ORIGIN}/mcp`);
-      expect(body['toolCount']).toBe(18);
+      expect(body['toolCount']).toBe(25);
     }
   });
 });
@@ -1543,5 +1543,163 @@ describe('worker package independence', () => {
     expect(source).not.toMatch(/from\s+['"][^'"]*health[^'"]*['"]/i);
     expect(source).not.toMatch(/require\s*\([^)]*health/i);
     expect(source).toContain('independent-from-health-erecords');
+  });
+});
+
+describe('assistant MCP parity over the Worker (25 tools)', () => {
+  it('documents resource_documentation and serves GET /docs/mcp with the 25-tool catalog', async () => {
+    const worker = createTraceForgeWorker();
+    const meta = (await readJson(
+      await worker.fetch(new Request(workerUrl('/.well-known/oauth-protected-resource'))),
+    )) as { resource_documentation: string; scopes_supported: string[] };
+    expect(meta.resource_documentation).toBe(`${ORIGIN}/docs/mcp`);
+    expect(meta.scopes_supported).toContain('traceforge:assistant:chat');
+
+    const docs = await worker.fetch(new Request(workerUrl('/docs/mcp')));
+    expect(docs.status).toBe(200);
+    const body = (await readJson(docs)) as {
+      toolCount: number; tools: string[]; protocolVersion: string;
+      oauth: { dynamicRegistration: string; clients: string[] };
+    };
+    expect(body.toolCount).toBe(25);
+    expect(body.protocolVersion).toBe('2025-06-18');
+    for (const name of [
+      'traceforge.kb.search',
+      'traceforge.chat.status',
+      'traceforge.chat.start',
+      'traceforge.chat.ask',
+      'traceforge.chat.history',
+      'traceforge.chat.clear',
+      'traceforge.chat.feedback',
+    ]) {
+      expect(body.tools).toContain(name);
+    }
+    expect(body.oauth.clients.join(' ')).toContain('agent.meta.ai');
+  });
+
+  it('accepts DCR from ChatGPT, Muse/Meta AI, and generic clients with or without client_name', async () => {
+    const cases = [
+      { name: 'ChatGPT with client_name', body: { client_name: 'ChatGPT TraceForge', redirect_uris: ['https://chatgpt.com/connector_platform_oauth_redirect'] } },
+      { name: 'ChatGPT without client_name', body: { redirect_uris: ['https://chatgpt.com/connector_platform_oauth_redirect'] } },
+      { name: 'Muse hatch with client_name', body: { client_name: 'Muse', redirect_uris: ['https://agent.meta.ai/api/hatch/oauth/callback'] } },
+      { name: 'Muse api without client_name', body: { redirect_uris: ['https://agent.meta.ai/api/oauth/callback'] } },
+      { name: 'generic localhost', body: { client_name: 'dev-client', redirect_uris: ['http://localhost:8787/callback'] } },
+    ];
+    for (const c of cases) {
+      const worker = createTraceForgeWorker();
+      const res = await worker.fetch(
+        new Request(workerUrl('/oauth/register'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(c.body),
+        }),
+      );
+      expect(res.status).toBe(201);
+      const client = (await readJson(res)) as { client_id: string; client_name?: string; redirect_uris: string[] };
+      expect(client.client_id.length).toBeGreaterThan(0);
+      expect(client.redirect_uris).toEqual((c.body as { redirect_uris: string[] }).redirect_uris);
+    }
+  });
+
+  it('runs the assistant conversation lifecycle with a Muse-style PKCE OAuth token', async () => {
+    const worker = createTraceForgeWorker();
+    const reg = await worker.fetch(
+      new Request(workerUrl('/oauth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_name: 'Muse test agent',
+          redirect_uris: ['https://agent.meta.ai/api/hatch/oauth/callback'],
+        }),
+      }),
+    );
+    expect(reg.status).toBe(201);
+    const client = (await readJson(reg)) as RegisteredClient;
+    const { accessToken, scope } = await fullPkceToken({ worker, client });
+    expect(scope).toContain('traceforge:discovery:read');
+    expect(scope).toContain('traceforge:assistant:chat');
+    const auth = `Bearer ${accessToken}`;
+
+    const started = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.chat.start',
+      arguments: { title: 'oauth lifecycle' },
+    }, auth);
+    const conv = (started.envelope['result'] as { structuredContent: { conversationId: string; ownerActorId: string } }).structuredContent;
+    expect(conv.conversationId.startsWith('conv_')).toBe(true);
+    expect(conv.ownerActorId.startsWith('actor_oauth_')).toBe(true);
+
+    const asked = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.chat.ask',
+      arguments: { conversationId: conv.conversationId, message: 'How does TraceForge work?' },
+    }, auth);
+    const answer = (asked.envelope['result'] as { structuredContent: { reply: string; liveInvoked: boolean; kbVersion: string } }).structuredContent;
+    expect(answer.reply.length).toBeGreaterThan(0);
+    expect(answer.liveInvoked).toBe(false);
+    expect(answer.kbVersion).toBe('2026.10.27-v3');
+
+    const history = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.chat.history',
+      arguments: { conversationId: conv.conversationId },
+    }, auth);
+    expect(
+      (history.envelope['result'] as { structuredContent: { messageCount: number } }).structuredContent.messageCount,
+    ).toBe(2);
+
+    const qa = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.chat.ask',
+      arguments: { runStandard20QuestionQa: true },
+    }, auth);
+    const report = (qa.envelope['result'] as { structuredContent: {
+      passedCount: number; failedCount: number; allPassed: boolean; totalCostUsd: number; kbVersion: string;
+    } }).structuredContent;
+    expect(report.passedCount).toBe(20);
+    expect(report.failedCount).toBe(0);
+    expect(report.allPassed).toBe(true);
+    expect(report.totalCostUsd).toBe(0);
+    expect(report.kbVersion).toBe('2026.10.27-v3');
+  }, 60000);
+
+  it('answers generic-client interop methods and isolates conversations per actor', async () => {
+    const worker = createTraceForgeWorker();
+    const init = await mcpCall(worker, 'initialize', {});
+    expect((init.envelope['result'] as { protocolVersion: string }).protocolVersion).toBe('2025-06-18');
+
+    const discovered = await mcpCall(worker, 'server/discover', {});
+    expect((discovered.envelope['result'] as { protocolVersion: string }).protocolVersion).toBe('2025-06-18');
+    expect(((discovered.envelope['result'] as { tools: unknown[] }).tools ?? [])).toHaveLength(25);
+
+    const ping = await mcpCall(worker, 'ping', {});
+    expect(ping.envelope['result']).toEqual({});
+
+    const initialized = await worker.fetch(
+      new Request(workerUrl('/mcp'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'notifications/initialized', params: {} }),
+      }),
+    );
+    expect(initialized.status).toBe(202);
+
+    const anonSearch = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.kb.search',
+      arguments: { query: 'What is the 8-probe budget?' },
+    });
+    const kb = (anonSearch.envelope['result'] as { structuredContent: { sources: unknown[]; incurredCostUsd: number } }).structuredContent;
+    expect(kb.sources.length).toBeGreaterThan(0);
+    expect(kb.incurredCostUsd).toBe(0);
+
+    const started = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.chat.start',
+      arguments: {},
+    }, AGENT);
+    const conv = (started.envelope['result'] as { structuredContent: { conversationId: string } }).structuredContent;
+
+    const crossed = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.chat.history',
+      arguments: { conversationId: conv.conversationId },
+    }, SECONDARY);
+    const structured = (crossed.envelope['result'] as { structuredContent: { code: string }; isError: boolean });
+    expect(structured.isError).toBe(true);
+    expect(structured.structuredContent.code).toBe('MAAS_CROSS_TENANT_ACCESS_DENIED');
   });
 });

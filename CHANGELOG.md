@@ -238,3 +238,51 @@ landed on the project branches.
   session grounding with ground-truth isolation, prompt-injection
   refusal, full server gating matrix, and the authorized single-call
   live path with ledger recording.
+
+## Assistant MCP parity: 25-tool catalog, 20-question RAG QA suite & parity matrix
+
+- **7 new assistant & knowledge base MCP tools
+  (`src/maas/tools.ts`, `TRACEFORGE_MAAS_TOOL_DESCRIPTORS` 18 → 25,
+  `WORKER_TOOL_COUNT = 25`):** `traceforge.kb.search` (public,
+  versioned BM25 + synonym retrieval at `$0.00`),
+  `traceforge.chat.status` (public status, `kbVersion`, topic count,
+  `$2.00` live-chat ledger, limits, caller conversation count),
+  `traceforge.chat.start` (actor-isolated `conv_…` conversation with
+  signed session ticket, optional owned-`scenarioId` binding),
+  `traceforge.chat.ask` (single RAG-first answers plus deterministic
+  1..25 batch QA and `runStandard20QuestionQa`), `traceforge.chat.history`,
+  `traceforge.chat.clear`, and `traceforge.chat.feedback`
+  (`helpful`/`unhelpful`). All 7 run through the shared chat & RAG
+  engine (`src/lib/assistant-server.ts`, `src/lib/rag-engine.ts`), so
+  the website assistant and MCP clients share retrieval,
+  conversation state, session grounding (`HiddenFault` strictly
+  withheld, verified per call), and budget control. Conversation tools
+  authorize on `traceforge:discovery:read` (valid for pre-existing
+  OAuth tokens) with `traceforge:assistant:chat` additionally granted
+  to agent/owner tokens and scopes.
+- **Deterministic 20-question QA benchmark
+  (`STANDARD_20_QA_BENCHMARK` in `src/lib/assistant-server.ts`):**
+  all 18 knowledge topics plus session troubleshooting and one
+  prompt-injection refusal probe; every item passes knowledge-only at
+  `$0.00` with grounding, expected-topic, accuracy-term, and
+  no-leakage verification.
+- **Multi-client MCP interop (`worker/index.ts`,
+  `src/server/maas-mcp-server.ts`):** `server/discover` alias and
+  `notifications/initialized` on both surfaces; Worker
+  `/.well-known/oauth-protected-resource` gains
+  `resource_documentation` → new `GET /docs/mcp` (25-tool catalog +
+  ChatGPT / Muse / Meta AI / generic-client OAuth setup);
+  `POST /oauth/register` accepts ChatGPT, Muse/Meta AI, and generic
+  HTTPS/localhost clients with `client_name` provided or omitted.
+- **Knowledge base `KB_VERSION = '2026.10.27-v3'`
+  (`src/data/knowledge-base.ts`,
+  `docs/knowledge/traceforge-knowledge-base.md`):** `mcp-integration`
+  entry documents all 25 tools and multi-client OAuth 2.1 + PKCE.
+- **Website/MCP parity matrix
+  (`docs/mcp/traceforge-mcp-parity-matrix.md`, summarized in
+  `README.md` §H3):** all capability areas audited with the five
+  required statuses; custom PCB / KiCad / Gerber / photo ingestion
+  with live SAM 3.1 segmentation recorded as not yet implemented
+  with a 4-stage safe roadmap. Governance docs rewritten in neutral
+  engineering language (no coordinator attributions; model
+  disclosures retained).

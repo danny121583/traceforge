@@ -84,7 +84,7 @@ const objSchema: MaasJsonSchema = {
 /* ---------------------------------------------------------------- area 1 -- */
 
 describe('1. tool discovery', () => {
-  it('tools/list returns all 18 tools with names, descriptions, and schemas', async () => {
+  it('tools/list returns all 25 tools with names, descriptions, and schemas', async () => {
     const service = new TraceForgeMaasService();
     const { res, out } = capture();
     const handled = await handleMaasMcpRequest(
@@ -95,7 +95,7 @@ describe('1. tool discovery', () => {
     expect(handled).toBe(true);
     expect(out.headers['X-Correlation-Id']).toBeTruthy();
     const envelope = JSON.parse(out.body) as { result: { tools: Array<{ name: string; description: string; inputSchema: unknown }> } };
-    expect(envelope.result.tools).toHaveLength(18);
+    expect(envelope.result.tools).toHaveLength(25);
     for (const tool of envelope.result.tools) {
       expect(tool.name.startsWith('traceforge.')).toBe(true);
       expect(tool.description.length).toBeGreaterThan(0);
@@ -103,14 +103,14 @@ describe('1. tool discovery', () => {
     }
   });
 
-  it('traceforge.capabilities.list returns all 18 descriptors with schemas, scopes, and annotations', async () => {
+  it('traceforge.capabilities.list returns all 25 descriptors with schemas, scopes, and annotations', async () => {
     const service = new TraceForgeMaasService();
     const result = (await service.executeTool('traceforge.capabilities.list', {}, {})) as {
       count: number;
       tools: Array<{ name: string; inputSchema: MaasJsonSchema; requiredScope: string | null; annotations: Record<string, boolean> }>;
     };
-    expect(result.count).toBe(18);
-    expect(result.tools).toHaveLength(18);
+    expect(result.count).toBe(25);
+    expect(result.tools).toHaveLength(25);
     for (const tool of result.tools) {
       expect(tool.inputSchema.type).toBe('object');
       expect(tool.annotations['readOnlyHint']).toBeDefined();
@@ -748,7 +748,7 @@ describe('14. simulated vs live model identity and HTTP middleware', () => {
 
     const catalog = capture();
     expect(await handleMaasMcpRequest({ method: 'GET', url: '/api/maas/catalog', headers: {} }, catalog.res, service)).toBe(true);
-    expect((JSON.parse(catalog.out.body) as { count: number }).count).toBe(18);
+    expect((JSON.parse(catalog.out.body) as { count: number }).count).toBe(25);
 
     const anonymousAudit = capture();
     expect(await handleMaasMcpRequest({ method: 'GET', url: '/api/maas/audit', headers: {} }, anonymousAudit.res, service)).toBe(true);
@@ -1694,5 +1694,290 @@ describe('22. cross-isolate MCP session consistency', () => {
     } finally {
       uninstall();
     }
+  });
+});
+
+/* --------------------------------------------------------------- area 23 -- */
+
+const CHAT_TOOL_NAMES = [
+  'traceforge.kb.search',
+  'traceforge.chat.status',
+  'traceforge.chat.start',
+  'traceforge.chat.ask',
+  'traceforge.chat.history',
+  'traceforge.chat.clear',
+  'traceforge.chat.feedback',
+];
+
+describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
+  it('exposes all 7 chat/kb tools with schemas, scopes, and annotations', async () => {
+    const service = new TraceForgeMaasService();
+    const result = (await service.executeTool('traceforge.capabilities.list', {}, {})) as {
+      count: number;
+      tools: Array<{ name: string; requiredScope: string | null; annotations: { readOnlyHint: boolean } }>;
+    };
+    expect(result.count).toBe(25);
+    const byName = new Map(result.tools.map((t) => [t.name, t]));
+    for (const name of CHAT_TOOL_NAMES) {
+      expect(byName.has(name)).toBe(true);
+    }
+    expect(byName.get('traceforge.kb.search')?.requiredScope).toBe(null);
+    expect(byName.get('traceforge.chat.status')?.requiredScope).toBe(null);
+    expect(byName.get('traceforge.chat.start')?.requiredScope).toBe('traceforge:discovery:read');
+    expect(byName.get('traceforge.chat.ask')?.requiredScope).toBe('traceforge:discovery:read');
+    expect(byName.get('traceforge.chat.history')?.requiredScope).toBe('traceforge:discovery:read');
+    expect(byName.get('traceforge.chat.clear')?.requiredScope).toBe('traceforge:discovery:read');
+    expect(byName.get('traceforge.chat.feedback')?.requiredScope).toBe('traceforge:discovery:read');
+    expect(byName.get('traceforge.kb.search')?.annotations.readOnlyHint).toBe(true);
+    expect(byName.get('traceforge.chat.status')?.annotations.readOnlyHint).toBe(true);
+    expect(byName.get('traceforge.chat.ask')?.annotations.readOnlyHint).toBe(false);
+  });
+
+  it('serves kb.search and chat.status without a token; chat tools require auth', async () => {
+    const service = new TraceForgeMaasService();
+    const kb = (await service.executeTool('traceforge.kb.search', { query: 'What does NRST mean?' }, {})) as {
+      kbVersion: string; coverage: string; answer: string; sources: unknown[]; liveInvoked: boolean; incurredCostUsd: number;
+    };
+    expect(kb.kbVersion).toBe('2026.10.27-v3');
+    expect(kb.answer.length).toBeGreaterThan(0);
+    expect(kb.sources.length).toBeGreaterThan(0);
+    expect(kb.liveInvoked).toBe(false);
+    expect(kb.incurredCostUsd).toBe(0);
+
+    const status = (await service.executeTool('traceforge.chat.status', {}, {})) as {
+      kbVersion: string; topicCount: number; liveUsage: { allowanceUsd: number }; limits: Record<string, number>;
+      activeConversationCount: number; feedbackCount: number; suggestedQuestions: string[];
+    };
+    expect(status.kbVersion).toBe('2026.10.27-v3');
+    expect(status.topicCount).toBe(18);
+    expect(status.liveUsage.allowanceUsd).toBe(2);
+    expect(status.limits['maxLiveCallsPerSession']).toBe(10);
+    expect(status.suggestedQuestions.length).toBeGreaterThan(0);
+
+    await expectToolError(service.executeTool('traceforge.chat.start', {}, {}), 'MAAS_AUTHENTICATION_REQUIRED');
+    await expectToolError(
+      service.executeTool('traceforge.chat.ask', { message: 'Hello?' }, {}),
+      'MAAS_AUTHENTICATION_REQUIRED',
+    );
+  });
+
+  it('runs the full conversation lifecycle with scenario grounding and no leakage', async () => {
+    const service = new TraceForgeMaasService();
+    const scenario = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+      AGENT,
+    )) as { scenarioId: string };
+    await service.executeTool(
+      'traceforge.measurements.voltage',
+      { scenarioId: scenario.scenarioId, node: 'TP_NRST' },
+      AGENT,
+    );
+
+    const started = (await service.executeTool(
+      'traceforge.chat.start',
+      { scenarioId: scenario.scenarioId, title: 'lifecycle probe' },
+      AGENT,
+    )) as {
+      conversationId: string; ownerActorId: string; scenarioId: string; sessionTicket: string;
+      kbVersion: string; suggestedQuestions: string[]; messageCount: number;
+    };
+    expect(started.conversationId.startsWith('conv_')).toBe(true);
+    expect(started.ownerActorId).toBe('actor_chatgpt_agent');
+    expect(started.scenarioId).toBe(scenario.scenarioId);
+    expect(started.sessionTicket.startsWith('tf_chat_')).toBe(true);
+    expect(started.kbVersion).toBe('2026.10.27-v3');
+    expect(started.messageCount).toBe(0);
+
+    const first = (await service.executeTool(
+      'traceforge.chat.ask',
+      { conversationId: started.conversationId, message: 'What did I measure in this session?' },
+      AGENT,
+    )) as {
+      conversationId: string; reply: string; sources: Array<{ entryId: string }>; mode: string;
+      liveInvoked: boolean; kbVersion: string; incurredCostUsd: number; messageCount: number;
+    };
+    expect(first.conversationId).toBe(started.conversationId);
+    expect(first.reply).toContain('TP_NRST');
+    expect(first.liveInvoked).toBe(false);
+    expect(first.incurredCostUsd).toBe(0);
+    expect(first.messageCount).toBe(2);
+    expect(leakedKeys(first)).toEqual([]);
+
+    const second = (await service.executeTool(
+      'traceforge.chat.ask',
+      { conversationId: started.conversationId, message: 'How do virtual voltage measurements work?' },
+      AGENT,
+    )) as { reply: string; messageCount: number; sources: unknown[] };
+    expect(second.messageCount).toBe(4);
+    expect(second.sources.length).toBeGreaterThan(0);
+    expect(leakedKeys(second)).toEqual([]);
+
+    const history = (await service.executeTool(
+      'traceforge.chat.history',
+      { conversationId: started.conversationId },
+      AGENT,
+    )) as {
+      conversationId: string; ownerActorId: string; scenarioId: string; messageCount: number;
+      messages: Array<{ role: string; content: string }>; kbVersion: string;
+    };
+    expect(history.messageCount).toBe(4);
+    expect(history.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
+    expect(history.kbVersion).toBe('2026.10.27-v3');
+
+    const feedback = (await service.executeTool(
+      'traceforge.chat.feedback',
+      { conversationId: started.conversationId, messageIndex: 1, rating: 'helpful', comment: 'grounded answer' },
+      AGENT,
+    )) as { feedbackId: string; recorded: boolean; rating: string; kbVersion: string };
+    expect(feedback.recorded).toBe(true);
+    expect(feedback.rating).toBe('helpful');
+
+    const cleared = (await service.executeTool(
+      'traceforge.chat.clear',
+      { conversationId: started.conversationId },
+      AGENT,
+    )) as { conversationId: string; cleared: boolean; messageCount: number };
+    expect(cleared.cleared).toBe(true);
+    expect(cleared.messageCount).toBe(0);
+
+    const after = (await service.executeTool(
+      'traceforge.chat.history',
+      { conversationId: started.conversationId },
+      AGENT,
+    )) as { messageCount: number };
+    expect(after.messageCount).toBe(0);
+
+    const status = (await service.executeTool('traceforge.chat.status', {}, AGENT)) as {
+      activeConversationCount: number; feedbackCount: number;
+    };
+    expect(status.activeConversationCount).toBeGreaterThanOrEqual(1);
+    expect(status.feedbackCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('auto-starts an ephemeral conversation when chat.ask omits conversationId', async () => {
+    const service = new TraceForgeMaasService();
+    const asked = (await service.executeTool(
+      'traceforge.chat.ask',
+      { message: 'How does TraceForge work?' },
+      AGENT,
+    )) as { conversationId: string; reply: string; messageCount: number };
+    expect(asked.conversationId.startsWith('conv_')).toBe(true);
+    expect(asked.reply.length).toBeGreaterThan(0);
+    expect(asked.messageCount).toBe(2);
+  });
+
+  it('isolates conversations per actor', async () => {
+    const service = new TraceForgeMaasService();
+    const started = (await service.executeTool('traceforge.chat.start', {}, AGENT)) as { conversationId: string };
+    const conv = started.conversationId;
+    await expectToolError(
+      service.executeTool('traceforge.chat.history', { conversationId: conv }, SECONDARY),
+      'MAAS_CROSS_TENANT_ACCESS_DENIED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.chat.ask', { conversationId: conv, message: 'Hello?' }, SECONDARY),
+      'MAAS_CROSS_TENANT_ACCESS_DENIED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.chat.clear', { conversationId: conv }, SECONDARY),
+      'MAAS_CROSS_TENANT_ACCESS_DENIED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.chat.feedback', { conversationId: conv, rating: 'helpful' }, SECONDARY),
+      'MAAS_CROSS_TENANT_ACCESS_DENIED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.chat.history', { conversationId: 'conv_deadbeefdeadbeefdeadbeef' }, AGENT),
+      'MAAS_RESOURCE_NOT_FOUND',
+    );
+    // Owner's own conversation still works after the cross-actor denials.
+    const history = (await service.executeTool('traceforge.chat.history', { conversationId: conv }, AGENT)) as {
+      messageCount: number;
+    };
+    expect(history.messageCount).toBe(0);
+  });
+
+  it('rejects invalid chat inputs without spending', async () => {
+    const service = new TraceForgeMaasService();
+    await expectToolError(service.executeTool('traceforge.chat.ask', {}, AGENT), 'MAAS_SCHEMA_VALIDATION_FAILED');
+    await expectToolError(
+      service.executeTool('traceforge.chat.ask', { questions: [] }, AGENT),
+      'MAAS_SCHEMA_VALIDATION_FAILED',
+    );
+    await expectToolError(
+      service.executeTool(
+        'traceforge.chat.ask',
+        { questions: Array.from({ length: 26 }, (_, i) => `Question ${i}?`) },
+        AGENT,
+      ),
+      'MAAS_SCHEMA_VALIDATION_FAILED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.chat.feedback', { rating: 'meh' }, AGENT),
+      'MAAS_SCHEMA_VALIDATION_FAILED',
+    );
+  });
+
+  it('runs a custom deterministic batch QA via questions[]', async () => {
+    const service = new TraceForgeMaasService();
+    const report = (await service.executeTool(
+      'traceforge.chat.ask',
+      { questions: ['How does TraceForge work?', 'What does NRST mean?'] },
+      AGENT,
+    )) as {
+      qaMode: boolean; kbVersion: string; totalQuestions: number; allPassed: boolean;
+      liveCallsInvoked: number; totalCostUsd: number;
+      results: Array<{ answer: string; liveInvoked: boolean; costUsd: number; passed: boolean }>;
+    };
+    expect(report.qaMode).toBe(true);
+    expect(report.kbVersion).toBe('2026.10.27-v3');
+    expect(report.totalQuestions).toBe(2);
+    expect(report.liveCallsInvoked).toBe(0);
+    expect(report.totalCostUsd).toBe(0);
+    for (const result of report.results) {
+      expect(result.answer.length).toBeGreaterThan(0);
+      expect(result.liveInvoked).toBe(false);
+      expect(result.costUsd).toBe(0);
+    }
+  });
+
+  it('answers standards-compliant MCP methods (initialize, server/discover, ping, notifications) over HTTP', async () => {
+    const service = new TraceForgeMaasService();
+    const call = async (method: string, params: Record<string, unknown>, headers: Record<string, string> = {}) => {
+      const { res, out } = capture();
+      const handled = await handleMaasMcpRequest(
+        { method: 'POST', url: '/api/mcp', headers, body: { jsonrpc: '2.0', id: 7, method, params } },
+        res,
+        service,
+      );
+      expect(handled).toBe(true);
+      return JSON.parse(out.body) as { result: Record<string, unknown> };
+    };
+    const init = await call('initialize', {});
+    expect(init.result['protocolVersion']).toBe('2025-06-18');
+
+    const discovered = await call('server/discover', {});
+    expect((discovered.result['serverInfo'] as { name: string }).name).toBe('traceforge-maas');
+    expect(discovered.result['protocolVersion']).toBe('2025-06-18');
+    expect((discovered.result['tools'] as unknown[]).length).toBe(25);
+
+    const ping = await call('ping', {});
+    expect(ping.result).toEqual({});
+
+    const initialized = await call('notifications/initialized', {});
+    expect(initialized.result).toEqual({});
+
+    const listed = await call('tools/list', {});
+    const names = ((listed.result['tools'] as Array<{ name: string }>) ?? []).map((t) => t.name);
+    for (const name of CHAT_TOOL_NAMES) {
+      expect(names).toContain(name);
+    }
+
+    const searched = await call('tools/call', { name: 'traceforge.kb.search', arguments: { query: 'How do I start an investigation?' } });
+    const structured = searched.result['structuredContent'] as { answer: string; liveInvoked: boolean; kbVersion: string };
+    expect(structured.answer.length).toBeGreaterThan(0);
+    expect(structured.liveInvoked).toBe(false);
+    expect(structured.kbVersion).toBe('2026.10.27-v3');
   });
 });

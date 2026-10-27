@@ -1,7 +1,7 @@
 /**
- * TraceForge MaaS — 18-tool service layer.
+ * TraceForge MaaS — 25-tool service layer (18 circuit-diagnostic + 7 assistant/KB).
  *
- * `TraceForgeMaasService` registers and executes every TraceForge MaaS tool
+ * `TraceForgeMaasService` registers and executes every TraceForge MaaS tool (25 total)
  * against the REAL in-repo engines (`circuit-simulator.ts`,
  * `diagnostic-agent.ts`, `meta-client.ts`, `samples.ts`). Independent of
  * Health eRecords: no imports outside this repository, no external
@@ -58,6 +58,19 @@ import {
   type MaasStructuredError,
 } from './protocol';
 import { TraceForgeVerificationEngine, type MaasVerificationReceipt } from './verification';
+import { KB_VERSION, KNOWLEDGE_BASE_ENTRIES, SUGGESTED_QUESTIONS } from '../data/knowledge-base';
+import {
+  queryTraceForgeRAG,
+  sanitizeAssistantSessionContext,
+  type AssistantSessionContext,
+} from '../lib/rag-engine';
+import {
+  STANDARD_20_QA_BENCHMARK,
+  handleAssistantChat,
+  issueAssistantSessionTicket,
+  type AssistantChatResponse,
+  type StandardQaBenchmarkItem,
+} from '../lib/assistant-server';
 import {
   MAAS_LOCAL_TOKENS,
   MaasAuditLog,
@@ -157,7 +170,7 @@ const SCENARIO_REF_SCHEMA = objSchema(
   [],
 );
 
-/** All 18 registered TraceForge MaaS tool descriptors. */
+/** All 25 registered TraceForge MaaS tool descriptors (18 circuit-diagnostic + 7 assistant/KB). */
 export const TRACEFORGE_MAAS_TOOL_DESCRIPTORS: MaasCapabilityDescriptor[] = [
   descriptor('traceforge.capabilities.list', 'List all registered TraceForge MaaS tool descriptors with schemas, scopes, and annotations.', objSchema(), null, true),
   descriptor('traceforge.system.status', 'Service health: MCP protocol version, solver capabilities, kill-switch status, active session count.', objSchema(), null, true),
@@ -177,6 +190,37 @@ export const TRACEFORGE_MAAS_TOOL_DESCRIPTORS: MaasCapabilityDescriptor[] = [
   descriptor('traceforge.investigations.result', 'Proposed diagnosis, classified evidence, verification status, operational mode, diagnosis source, and telemetry. Ground truth stays withheld.', SCENARIO_REF_SCHEMA, 'traceforge:investigations:read', true),
   descriptor('traceforge.evaluation.score', 'Score the completed investigation (or an explicit componentRef/faultType submission with >=1 probe) against the withheld HiddenFault. Discloses ground truth and locks the scenario against further probing.', objSchema({ scenarioId: S('Owning scenario id.'), submission: { type: 'object', description: 'Explicit { componentRef, faultType, verificationStatus } submission.', properties: { componentRef: S('Board reference designator.'), faultType: S('Fault class.'), verificationStatus: { type: 'string', description: 'confirmed | hypothesis.', enum: ['confirmed', 'hypothesis'] } }, required: ['componentRef', 'faultType', 'verificationStatus'], additionalProperties: false } }, ['scenarioId']), 'traceforge:evaluation:score', false),
   descriptor('traceforge.evaluation.report', 'Complete post-evaluation audit report. Only after evaluation.score ran on that scenario.', objSchema({ scenarioId: S('Evaluated scenario id.') }, ['scenarioId']), 'traceforge:evaluation:score', true),
+  descriptor('traceforge.kb.search', 'Search the versioned TraceForge knowledge base (BM25 + synonym expansion) at $0.00 with zero model calls. Returns ranked sources, coverage level, answer excerpt, and kbVersion.', objSchema({ query: S('Search query or question.'), limit: { type: 'number', description: 'Maximum matching entries to return (1..10, default 3).', minimum: 1, maximum: 10 } }, ['query']), null, true),
+  descriptor('traceforge.chat.status', 'Retrieve TraceForge Assistant status, kbVersion, knowledge topic count, shared $2.00 live-chat allowance ledger, rate/concurrency limits, and caller conversation count. Never invokes paid inference.', objSchema(), null, true),
+  descriptor('traceforge.chat.start', 'Start an actor-isolated TraceForge Assistant conversation, optionally bound to an owned scenarioId for session-grounded answers. Returns a conversationId plus a signed session ticket.', objSchema({ scenarioId: OPT_S('Optional owned scenarioId to bind this conversation to for session-grounded answers.'), title: OPT_S('Optional conversation label.') }, []), 'traceforge:discovery:read', false),
+  descriptor(
+    'traceforge.chat.ask',
+    'Ask the TraceForge Assistant a question (or run a deterministic multi-question QA batch) using RAG-first retrieval over the versioned knowledge base ($0.00 by default). Live muse-spark-1.3 inference runs only when allowLiveInference=true with traceforge:live_inference:execute scope and budget headroom.',
+    objSchema({
+      message: OPT_S('Question to ask the assistant (required unless questions or runStandard20QuestionQa is provided).'),
+      questions: { type: 'array', description: 'Optional batch of questions (1..25) for deterministic QA evaluation at $0.00.', items: { type: 'string' } },
+      runStandard20QuestionQa: { type: 'boolean', description: 'When true, runs the built-in 20-question TraceForge QA benchmark at $0.00.' },
+      conversationId: OPT_S('Optional owned conversationId from traceforge.chat.start to append turns and include history.'),
+      scenarioId: OPT_S('Optional owned scenarioId to ground answers in sanitized session state (HiddenFault withheld).'),
+      allowLiveInference: { type: 'boolean', description: 'Default false ($0.00 knowledge-only). Even when true, requires traceforge:live_inference:execute scope, a configured key, and budget headroom.' },
+    }, []),
+    'traceforge:discovery:read',
+    false,
+  ),
+  descriptor('traceforge.chat.history', 'Retrieve ordered conversation history, cited knowledge sources, and token/cost summary for an owned conversationId.', objSchema({ conversationId: S('Owning conversation id returned by traceforge.chat.start or traceforge.chat.ask.') }, ['conversationId']), 'traceforge:discovery:read', true),
+  descriptor('traceforge.chat.clear', 'Clear all messages in an owned conversationId while keeping the conversation container active.', objSchema({ conversationId: S('Owning conversation id to clear.') }, ['conversationId']), 'traceforge:discovery:read', false),
+  descriptor(
+    'traceforge.chat.feedback',
+    'Submit quality and grounding feedback (helpful | unhelpful) on a TraceForge Assistant answer.',
+    objSchema({
+      conversationId: OPT_S('Optional conversation id associated with the answer.'),
+      messageIndex: { type: 'number', description: 'Optional 0-based message index within the conversation.' },
+      rating: { type: 'string', description: 'Feedback rating: helpful or unhelpful.', enum: ['helpful', 'unhelpful'] },
+      comment: OPT_S('Optional diagnostic or documentation feedback note (max 500 chars).'),
+    }, ['rating']),
+    'traceforge:discovery:read',
+    false,
+  ),
 ];
 
 /** Capabilities callable without a Bearer token (read-only discovery). */
@@ -187,6 +231,8 @@ export const PUBLIC_MAAS_CAPABILITIES: ReadonlySet<string> = new Set([
   'traceforge.budget.status',
   'traceforge.circuits.list',
   'traceforge.circuits.get',
+  'traceforge.kb.search',
+  'traceforge.chat.status',
 ]);
 
 /** Capabilities that mutate state and therefore carry a verificationReceipt. */
@@ -761,6 +807,110 @@ function requireString(args: Record<string, unknown>, key: string, correlationId
 }
 
 /* ---------------------------------------------------------------------------
+ * TraceForge Assistant conversations & feedback (MCP chat tools)
+ *
+ * `traceforge.chat.*` and `traceforge.kb.search` share the exact same
+ * retrieval, conversation-state, session-grounding, and budget-control
+ * engine as the website floating assistant (`POST /api/assistant/chat` via
+ * `handleAssistantChat`): every answer runs RAG-first over the versioned
+ * knowledge base at $0.00, and paid `muse-spark-1.3` inference happens only
+ * through the same gated live path. Conversations are actor-isolated
+ * (`ownerActorId`, `MAAS_CROSS_TENANT_ACCESS_DENIED` on cross-actor access),
+ * mirrored to edge storage for cross-isolate reads, and never carry
+ * withheld `HiddenFault` ground truth (verified with
+ * `assertGroundTruthIsolated` before use).
+ * ------------------------------------------------------------------------- */
+
+/** One stored assistant message with its RAG grounding snapshot. */
+export interface AssistantConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  sources?: Array<{ entryId: string; title: string; excerpt: string }>;
+  mode?: string;
+  liveInvoked?: boolean;
+  kbVersion?: string;
+  timestamp: string;
+}
+
+/** Actor-isolated multi-turn assistant conversation. */
+export interface AssistantConversationRecord {
+  conversationId: string;
+  ownerActorId: string;
+  scenarioId: string | null;
+  title: string;
+  messages: AssistantConversationMessage[];
+  createdAt: string;
+  updatedAt: string;
+  sessionTicket: string;
+  sessionId: string;
+  ticketExpiresAtMs: number;
+}
+
+/** One quality/grounding feedback entry on an assistant answer. */
+export interface AssistantFeedbackRecord {
+  feedbackId: string;
+  actorId: string;
+  conversationId: string | null;
+  messageIndex?: number;
+  rating: 'helpful' | 'unhelpful';
+  comment?: string;
+  kbVersion: string;
+  createdAt: string;
+}
+
+/**
+ * Synthetic evaluated-session context grounding the deterministic QA
+ * benchmark: an F405 board with two recorded abnormal probes, a confirmed
+ * U1 solder-bridge diagnosis, and a 99/100 evaluated score. Contains zero
+ * withheld fault answers — only the same sanitized fields a real evaluated
+ * session exposes to the assistant.
+ */
+const QA_BENCHMARK_SESSION_CONTEXT: Record<string, unknown> = {
+  boardId: 'f405-flight-controller',
+  boardName: 'FPV Drone Flight Controller (F405)',
+  symptom: 'Board enumerates no USB device; NRST test pad near 0 V instead of the 3.3 V pull-up.',
+  lifecycleState: 'evaluated',
+  probeMeasurements: [
+    { target: 'TP_NRST', kind: 'voltage', detail: '0.020 V (nominal 3.240 V)', abnormal: true },
+    { target: 'U1-14↔U1-15', kind: 'resistance', detail: '0.4 Ohm SHORT', abnormal: true },
+  ],
+  proposedDiagnosis: {
+    componentRef: 'U1',
+    faultType: 'solder_bridge',
+    verificationStatus: 'confirmed',
+    explanation: 'NRST crushed plus pin-to-pin short.',
+  },
+  verificationStatus: 'confirmed',
+  score: {
+    totalScore: 99,
+    componentMatch: true,
+    faultTypeMatch: true,
+    evidenceConfirmed: true,
+    probeCount: 5,
+    efficiencyScore: 92,
+    summary: 'Component and fault-type match with confirmed evidence.',
+  },
+  evaluated: true,
+};
+
+const EDGE_CACHE_CONVERSATION_PREFIX = 'https://traceforge-internal.local/conv/';
+const EDGE_CACHE_ASSISTANT_FEEDBACK_KEY = 'https://traceforge-internal.local/assistant-feedback';
+
+function edgeConversationKey(conversationId: string): string {
+  return `${EDGE_CACHE_CONVERSATION_PREFIX}${conversationId}`;
+}
+
+/** Per-actor conversation index for cross-isolate `traceforge.chat.status`. */
+function edgeActorConversationsKey(actorId: string): string {
+  return `https://traceforge-internal.local/actor-conversations/${encodeURIComponent(actorId)}`;
+}
+
+function randomAssistantId(prefix: string): string {
+  const raw = crypto.getRandomValues(new Uint8Array(12));
+  return `${prefix}${bytesToHex(raw)}`;
+}
+
+/* ---------------------------------------------------------------------------
  * TraceForgeMaasService
  * ------------------------------------------------------------------------- */
 
@@ -813,7 +963,7 @@ function highlightsForSession(boardId: string, session: VirtualLabSession): Arra
 }
 
 /**
- * Registers and executes all 18 TraceForge MaaS tools with authentication,
+ * Registers and executes all 25 TraceForge MaaS tools with authentication,
  * authorization, rate limiting, kill-switch, audit, probe-budget, tenant
  * isolation, and verification-receipt enforcement.
  */
@@ -852,6 +1002,12 @@ export class TraceForgeMaasService {
   private assistantActiveCalls = 0;
   /** Paid assistant-chat calls consumed per chat session id (this isolate). */
   private readonly assistantSessionCalls = new Map<string, number>();
+  /** Actor-isolated assistant conversations (`conv_...` ids, this isolate). */
+  private readonly conversations = new Map<string, AssistantConversationRecord>();
+  /** Assistant answer feedback entries (this isolate; mirrored to edge storage). */
+  private readonly assistantFeedback: AssistantFeedbackRecord[] = [];
+  /** Server-side live key for MCP assistant chat (never exposed in payloads). */
+  private liveApiKey?: string;
   /** Remote-colo assistant spend merged from the edge-cached runtime snapshot. */
   private edgeCachedAssistantSpendUsd = 0;
   private edgeCachedAssistantRequests = 0;
@@ -940,6 +1096,7 @@ export class TraceForgeMaasService {
   configureLiveApiKey(apiKey: string): void {
     if (!apiKey || !apiKey.trim()) return;
     this.liveClient = new MetaClient({ mode: 'live', apiKey: apiKey.trim(), segmentationMode: 'static_fixture' });
+    this.liveApiKey = apiKey.trim();
     if (this.sessionSecret === DEFAULT_SESSION_SECRET) {
       this.sessionSecret = `tf-live-derived::${apiKey.trim()}`;
     }
@@ -1234,6 +1391,13 @@ export class TraceForgeMaasService {
       case 'traceforge.investigations.result': return this.investigationsResult(args, context);
       case 'traceforge.evaluation.score': return this.evaluationScore(args, context, correlationId);
       case 'traceforge.evaluation.report': return this.evaluationReport(args, context);
+      case 'traceforge.kb.search': return this.kbSearch(args, correlationId);
+      case 'traceforge.chat.status': return this.chatStatus(context);
+      case 'traceforge.chat.start': return this.chatStart(args, context, correlationId);
+      case 'traceforge.chat.ask': return this.chatAsk(args, context, correlationId);
+      case 'traceforge.chat.history': return this.chatHistory(args, context, correlationId);
+      case 'traceforge.chat.clear': return this.chatClear(args, context, correlationId);
+      case 'traceforge.chat.feedback': return this.chatFeedback(args, context, correlationId);
       default:
         throw new MaasToolError('MAAS_CAPABILITY_NOT_FOUND', `Unknown MaaS capability '${capability}'.`, correlationId, capability);
     }
@@ -2304,6 +2468,456 @@ export class TraceForgeMaasService {
           }
         : { note: 'No confirmed fault: rework guidance withheld until evidence confirms a diagnosis.', proposedComponent: null },
       telemetry: latestInvestigation?.telemetry ?? this.simClient.getTelemetry(),
+    };
+  }
+
+  /* -- assistant conversations & knowledge base -------------------------------- */
+
+  /** Persist one conversation to memory + edge storage and refresh the actor index. */
+  private async persistConversation(record: AssistantConversationRecord): Promise<void> {
+    this.conversations.set(record.conversationId, record);
+    await edgeCachePut(edgeConversationKey(record.conversationId), record);
+    try {
+      const key = edgeActorConversationsKey(record.ownerActorId);
+      const existing = await edgeCacheGet<unknown>(key);
+      const ids: string[] = Array.isArray(existing)
+        ? (existing as unknown[]).filter((e): e is string => typeof e === 'string')
+        : [];
+      if (!ids.includes(record.conversationId)) ids.push(record.conversationId);
+      await edgeCachePut(key, ids);
+    } catch {
+      // Best-effort only: index persistence must never fail a tool call.
+    }
+  }
+
+  /** Mint, store, and persist an actor-owned conversation with a signed session ticket. */
+  private async startConversation(ownerActorId: string, scenarioId: string | null, title?: string): Promise<AssistantConversationRecord> {
+    const issued = await issueAssistantSessionTicket(this.sessionSecret);
+    const now = new Date().toISOString();
+    const record: AssistantConversationRecord = {
+      conversationId: randomAssistantId('conv_'),
+      ownerActorId,
+      scenarioId,
+      title: title && title.length > 0 ? title : 'TraceForge Assistant Conversation',
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+      sessionTicket: issued.sessionTicket,
+      sessionId: issued.sessionId,
+      ticketExpiresAtMs: issued.expiresAtMs,
+    };
+    await this.persistConversation(record);
+    return record;
+  }
+
+  /** Load an owned conversation from memory or edge storage (tenant-checked). */
+  private async requireOwnedConversation(
+    conversationId: string,
+    context: MaasAuthContext,
+    correlationId: string,
+    capability: string,
+  ): Promise<AssistantConversationRecord> {
+    const local = this.conversations.get(conversationId);
+    if (local) {
+      if (local.ownerActorId !== context.actorId) {
+        throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Conversation '${conversationId}' belongs to another actor.`, correlationId, capability);
+      }
+      return local;
+    }
+    const edge = await edgeCacheGet<unknown>(edgeConversationKey(conversationId));
+    if (edge !== null && typeof edge === 'object' && !Array.isArray(edge)) {
+      const record = edge as AssistantConversationRecord;
+      if (typeof record.conversationId === 'string' && Array.isArray(record.messages)) {
+        if (record.ownerActorId !== context.actorId) {
+          throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Conversation '${conversationId}' belongs to another actor.`, correlationId, capability);
+        }
+        this.conversations.set(record.conversationId, record);
+        return record;
+      }
+    }
+    throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown conversation '${conversationId}'.`, correlationId, capability);
+  }
+
+  /** Conversation ids owned by one actor (memory + edge index merged). */
+  private async listActorConversationIds(ownerActorId: string): Promise<string[]> {
+    const ids = new Set<string>();
+    for (const record of this.conversations.values()) {
+      if (record.ownerActorId === ownerActorId) ids.add(record.conversationId);
+    }
+    try {
+      const edge = await edgeCacheGet<unknown>(edgeActorConversationsKey(ownerActorId));
+      if (Array.isArray(edge)) {
+        for (const entry of edge) {
+          if (typeof entry === 'string') ids.add(entry);
+        }
+      }
+    } catch {
+      // Best-effort only.
+    }
+    return [...ids];
+  }
+
+  /** Total recorded feedback items (memory + edge mirror merged without double counting). */
+  private async assistantFeedbackCount(): Promise<number> {
+    try {
+      const edge = await edgeCacheGet<unknown>(EDGE_CACHE_ASSISTANT_FEEDBACK_KEY);
+      if (Array.isArray(edge)) return Math.max(this.assistantFeedback.length, edge.length);
+    } catch {
+      // Best-effort only.
+    }
+    return this.assistantFeedback.length;
+  }
+
+  /** Mirror one feedback entry into edge storage (best-effort read-modify-write). */
+  private async persistAssistantFeedback(entry: AssistantFeedbackRecord): Promise<void> {
+    this.assistantFeedback.push(entry);
+    try {
+      const edge = await edgeCacheGet<unknown>(EDGE_CACHE_ASSISTANT_FEEDBACK_KEY);
+      const list: AssistantFeedbackRecord[] = Array.isArray(edge) ? (edge as AssistantFeedbackRecord[]) : [];
+      if (!list.some((e) => e !== null && typeof e === 'object' && (e as AssistantFeedbackRecord).feedbackId === entry.feedbackId)) {
+        list.push(entry);
+      }
+      await edgeCachePut(EDGE_CACHE_ASSISTANT_FEEDBACK_KEY, list);
+    } catch {
+      // Best-effort only.
+    }
+  }
+
+  private kbSearch(args: Record<string, unknown>, correlationId: string): unknown {
+    const capability = 'traceforge.kb.search';
+    const query = requireString(args, 'query', correlationId, capability);
+    const rawLimit = args['limit'];
+    const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit)
+      ? Math.min(10, Math.max(1, Math.floor(rawLimit)))
+      : 3;
+    const rag = queryTraceForgeRAG(query);
+    return {
+      query,
+      kbVersion: KB_VERSION,
+      coverage: rag.coverage,
+      answer: rag.answer,
+      sources: rag.sources.slice(0, limit),
+      topicIds: rag.topicIds.slice(0, limit),
+      liveInvoked: false,
+      incurredCostUsd: 0,
+    };
+  }
+
+  private async chatStatus(context: MaasAuthContext): Promise<unknown> {
+    await this.refreshEdgeRuntimeSnapshot();
+    return {
+      kbVersion: KB_VERSION,
+      topicCount: KNOWLEDGE_BASE_ENTRIES.length,
+      suggestedQuestions: SUGGESTED_QUESTIONS,
+      liveUpstreamConfigured: this.hasLiveClient(),
+      defaultMode: 'knowledge_base',
+      liveUsage: this.getAssistantLiveUsage(),
+      limits: {
+        allowanceUsd: ASSISTANT_LIVE_ALLOWANCE_USD,
+        projectSafetyThresholdUsd: BUDGET_SAFETY_THRESHOLD_USD,
+        maxLiveCallsPerSession: MAX_ASSISTANT_LIVE_CALLS_PER_SESSION,
+        maxConcurrentLiveCalls: MAX_CONCURRENT_ASSISTANT_LIVE_CALLS,
+        maxInputChars: ASSISTANT_MAX_INPUT_CHARS,
+        maxHistoryMessages: ASSISTANT_MAX_HISTORY_MESSAGES,
+        maxOutputTokens: ASSISTANT_MAX_OUTPUT_TOKENS,
+      },
+      activeConversationCount: (await this.listActorConversationIds(context.actorId)).length,
+      feedbackCount: await this.assistantFeedbackCount(),
+    };
+  }
+
+  private async chatStart(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
+    const capability = 'traceforge.chat.start';
+    const scenarioId = asString(args['scenarioId']) ?? null;
+    const title = asString(args['title']);
+    if (scenarioId) {
+      await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    }
+    const record = await this.startConversation(context.actorId, scenarioId, title);
+    return {
+      conversationId: record.conversationId,
+      ownerActorId: context.actorId,
+      scenarioId: record.scenarioId,
+      title: record.title,
+      sessionTicket: record.sessionTicket,
+      sessionId: record.sessionId,
+      expiresAtMs: record.ticketExpiresAtMs,
+      kbVersion: KB_VERSION,
+      suggestedQuestions: SUGGESTED_QUESTIONS,
+      messageCount: 0,
+    };
+  }
+
+  /**
+   * Build the sanitized session context for one owned scenario: board,
+   * symptom, recorded probes, proposed diagnosis, and evaluated score.
+   * Withheld `HiddenFault` fields are stripped and the result is verified
+   * ground-truth-free before it ever reaches the assistant.
+   */
+  private async buildAssistantSessionContext(
+    scenarioId: string,
+    context: MaasAuthContext,
+    correlationId: string,
+    capability: string,
+  ): Promise<AssistantSessionContext> {
+    const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    const reference = getReferenceBoard(record.boardId);
+    const latest = record.latestInvestigation
+      ?? [...this.investigations.values()].filter((r) => r.scenarioId === record.scenarioId).pop();
+    const raw: Record<string, unknown> = {
+      boardId: record.boardId,
+      ...(reference ? { boardName: reference.boardName, symptom: reference.symptom } : {}),
+      lifecycleState: record.evaluated ? 'evaluated' : 'active',
+      probeMeasurements: record.session.getProbeLog().map((p) => ({
+        target: p.target,
+        kind: p.kind,
+        detail: p.detail ?? '',
+        abnormal: p.abnormal,
+      })),
+    };
+    if (latest) {
+      raw['proposedDiagnosis'] = { ...latest.proposedDiagnosis };
+      raw['verificationStatus'] = latest.proposedDiagnosis.verificationStatus;
+    }
+    if (record.evaluated && record.scorecard !== undefined) {
+      const scorecard = record.scorecard as { score?: unknown };
+      if (scorecard !== null && typeof scorecard === 'object' && scorecard.score !== null && typeof scorecard.score === 'object') {
+        raw['score'] = { ...(scorecard.score as Record<string, unknown>) };
+        raw['evaluated'] = true;
+      }
+    }
+    const clean = sanitizeAssistantSessionContext(raw);
+    assertGroundTruthIsolated(clean, record.session.getGroundTruth());
+    return clean;
+  }
+
+  private async chatAsk(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
+    const capability = 'traceforge.chat.ask';
+    if (args['runStandard20QuestionQa'] === true) {
+      return this.runAssistantQa(STANDARD_20_QA_BENCHMARK);
+    }
+    const questionsRaw = args['questions'];
+    if (questionsRaw !== undefined) {
+      if (!Array.isArray(questionsRaw)
+        || questionsRaw.length < 1
+        || questionsRaw.length > 25
+        || !questionsRaw.every((q): q is string => typeof q === 'string' && q.length > 0)) {
+        throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', 'questions must be an array of 1..25 non-empty strings.', correlationId, capability);
+      }
+      return this.runAssistantQa(questionsRaw.map((question, index): StandardQaBenchmarkItem => ({
+        id: index + 1,
+        question,
+        mustContainTerms: [],
+      })));
+    }
+    const message = asString(args['message']);
+    if (!message || message.trim().length === 0) {
+      throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', 'One of message, questions, or runStandard20QuestionQa is required.', correlationId, capability);
+    }
+    const conversationIdArg = asString(args['conversationId']);
+    const scenarioIdArg = asString(args['scenarioId']) ?? undefined;
+    if (scenarioIdArg) {
+      await this.requireOwnedScenario(scenarioIdArg, context, correlationId, capability);
+    }
+    let record: AssistantConversationRecord;
+    if (conversationIdArg) {
+      record = await this.requireOwnedConversation(conversationIdArg, context, correlationId, capability);
+      if (scenarioIdArg) {
+        record.scenarioId = scenarioIdArg;
+      }
+    } else {
+      record = await this.startConversation(context.actorId, scenarioIdArg ?? null, undefined);
+    }
+    const sessionContext = record.scenarioId
+      ? await this.buildAssistantSessionContext(record.scenarioId, context, correlationId, capability)
+      : {};
+    const history = record.messages
+      .slice(-ASSISTANT_MAX_HISTORY_MESSAGES)
+      .map((m) => ({ role: m.role, content: m.content }));
+    // Live inference stays explicitly gated: the caller's token must carry
+    // `traceforge:live_inference:execute`, exactly like `mode: "live"`
+    // investigations. Anything else answers from knowledge at $0.00.
+    const allowLive = args['allowLiveInference'] === true
+      && context.scopes.includes('traceforge:live_inference:execute');
+    const handled = await handleAssistantChat({
+      service: this,
+      body: {
+        message,
+        history,
+        allowLiveInference: allowLive,
+        sessionContext: sessionContext as Record<string, unknown>,
+        sessionTicket: record.sessionTicket,
+      },
+      headers: {},
+      signingSecret: this.sessionSecret,
+      apiKey: this.liveApiKey,
+    });
+    if (handled.status !== 200) {
+      const problem = handled.payload as { error?: string };
+      throw new MaasToolError('MAAS_INVALID_REQUEST', typeof problem.error === 'string' ? problem.error : 'Assistant request failed.', correlationId, capability);
+    }
+    const result = handled.payload as AssistantChatResponse;
+    const timestamp = new Date().toISOString();
+    record.messages.push({ role: 'user', content: message, timestamp });
+    record.messages.push({
+      role: 'assistant',
+      content: result.reply,
+      sources: result.sources,
+      mode: result.mode,
+      liveInvoked: result.liveInvoked,
+      kbVersion: result.kbVersion,
+      timestamp,
+    });
+    record.updatedAt = timestamp;
+    await this.persistConversation(record);
+    return {
+      conversationId: record.conversationId,
+      question: message,
+      reply: result.reply,
+      sources: result.sources,
+      mode: result.mode,
+      liveInvoked: result.liveInvoked,
+      kbVersion: result.kbVersion,
+      ...(result.fallbackReason ? { fallbackReason: result.fallbackReason } : {}),
+      usage: result.usage ?? { inputTokens: 0, outputTokens: 0 },
+      incurredCostUsd: result.liveInvoked && result.usage
+        ? estimateLiveCostUsd(result.usage.inputTokens, result.usage.outputTokens)
+        : 0,
+      messageCount: record.messages.length,
+    };
+  }
+
+  /**
+   * Deterministic QA evaluation over 1..25 questions at $0.00. Every
+   * question runs knowledge-only (`handleAssistantChat` with live
+   * inference disabled, no server key) against the synthetic evaluated
+   * session, then verifies grounding, expected-topic retrieval, key
+   * accuracy terms, and zero withheld-fault leakage.
+   */
+  private async runAssistantQa(items: StandardQaBenchmarkItem[]): Promise<unknown> {
+    const sessionContext = sanitizeAssistantSessionContext({ ...QA_BENCHMARK_SESSION_CONTEXT });
+    const results: Array<Record<string, unknown>> = [];
+    for (const item of items) {
+      const rag = queryTraceForgeRAG(item.question, sessionContext);
+      const handled = await handleAssistantChat({
+        service: this,
+        body: { message: item.question, sessionContext: sessionContext as Record<string, unknown> },
+        headers: {},
+        signingSecret: this.sessionSecret,
+        apiKey: undefined,
+      });
+      const payload = handled.payload as {
+        reply?: unknown;
+        sources?: unknown;
+        mode?: unknown;
+        liveInvoked?: unknown;
+      };
+      const reply = typeof payload.reply === 'string' ? payload.reply : '';
+      const sources = Array.isArray(payload.sources) ? payload.sources : [];
+      const topicIds = rag.topicIds;
+      const groundingVerified = sources.length > 0 || rag.blockedByPolicy;
+      const policyVerified = item.expectedPolicyRefusal === true ? rag.blockedByPolicy : true;
+      const topicVerified = item.expectedTopicIds !== undefined
+        ? item.expectedTopicIds.some((t) => topicIds.includes(t))
+        : true;
+      const lowered = reply.toLowerCase();
+      const termsVerified = item.mustContainTerms.every((t) => lowered.includes(t.toLowerCase()));
+      const leakScan = JSON.stringify({ reply, sources });
+      const leakFree = !/"(hiddenFault|faultId|targetComponentRef|groundTruth|injectedFault)"/.test(leakScan)
+        && !/hiddenFault|targetComponentRef|injectedFault/.test(leakScan);
+      const passed = groundingVerified && policyVerified && topicVerified && termsVerified && leakFree;
+      results.push({
+        index: item.id,
+        question: item.question,
+        answer: reply,
+        sources,
+        topicIds,
+        mode: typeof payload.mode === 'string' ? payload.mode : 'knowledge_base',
+        liveInvoked: false,
+        tokens: { inputTokens: 0, outputTokens: 0 },
+        costUsd: 0,
+        groundingVerified,
+        accuracyVerified: topicVerified && termsVerified,
+        passed,
+      });
+    }
+    const passedCount = results.filter((r) => r['passed'] === true).length;
+    return {
+      qaMode: true,
+      kbVersion: KB_VERSION,
+      totalQuestions: results.length,
+      passedCount,
+      failedCount: results.length - passedCount,
+      allPassed: passedCount === results.length,
+      liveCallsInvoked: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalCostUsd: 0,
+      results,
+    };
+  }
+
+  private async chatHistory(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
+    const capability = 'traceforge.chat.history';
+    const conversationId = requireString(args, 'conversationId', correlationId, capability);
+    const record = await this.requireOwnedConversation(conversationId, context, correlationId, capability);
+    const inputTokens = 0;
+    const outputTokens = 0;
+    return {
+      conversationId: record.conversationId,
+      ownerActorId: record.ownerActorId,
+      scenarioId: record.scenarioId,
+      kbVersion: KB_VERSION,
+      messageCount: record.messages.length,
+      messages: record.messages,
+      tokenSummary: { inputTokens, outputTokens, incurredCostUsd: 0 },
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    };
+  }
+
+  private async chatClear(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
+    const capability = 'traceforge.chat.clear';
+    const conversationId = requireString(args, 'conversationId', correlationId, capability);
+    const record = await this.requireOwnedConversation(conversationId, context, correlationId, capability);
+    record.messages = [];
+    record.updatedAt = new Date().toISOString();
+    await this.persistConversation(record);
+    return { conversationId: record.conversationId, cleared: true, messageCount: 0, kbVersion: KB_VERSION };
+  }
+
+  private async chatFeedback(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
+    const capability = 'traceforge.chat.feedback';
+    const rating = asString(args['rating']);
+    if (rating !== 'helpful' && rating !== 'unhelpful') {
+      throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', `Invalid rating '${String(rating)}': expected 'helpful' or 'unhelpful'.`, correlationId, capability);
+    }
+    const conversationId = asString(args['conversationId']) ?? null;
+    if (conversationId) {
+      await this.requireOwnedConversation(conversationId, context, correlationId, capability);
+    }
+    const rawIndex = args['messageIndex'];
+    const messageIndex = typeof rawIndex === 'number' && Number.isInteger(rawIndex) && rawIndex >= 0
+      ? rawIndex
+      : undefined;
+    const rawComment = asString(args['comment']) ?? '';
+    const entry: AssistantFeedbackRecord = {
+      feedbackId: randomAssistantId('fb_'),
+      actorId: context.actorId,
+      conversationId,
+      ...(messageIndex !== undefined ? { messageIndex } : {}),
+      rating,
+      ...(rawComment.length > 0 ? { comment: rawComment.slice(0, 500) } : {}),
+      kbVersion: KB_VERSION,
+      createdAt: new Date().toISOString(),
+    };
+    await this.persistAssistantFeedback(entry);
+    return {
+      feedbackId: entry.feedbackId,
+      recorded: true,
+      rating: entry.rating,
+      conversationId: entry.conversationId,
+      kbVersion: KB_VERSION,
     };
   }
 }

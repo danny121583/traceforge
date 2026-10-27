@@ -34,7 +34,7 @@ diagnosis score, not a vague impression.
   investigation replay at zero cost.
 - Real Muse Spark 1.3 (`muse-spark-1.3`) multi-turn diagnostic reasoning
   with structured tool calls — always behind an explicit, paid opt-in.
-- 18-tool MaaS/MCP server, Cloudflare Worker staging backend with
+- 25-tool MaaS/MCP server, Cloudflare Worker staging backend with
   OAuth 2.1 PKCE, and AES-256-GCM authenticated session tokens.
 - Floating TraceForge Assistant: RAG-first answers from a versioned
   knowledge base (`KB_VERSION`) at `$0.00`, with explicitly authorized,
@@ -148,7 +148,7 @@ CH224K PD trigger. Nodes: `GND`, `V5`, `CC1`, `CC2`. Probe aliases:
   (`src/lib/meta-client.ts`).
 - **Local proxy:** same-origin server proxy attaching `META_API_KEY`
   (`src/server/meta-proxy.ts`).
-- **MaaS service:** 18-tool MCP service (`src/maas/tools.ts`) with
+- **MaaS service:** 25-tool MCP service (`src/maas/tools.ts`, 18 circuit-diagnostic + 7 assistant/KB) with
   security layer (`src/maas/security.ts`), protocol
   (`src/maas/protocol.ts`), and verification receipts
   (`src/maas/verification.ts`).
@@ -233,7 +233,7 @@ consume paid inference credits — every other tool is non-billable.
 
 | Tool | Purpose | Key args | Auth scope |
 |---|---|---|---|
-| `traceforge.capabilities.list` | List all 18 tools + schemas | — | public |
+| `traceforge.capabilities.list` | List all 25 tools + schemas | — | public |
 | `traceforge.system.status` | Health, solver, kill switch, sessions | — | public |
 | `traceforge.models.status` | Spark/SAM modes, never calls paid inference | — | public |
 | `traceforge.budget.status` | Budget baseline, ledger, safety stop | — | public |
@@ -251,6 +251,13 @@ consume paid inference credits — every other tool is non-billable.
 | `traceforge.investigations.result` | Diagnosis + evidence, truth withheld | `investigationId?`, `scenarioId?` | `investigations:read` |
 | `traceforge.evaluation.score` | Score vs hidden fault, discloses truth (mutates: locks) | `scenarioId`, `submission?` | `evaluation:score` |
 | `traceforge.evaluation.report` | Full post-evaluation audit report | `scenarioId` | `evaluation:score` |
+| `traceforge.kb.search` | Versioned KB search (BM25 + synonyms, `$0.00`) | `query`, `limit?` | public |
+| `traceforge.chat.status` | Assistant status, `kbVersion`, `$2.00` ledger, limits | — | public |
+| `traceforge.chat.start` | Actor-isolated conversation (+ optional `scenarioId` grounding) | `scenarioId?`, `title?` | `discovery:read` |
+| `traceforge.chat.ask` | RAG-first answer or 20-question QA batch (`runStandard20QuestionQa`) | `message?`, `questions?`, `runStandard20QuestionQa?`, `conversationId?`, `scenarioId?`, `allowLiveInference?` | `discovery:read` |
+| `traceforge.chat.history` | Ordered history + sources + cost summary | `conversationId` | `discovery:read` |
+| `traceforge.chat.clear` | Clear owned conversation messages | `conversationId` | `discovery:read` |
+| `traceforge.chat.feedback` | Answer feedback (`helpful` / `unhelpful`) | `rating`, `conversationId?`, `messageIndex?`, `comment?` | `discovery:read` |
 
 End-to-end JSON-RPC example (bearer abbreviated):
 
@@ -269,22 +276,30 @@ End-to-end JSON-RPC example (bearer abbreviated):
   "arguments": {"scenarioId": "scn_…"}}}
 ```
 
-OAuth clients use RFC 7591 dynamic registration plus PKCE S256 and
-OAuth 2.1 refresh-token rotation (`POST /oauth/register` →
-`GET /oauth/authorize` → `POST /oauth/token` with
+OAuth 2.1 works for ChatGPT, Muse / Meta AI, and generic
+standards-compliant MCP clients via RFC 7591 dynamic registration
+(`client_name` optional; `POST /oauth/register` → `GET /oauth/authorize`
+with PKCE S256 → `POST /oauth/token` with
 `grant_type=authorization_code` or `grant_type=refresh_token` →
 `POST /oauth/revoke`); each issued token is bound to its own
 `actor_oauth_<clientId>` actor with only its granted scopes, and
 refresh-token state is persisted in `TraceForgeStateDO` so ChatGPT MCP
 connections can renew expired 1-hour access tokens without full manual
-re-authentication.
+re-authentication. Discovery lives at
+`/.well-known/oauth-protected-resource` (with `resource_documentation`
+→ `GET /docs/mcp`, documenting all 25 tools) and
+`/.well-known/oauth-authorization-server`; the MCP layer additionally
+answers `initialize`, `notifications/initialized`, `ping`,
+`server/discover` (server info + tool catalog for discovery clients),
+`tools/list`, `tools/call`, `resources/list`, `resources/read`, and
+`prompts/list`.
 
 ### H2. TraceForge Assistant (RAG-first, `$0.00` by default)
 
 The floating **TraceForge Assistant** widget answers from a versioned
 static knowledge base first (`src/data/knowledge-base.ts`,
 `docs/knowledge/traceforge-knowledge-base.md`, pinned by `KB_VERSION =
-'2026.10.27-v2'`, 18 topics): deterministic inverted-index + synonym +
+'2026.10.27-v3'`, 18 topics): deterministic inverted-index + synonym +
 BM25 retrieval with a confidence/coverage gate (`high`/`medium`/`low`),
 prompt-injection refusal, greeting handling, and session-grounded
 answers (board, symptom, probes, diagnosis, evaluated score breakdown)
@@ -305,6 +320,37 @@ and the shared-ledger reservation succeeds (`$2.00` chat allowance,
 per-client rate limit). Every other outcome — including upstream
 errors, with no retries — returns a knowledge-only fallback
 (`mode: 'knowledge_fallback'`, `liveInvoked: false`) at `$0.00`.
+
+The same engine serves MCP clients through 7 assistant & knowledge
+base tools (`traceforge.kb.search`, `traceforge.chat.status`,
+`traceforge.chat.start`, `traceforge.chat.ask`,
+`traceforge.chat.history`, `traceforge.chat.clear`,
+`traceforge.chat.feedback`), including the deterministic 20-question
+QA benchmark (`runStandard20QuestionQa: true`, knowledge-only,
+`$0.00`, zero live calls).
+
+### H3. Website vs. MCP Feature-Parity Matrix & Custom PCB Upload Roadmap
+
+Full audit:
+[`docs/mcp/traceforge-mcp-parity-matrix.md`](docs/mcp/traceforge-mcp-parity-matrix.md).
+Summary — `Available through website and MCP`: board selection &
+inspection, scenario sessions, virtual multimeter, autonomous
+investigations (Virtual Lab `$0.00` / explicit Live AI
+`muse-spark-1.3`), ground-truth scoring, audit report & rework
+guidance, pinout/spec/test-point inspection, AI assistant
+(conversation, session grounding, feedback, usage status), and direct
+KB search. `MCP-only`: scripted 20-question QA batch benchmark.
+`Website-only`: interactive SVG PCB pan/zoom and recorded replay
+animation (MCP returns coordinate highlights instead).
+`Not yet implemented` / `Requires additional infrastructure or
+authorization`: arbitrary custom PCB / schematic / KiCad / Gerber /
+photo ingestion with netlist extraction and live `sam-3.1`
+segmentation — missing a server-side netlist parser, a verified
+`sam-3.1` endpoint with coordinate registration, sandboxed upload
+storage with validation, and scoped upload authorization (the doc
+records a 4-stage safe roadmap; no unrestricted upload subsystem is
+built now). The website Advanced Tools panel only appends local
+`.txt`/`.md` symptom and datasheet notes.
 
 ## I. Cloudflare Worker & Vercel Hobby ($0) Deployment
 
@@ -452,8 +498,8 @@ call) establishes live execution.
 
 **Implemented:** virtual bench + hidden faults for all 3 boards;
 guided 3-step UX with progressive probing and recorded replay; live
-Muse Spark 1.3 multi-turn tool calling (explicit opt-in); 18-tool
-MaaS/MCP server; Cloudflare Worker with OAuth 2.1 PKCE, AES-256-GCM
+Muse Spark 1.3 multi-turn tool calling (explicit opt-in); 25-tool
+MaaS/MCP server (18 diagnostic + 7 assistant/KB); Cloudflare Worker with OAuth 2.1 PKCE, AES-256-GCM
 tokens, and browser backend routes; Vercel Hobby deployment wiring;
 budget ledger with `$95.00` safety stop; floating TraceForge Assistant
 with versioned RAG knowledge base (`KB_VERSION`), deterministic local
@@ -467,15 +513,24 @@ attachment; multi-user accounts, cloud databases, secondary AI models.
 
 ## N. Development & Contribution Governance
 
-All work follows [`AGENTS.md`](AGENTS.md): Antigravity coordinates
-(planning, review, QA, budget tracking) and never edits implementation
-code; Muse Code is the exclusive implementation agent. Key standing
-rules: `README.md` + `CHANGELOG.md` must be updated with every
-functional change; simulated output is never presented as live
-inference; `META_API_KEY` never enters browser bundles or commits;
-TraceForge stays isolated from all other projects. The official
-private repository is `danny121583/traceforge` (branch workflow,
-no force-push, verify identity before remote operations).
+All work follows the operating contract in [`AGENTS.md`](AGENTS.md).
+Key standing rules, stated in neutral engineering terms: develop on
+descriptive feature branches and keep `main` stable; every change
+passes the automated verification gates (unit tests, TypeScript
+validation, production build) before merge — never merge unverified
+changes and never force-push; `README.md` + `CHANGELOG.md` are
+updated in the same change set as every functional change, with
+capabilities honestly classified as implemented, partial, planned,
+deferred, or unavailable; every AI result carries an explicit
+operational-mode badge (`SIMULATED`, `STATIC_FIXTURE`, `UNVERIFIED`,
+`UNAVAILABLE`, `LIVE_API`) and simulated output is never presented as
+live inference (`muse-spark-1.3` live calls and `sam-3.1` static
+fixtures are always disclosed as such); secrets and credentials
+(`META_API_KEY`, tokens) never enter browser bundles, logs,
+screenshots, or commits and live strictly on the trusted
+server/proxy; TraceForge stays isolated from all other projects. The
+official private repository is `danny121583/traceforge` (verify
+identity before remote operations).
 
 ## O. License & Usage
 
