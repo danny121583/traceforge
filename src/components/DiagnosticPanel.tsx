@@ -34,7 +34,7 @@ export function DiagnosticPanel({ boardName, evidence, verification }: Props) {
         <span className="tf-verdict-reason">{verification.reason}</span>
       </div>
 
-      <h4>Observed Evidence</h4>
+      <h4>Observed Symptoms</h4>
       {evidence.observedEvidence.length === 0 ? (
         <div className="tf-ev-empty">No observed symptoms recorded.</div>
       ) : (
@@ -47,21 +47,24 @@ export function DiagnosticPanel({ boardName, evidence, verification }: Props) {
         </ul>
       )}
 
-      <h4>Probe Measurements</h4>
+      <h4>Probe Measurements (Virtual Multimeter)</h4>
       {evidence.probeMeasurements.length === 0 ? (
         <div className="tf-ev-empty">No probe measurements yet — hypotheses below are unverified.</div>
       ) : (
         <ul className="tf-ev-list">
-          {evidence.probeMeasurements.map((m, i) => (
-            <li key={i}>
-              <span className={STATUS_CHIP[m.status] ?? 'tf-ev-chip mute'}>{m.status}</span>{' '}
-              <strong>{m.point}</strong> · {m.value}
-            </li>
-          ))}
+          {evidence.probeMeasurements.map((m, i) => {
+            const cleanValue = m.value.replace(/^\[Virtual Measurements\]\s*/i, '');
+            return (
+              <li key={i}>
+                <span className={STATUS_CHIP[m.status] ?? 'tf-ev-chip mute'}>{m.status}</span>{' '}
+                <strong>{m.point}</strong> · {cleanValue}
+              </li>
+            );
+          })}
         </ul>
       )}
 
-      <h4>Datasheet Specifications</h4>
+      <h4>Datasheet Reference Specifications</h4>
       {evidence.datasheetSpecs.length === 0 ? (
         <div className="tf-ev-empty">No datasheet citations.</div>
       ) : (

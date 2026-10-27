@@ -144,6 +144,24 @@ interface OAuthClientRecord {
   createdAtMs: number;
 }
 
+/** Persistent state record for an OAuth 2.1 refresh token (rotation + revocation). */
+export interface RefreshTokenRecord {
+  tokenId: string;
+  clientId: string;
+  actorId: string;
+  scope: string;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  consumed: boolean;
+  revoked: boolean;
+  replacedBy?: string;
+}
+
+/** Access token lifetime in seconds (60 minutes). */
+export const ACCESS_TOKEN_TTL_SECONDS = 3600;
+/** Refresh token lifetime in milliseconds (30 days). */
+export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 3600 * 1000;
+
 /* ---------------------------------------------------------------------------
  * Module-level pure helpers (CORS, envelopes, PKCE, header mapping)
  * ------------------------------------------------------------------------- */
@@ -232,8 +250,13 @@ function incomingHeaders(request: Request): Record<string, string | string[] | u
 const STATELESS_SIGNING_SECRET = 'tf-internal-stateless-oauth-v1::worker-isolate-signing-only';
 const STATELESS_CODE_PREFIX = 'tf_code_x.';
 const STATELESS_TOKEN_PREFIX = 'tf_live_x.';
+const STATELESS_REFRESH_PREFIX = 'tf_rt_x.';
 /** Edge-cache key prefix for cross-isolate one-time auth-code consumption. */
 const EDGE_CACHE_OAUTH_CODE_PREFIX = 'https://traceforge-internal.local/oauth/code/';
+/** Durable / Edge-cache key prefix for OAuth 2.1 refresh-token records. */
+const EDGE_CACHE_OAUTH_REFRESH_PREFIX = 'https://traceforge-internal.local/oauth/refresh/';
+/** Durable / Edge-cache key prefix for revoked OAuth 2.1 access/refresh tokens. */
+const EDGE_CACHE_OAUTH_REVOKED_PREFIX = 'https://traceforge-internal.local/oauth/revoked/';
 
 function b64urlEncodeText(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -373,6 +396,94 @@ export async function markCodeConsumedInEdgeCache(codeParam: string): Promise<vo
   }
 }
 
+/** Read a persisted OAuth 2.1 refresh-token record (Durable Object first, Edge Cache second). */
+export async function getRefreshTokenRecordFromStorage(token: string): Promise<RefreshTokenRecord | null> {
+  const key = `${EDGE_CACHE_OAUTH_REFRESH_PREFIX}${await sha256Hex(token)}`;
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      const val = await hook.get(key);
+      if (val && typeof val === 'object') return val as RefreshTokenRecord;
+    } catch {
+      // Fall through to caches.default on durable-read failure.
+    }
+  }
+  try {
+    const cache = getEdgeCache();
+    if (cache) {
+      const hit = await cache.match(key);
+      if (hit) {
+        const parsed = await hit.json();
+        if (parsed && typeof parsed === 'object') return parsed as RefreshTokenRecord;
+      }
+    }
+  } catch {
+    // Best-effort only.
+  }
+  return null;
+}
+
+/** Persist an OAuth 2.1 refresh-token record (Durable Object AND Edge Cache). */
+export async function saveRefreshTokenRecordToStorage(token: string, record: RefreshTokenRecord): Promise<void> {
+  const key = `${EDGE_CACHE_OAUTH_REFRESH_PREFIX}${await sha256Hex(token)}`;
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      await hook.put(key, record);
+    } catch {
+      // Best-effort only.
+    }
+  }
+  try {
+    edgeCachePutJson(key, record);
+  } catch {
+    // Best-effort only.
+  }
+}
+
+/** Check whether an access or refresh token has been revoked in durable/edge storage. */
+export async function isTokenRevokedInStorage(token: string): Promise<boolean> {
+  const key = `${EDGE_CACHE_OAUTH_REVOKED_PREFIX}${await sha256Hex(token)}`;
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      const val = await hook.get(key);
+      if (val !== undefined && val !== null) return true;
+    } catch {
+      // Fall through to caches.default.
+    }
+  }
+  try {
+    const cache = getEdgeCache();
+    if (cache) {
+      const hit = await cache.match(key);
+      if (hit) return true;
+    }
+  } catch {
+    // Best-effort only.
+  }
+  return false;
+}
+
+/** Mark an access or refresh token revoked in durable/edge storage. */
+export async function markTokenRevokedInStorage(token: string): Promise<void> {
+  const key = `${EDGE_CACHE_OAUTH_REVOKED_PREFIX}${await sha256Hex(token)}`;
+  const payload = { revoked: true, at: new Date().toISOString() };
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      await hook.put(key, payload);
+    } catch {
+      // Best-effort only.
+    }
+  }
+  try {
+    edgeCachePutJson(key, payload);
+  } catch {
+    // Best-effort only.
+  }
+}
+
 /* ---------------------------------------------------------------------------
  * Worker factory: one isolated service + OAuth stores per instance
  * ------------------------------------------------------------------------- */
@@ -389,6 +500,8 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
   const issuedTokens = new Map<string, IssuedToken>();
   const authCodes = new Map<string, AuthCodeRecord>();
   const oauthClients = new Map<string, OAuthClientRecord>();
+  /** Isolate-local cache of refresh-token records (backed by Durable Object / Edge Cache). */
+  const refreshTokens = new Map<string, RefreshTokenRecord>();
   /** One-time consumption record for self-contained codes redeemed in THIS isolate. */
   const consumedStatelessCodes = new Set<string>();
 
@@ -464,6 +577,97 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
   }
 
   /**
+   * Mint a signed OAuth 2.1 refresh token bound to `clientId` and `scope`,
+   * and persist its rotation/revocation record in isolate memory, Durable
+   * Object storage, and Cloudflare Edge Cache.
+   */
+  async function issueRefreshToken(scope: string, clientId: string, signingSecret: string): Promise<string> {
+    const issuedAtMs = clock();
+    const expiresAtMs = issuedAtMs + REFRESH_TOKEN_TTL_MS;
+    const tokenId = randomHex('tf_rt_id', 12);
+    const actorId = `actor_oauth_${clientId || 'default'}`;
+    const payloadB64 = b64urlEncodeText(JSON.stringify({
+      v: 1,
+      jti: tokenId,
+      scope,
+      cid: clientId,
+      aid: actorId,
+      iat: issuedAtMs,
+      exp: expiresAtMs,
+    }));
+    const token = `${STATELESS_REFRESH_PREFIX}${payloadB64}.${await statelessSign(payloadB64, signingSecret)}`;
+    const record: RefreshTokenRecord = {
+      tokenId,
+      clientId,
+      actorId,
+      scope,
+      issuedAtMs,
+      expiresAtMs,
+      consumed: false,
+      revoked: false,
+    };
+    refreshTokens.set(token, record);
+    await saveRefreshTokenRecordToStorage(token, record);
+    return token;
+  }
+
+  /**
+   * Verify a self-contained OAuth 2.1 refresh token (HMAC-SHA-256 signature +
+   * shape) and merge with any persisted rotation/revocation state from
+   * isolate memory or Durable Object / Edge Cache storage.
+   */
+  async function verifyStatelessRefreshToken(token: string, signingSecret: string): Promise<RefreshTokenRecord | null> {
+    if (!token.startsWith(STATELESS_REFRESH_PREFIX)) return null;
+    const rest = token.slice(STATELESS_REFRESH_PREFIX.length);
+    const dot = rest.lastIndexOf('.');
+    if (dot === -1) return null;
+    const payloadB64 = rest.slice(0, dot);
+    const sig = rest.slice(dot + 1);
+    if (!payloadB64 || !sig) return null;
+    if ((await statelessSign(payloadB64, signingSecret)) !== sig) return null;
+    try {
+      const payload = JSON.parse(b64urlDecodeText(payloadB64)) as {
+        v?: number;
+        jti?: string;
+        scope?: string;
+        cid?: string;
+        aid?: string;
+        iat?: number;
+        exp?: number;
+      };
+      if (
+        payload.v !== 1
+        || typeof payload.jti !== 'string'
+        || typeof payload.scope !== 'string'
+        || typeof payload.cid !== 'string'
+        || typeof payload.exp !== 'number'
+      ) {
+        return null;
+      }
+      const inMemory = refreshTokens.get(token);
+      const persisted = await getRefreshTokenRecordFromStorage(token);
+      const revokedInStorage = await isTokenRevokedInStorage(token);
+      const consumed = Boolean(inMemory?.consumed || persisted?.consumed);
+      const revoked = Boolean(inMemory?.revoked || persisted?.revoked || revokedInStorage || service.getKillSwitch().isTokenRevoked(token));
+      const merged: RefreshTokenRecord = {
+        tokenId: payload.jti,
+        clientId: payload.cid,
+        actorId: typeof payload.aid === 'string' ? payload.aid : `actor_oauth_${payload.cid || 'default'}`,
+        scope: payload.scope,
+        issuedAtMs: typeof payload.iat === 'number' ? payload.iat : 0,
+        expiresAtMs: payload.exp,
+        consumed,
+        revoked,
+        ...(inMemory?.replacedBy ?? persisted?.replacedBy ? { replacedBy: inMemory?.replacedBy ?? persisted?.replacedBy } : {}),
+      };
+      refreshTokens.set(token, merged);
+      return merged;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Register a verified PKCE-issued Bearer token under its own isolated
    * actor (`actor_oauth_<clientId>`) with exactly its granted scopes — never
    * the shared operator token. A revoked token passes through untouched so
@@ -490,7 +694,11 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     if (token) {
       // Revoked tokens pass through untouched: `authenticate()` throws
       // `MAAS_CREDENTIALS_REVOKED` for them.
-      if (service.getKillSwitch().isTokenRevoked(token)) return headers;
+      if (service.getKillSwitch().isTokenRevoked(token) || (await isTokenRevokedInStorage(token))) {
+        service.getKillSwitch().revokeToken(token);
+        issuedTokens.delete(token);
+        return headers;
+      }
       const issued = issuedTokens.get(token);
       if (issued && clock() <= issued.expiresAtMs) {
         return { ...headers, ...registerOAuthToken(token, issued.scope, issued.clientId) };
@@ -794,8 +1002,9 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         authorization_endpoint: `${origin}/oauth/authorize`,
         token_endpoint: `${origin}/oauth/token`,
         registration_endpoint: `${origin}/oauth/register`,
+        revocation_endpoint: `${origin}/oauth/revoke`,
         response_types_supported: ['code'],
-        grant_types_supported: ['authorization_code'],
+        grant_types_supported: ['authorization_code', 'refresh_token'],
         code_challenge_methods_supported: ['S256'],
         token_endpoint_auth_methods_supported: ['none'],
         scopes_supported: [...WORKER_SCOPES],
@@ -824,7 +1033,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         client_id: clientId,
         client_secret_expires_at: 0,
         redirect_uris: redirectUris,
-        grant_types: ['authorization_code'],
+        grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
         token_endpoint_auth_method: 'none',
       }, correlationId);
@@ -859,9 +1068,80 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
 
     if (method === 'POST' && path === '/oauth/token') {
       const params = await readTokenParams(request);
-      if (params['grant_type'] !== 'authorization_code') {
-        return oauthError(400, 'unsupported_grant_type', 'Only grant_type=authorization_code is supported.', correlationId);
+      const grantType = params['grant_type'] ?? '';
+      if (grantType !== 'authorization_code' && grantType !== 'refresh_token') {
+        return oauthError(
+          400,
+          'unsupported_grant_type',
+          'Only grant_type=authorization_code and grant_type=refresh_token are supported.',
+          correlationId,
+        );
       }
+
+      if (grantType === 'refresh_token') {
+        const refreshParam = params['refresh_token'] ?? '';
+        if (!refreshParam) {
+          return oauthError(400, 'invalid_request', 'refresh_token is required for grant_type=refresh_token.', correlationId);
+        }
+        const record = await verifyStatelessRefreshToken(refreshParam, signingSecret);
+        if (!record) {
+          return oauthError(400, 'invalid_grant', 'Refresh token is invalid or malformed.', correlationId);
+        }
+        if (record.revoked) {
+          return oauthError(400, 'invalid_grant', 'Refresh token has been revoked.', correlationId);
+        }
+        if (record.consumed) {
+          return oauthError(400, 'invalid_grant', 'Refresh token has already been used (rotated).', correlationId);
+        }
+        if (clock() > record.expiresAtMs) {
+          return oauthError(400, 'invalid_grant', 'Refresh token has expired.', correlationId);
+        }
+        const requestedClientId = params['client_id']?.trim();
+        if (requestedClientId && requestedClientId !== record.clientId) {
+          return oauthError(400, 'invalid_grant', 'Refresh token does not belong to the specified client_id.', correlationId);
+        }
+        const grantedList = record.scope.split(/\s+/).map((s) => s.trim()).filter((s) => s.length > 0);
+        const grantedSet = new Set(grantedList);
+        let effectiveScope = record.scope;
+        if (typeof params['scope'] === 'string' && params['scope'].trim().length > 0) {
+          const requestedScopes = params['scope'].split(/\s+/).map((s) => s.trim()).filter((s) => s.length > 0);
+          for (const s of requestedScopes) {
+            if (!grantedSet.has(s)) {
+              return oauthError(
+                400,
+                'invalid_scope',
+                `Requested scope '${s}' exceeds the scopes granted to this refresh token.`,
+                correlationId,
+              );
+            }
+          }
+          effectiveScope = requestedScopes.join(' ');
+        }
+        // Issue new access token + rotated refresh token, and atomically mark
+        // the old refresh token consumed so it cannot be replayed.
+        const newAccessToken = await mintStatelessToken(effectiveScope, record.clientId, signingSecret);
+        issuedTokens.set(newAccessToken, {
+          scope: effectiveScope,
+          clientId: record.clientId,
+          expiresAtMs: clock() + ACCESS_TOKEN_TTL_SECONDS * 1000,
+        });
+        const newRefreshToken = await issueRefreshToken(effectiveScope, record.clientId, signingSecret);
+        const consumedRecord: RefreshTokenRecord = {
+          ...record,
+          consumed: true,
+          replacedBy: newRefreshToken,
+        };
+        refreshTokens.set(refreshParam, consumedRecord);
+        await saveRefreshTokenRecordToStorage(refreshParam, consumedRecord);
+        return jsonResponse(200, {
+          access_token: newAccessToken,
+          token_type: 'Bearer',
+          expires_in: ACCESS_TOKEN_TTL_SECONDS,
+          refresh_token: newRefreshToken,
+          scope: effectiveScope,
+        }, correlationId);
+      }
+
       const codeParam = params['code'] ?? '';
       let stored = authCodes.get(codeParam);
       if (stored && clock() > stored.expiresAtMs) {
@@ -899,13 +1179,33 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       consumedStatelessCodes.add(codeParam);
       await markCodeConsumedInEdgeCache(codeParam);
       const accessToken = await mintStatelessToken(stored.scope, stored.clientId, signingSecret);
-      issuedTokens.set(accessToken, { scope: stored.scope, clientId: stored.clientId, expiresAtMs: clock() + 3600 * 1000 });
+      issuedTokens.set(accessToken, { scope: stored.scope, clientId: stored.clientId, expiresAtMs: clock() + ACCESS_TOKEN_TTL_SECONDS * 1000 });
+      const refreshToken = await issueRefreshToken(stored.scope, stored.clientId, signingSecret);
       return jsonResponse(200, {
         access_token: accessToken,
         token_type: 'Bearer',
-        expires_in: 3600,
+        expires_in: ACCESS_TOKEN_TTL_SECONDS,
+        refresh_token: refreshToken,
         scope: stored.scope,
       }, correlationId);
+    }
+
+    if (method === 'POST' && path === '/oauth/revoke') {
+      const params = await readTokenParams(request);
+      const tokenParam = params['token']?.trim() ?? '';
+      if (!tokenParam) {
+        return oauthError(400, 'invalid_request', 'token is required for POST /oauth/revoke (RFC 7009).', correlationId);
+      }
+      service.getKillSwitch().revokeToken(tokenParam);
+      issuedTokens.delete(tokenParam);
+      await markTokenRevokedInStorage(tokenParam);
+      const rtRecord = await verifyStatelessRefreshToken(tokenParam, signingSecret);
+      if (rtRecord) {
+        const revokedRt: RefreshTokenRecord = { ...rtRecord, revoked: true };
+        refreshTokens.set(tokenParam, revokedRt);
+        await saveRefreshTokenRecordToStorage(tokenParam, revokedRt);
+      }
+      return jsonResponse(200, { revoked: true }, correlationId);
     }
 
     if (method === 'POST' && (path === '/mcp' || path === '/api/mcp')) {

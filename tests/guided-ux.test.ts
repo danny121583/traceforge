@@ -105,54 +105,67 @@ describe('plain-language activity summary', () => {
   });
 });
 
-describe('AI mode badge', () => {
-  it('labels every operational mode truthfully with the matching chip class', () => {
-    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'Live AI', className: 'tf-chip live' });
+describe('AI mode badge (unified Live AI status model)', () => {
+  it('labels every operational mode truthfully with the unified status model', () => {
+    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'Completed with Muse Spark 1.3', className: 'tf-chip live' });
     expect(aiModeBadge('SIMULATED')).toEqual({ label: 'Virtual Lab', className: 'tf-chip sim' });
     expect(aiModeBadge('STATIC_FIXTURE')).toEqual({ label: 'Virtual Lab', className: 'tf-chip sim' });
-    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'Live AI (Unverified)', className: 'tf-chip unverified' });
-    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Service Unavailable', className: 'tf-chip unavailable' });
+    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'Live AI Ready', className: 'tf-chip live' });
+    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'Live AI Unavailable', className: 'tf-chip unavailable' });
   });
 
-  it('never exposes model branding in the header badge label', () => {
-    for (const mode of ['LIVE_API', 'SIMULATED', 'STATIC_FIXTURE', 'UNVERIFIED', 'UNAVAILABLE'] as const) {
-      expect(aiModeBadge(mode).label).not.toContain('Muse');
-      expect(aiModeBadge(mode).label).not.toContain('Spark');
+  it('never exposes raw internal enum identifiers in any badge label', () => {
+    for (const mode of ['LIVE_API', 'SIMULATED', 'STATIC_FIXTURE', 'UNVERIFIED', 'UNAVAILABLE', 'RECORDED_LIVE_REPLAY'] as const) {
+      const label = aiModeBadge(mode).label;
+      expect(label).not.toContain('LIVE_API');
+      expect(label).not.toContain('UNVERIFIED');
+      expect(label).not.toContain('STATIC_FIXTURE');
+      expect(label).not.toContain('RECORDED_LIVE_REPLAY');
     }
   });
 
-  it('keeps every return value unchanged when options are omitted', () => {
-    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'Live AI', className: 'tf-chip live' });
-    expect(aiModeBadge('SIMULATED')).toEqual({ label: 'Virtual Lab', className: 'tf-chip sim' });
-    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'Live AI (Unverified)', className: 'tf-chip unverified' });
-    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Service Unavailable', className: 'tf-chip unavailable' });
+  it('distinguishes Live AI Ready, Live AI Investigating, Completed with Muse Spark 1.3, and Recorded Investigation', () => {
+    expect(aiModeBadge('UNVERIFIED', { proxyConfigured: true })).toEqual({
+      label: 'Live AI Ready',
+      className: 'tf-chip live',
+    });
+    expect(aiModeBadge('UNVERIFIED', { proxyConfigured: true, running: true })).toEqual({
+      label: 'Live AI Investigating',
+      className: 'tf-chip live',
+    });
+    expect(aiModeBadge('LIVE_API', { running: true })).toEqual({
+      label: 'Live AI Investigating',
+      className: 'tf-chip live',
+    });
+    expect(aiModeBadge('LIVE_API', { running: false })).toEqual({
+      label: 'Completed with Muse Spark 1.3',
+      className: 'tf-chip live',
+    });
     expect(aiModeBadge('RECORDED_LIVE_REPLAY')).toEqual({
       label: 'Recorded Investigation',
       className: 'tf-chip sim',
     });
   });
 
-  it('reports Live AI (Ready) when UNVERIFIED with a configured proxy', () => {
+  it('reports Live AI Unavailable when proxyConfigured is false or UNVERIFIED cannot reach proxy', () => {
     expect(aiModeBadge('UNVERIFIED', { proxyConfigured: true })).toEqual({
-      label: 'Live AI (Ready)',
+      label: 'Live AI Ready',
       className: 'tf-chip live',
     });
-    // Explicit false (or omitted) keeps the Unverified badge.
     expect(aiModeBadge('UNVERIFIED', { proxyConfigured: false })).toEqual({
-      label: 'Live AI (Unverified)',
-      className: 'tf-chip unverified',
+      label: 'Live AI Unavailable',
+      className: 'tf-chip unavailable',
     });
   });
 
-  it('reports AI Service Unavailable whenever a liveModeError is present (mode never silently reverts)', () => {
+  it('reports Live AI Unavailable whenever a liveModeError is present (mode never silently reverts)', () => {
     const err = 'proxy unavailable';
     for (const mode of ['LIVE_API', 'UNVERIFIED', 'UNAVAILABLE', 'SIMULATED'] as const) {
       expect(aiModeBadge(mode, { proxyConfigured: true, liveModeError: err })).toEqual({
-        label: 'AI Service Unavailable',
+        label: 'Live AI Unavailable',
         className: 'tf-chip unavailable',
       });
     }
-    // Null/empty errors behave exactly like omitted options.
     expect(aiModeBadge('UNVERIFIED', { liveModeError: null })).toEqual(aiModeBadge('UNVERIFIED'));
   });
 });

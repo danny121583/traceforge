@@ -371,8 +371,21 @@ function constantTimeHexEqual(a: string, b: string): boolean {
  */
 export async function encryptSignedToken(prefix: string, payload: Record<string, unknown>, secret: string, ivOverride?: Uint8Array): Promise<string> {
   const aesKey = await aeadKeyForSecret(secret);
-  const iv = ivOverride && ivOverride.length === 12 ? ivOverride.slice() : crypto.getRandomValues(new Uint8Array(12));
-  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const plaintextText = JSON.stringify(payload);
+  const plaintext = new TextEncoder().encode(plaintextText);
+  let iv: Uint8Array;
+  if (ivOverride && ivOverride.length === 12) {
+    // SIV safeguard: bind any caller-supplied deterministic IV seed to the
+    // exact plaintext bytes so two distinct plaintexts can NEVER share an
+    // AES-GCM nonce under the same key.
+    const sivDigest = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(`traceforge-aead-siv-v3::${secret}::${prefix}::${bytesToHex(ivOverride)}::${plaintextText}`),
+    );
+    iv = new Uint8Array(sivDigest).slice(0, 12);
+  } else {
+    iv = crypto.getRandomValues(new Uint8Array(12));
+  }
   const sealed = new Uint8Array(
     await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix) }, aesKey, plaintext as unknown as BufferSource),
   );
@@ -462,10 +475,16 @@ async function encodeInvestigationToken(payload: { s: string; o: string; q: numb
  * Edge Cache entry. `encodeScenarioToken` / `encryptSignedToken` keep using
  * random 96-bit IVs by default.
  */
-export async function deterministicIvForInvestigation(scenarioId: string, ownerActorId: string, secret: string): Promise<Uint8Array> {
+export async function deterministicIvForInvestigation(
+  scenarioId: string,
+  ownerActorId: string,
+  secret: string,
+  payload?: Record<string, unknown>,
+): Promise<Uint8Array> {
+  const canonicalPayload = payload ? JSON.stringify(payload) : '';
   const digest = await crypto.subtle.digest(
     'SHA-256',
-    new TextEncoder().encode(`traceforge-inv-iv-v2::${secret}::${scenarioId}::${ownerActorId}`),
+    new TextEncoder().encode(`traceforge-inv-iv-v2::${secret}::${scenarioId}::${ownerActorId}::${canonicalPayload}`),
   );
   return new Uint8Array(digest).slice(0, 12);
 }

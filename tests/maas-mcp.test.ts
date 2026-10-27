@@ -1112,6 +1112,24 @@ describe('20. AES-256-GCM session tokens', () => {
     expect(inv).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
   });
 
+  it('derives a Synthetic IV (SIV) bound to the exact plaintext so distinct plaintexts never share an AES-GCM IV', async () => {
+    const fixedSeed = new Uint8Array(12);
+    fixedSeed.fill(7);
+    const payloadA = { s: 'scn_alpha', o: 'actor_test', q: 1 };
+    const payloadB = { s: 'scn_beta', o: 'actor_test', q: 1 };
+    const tokenA1 = await encryptSignedToken('inv_', payloadA, SECRET, fixedSeed);
+    const tokenA2 = await encryptSignedToken('inv_', payloadA, SECRET, fixedSeed);
+    const tokenB = await encryptSignedToken('inv_', payloadB, SECRET, fixedSeed);
+    // Identical plaintext + seed -> identical token for cold-isolate determinism
+    expect(tokenA1).toBe(tokenA2);
+    // Distinct plaintexts with the same caller seed -> distinct 12-byte IVs (first 24 hex chars after prefix)
+    const ivHexA = tokenA1.slice('inv_'.length, 'inv_'.length + 24);
+    const ivHexB = tokenB.slice('inv_'.length, 'inv_'.length + 24);
+    expect(ivHexA).not.toBe(ivHexB);
+    expect(await decryptSignedToken('inv_', tokenA1, SECRET)).toEqual(payloadA);
+    expect(await decryptSignedToken('inv_', tokenB, SECRET)).toEqual(payloadB);
+  });
+
   it('rejects bit flips, truncation, and wrong-key decryption', async () => {
     const token = await encryptSignedToken('scn_', { b: 0, f: 0, o: 'actor_test', x: 1, q: 1 }, SECRET);
     const hex = token.slice('scn_'.length, token.lastIndexOf('_'));

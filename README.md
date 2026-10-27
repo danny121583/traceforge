@@ -172,26 +172,29 @@ flowchart LR
 
 ## F. AI Execution Modes
 
-| Mode | Badge | Meaning |
-|---|---|---|
-| Virtual Lab | `SIMULATED` / `Deterministic Virtual Lab` | Deterministic MNA bench + local agent. Default, `$0.00`. |
-| Live AI | `LIVE_API` / `Live Muse Spark 1.3` | Real `muse-spark-1.3` inference via the server proxy. Only after a verified real response; only via explicit opt-in. |
-| Recorded Investigation | `RECORDED_LIVE_REPLAY` / `Recorded Live Investigation` | Zero-cost replay of a recorded live session. Never labeled live. |
-| Static Reference Fixture | `STATIC_FIXTURE` | Predefined KiCad-derived geometry/overlays. Live SAM 3.1 segmentation is explicitly **deferred** (see §M). |
-| Unverified / Unavailable | `UNVERIFIED` / `UNAVAILABLE` | Live path exists but no real response confirmed yet / no key or proxy configured. |
+| Mode | User-Facing Badge | Internal Enum | Meaning |
+|---|---|---|---|
+| Virtual Lab | `Virtual Lab` | `SIMULATED` / `STATIC_FIXTURE` | Deterministic MNA bench + local agent. Default, `$0.00`. |
+| Recorded Investigation | `Recorded Investigation` | `RECORDED_LIVE_REPLAY` | Zero-cost replay of a recorded live session. Never labeled live. |
+| Live AI Ready | `Live AI Ready` | `UNVERIFIED` (proxy configured, idle) | Live mode selected and server proxy reachable; awaiting investigation start. |
+| Live AI Investigating | `Live AI Investigating` | `UNVERIFIED` / `LIVE_API` (`running: true`) | Active multi-turn live `muse-spark-1.3` investigation in progress. |
+| Completed with Muse Spark 1.3 | `Completed with Muse Spark 1.3` | `LIVE_API` (`running: false`) | Verified execution through the real remote `muse-spark-1.3` model. |
+| Live AI Unavailable | `Live AI Unavailable` | `UNAVAILABLE` / proxy error | Required service, proxy, or live API credential is inaccessible. |
 
 Explicit spend control: an omitted `mode` in
 `traceforge.investigations.start` **always** runs simulated, even with a
 live client attached. Read-only tools never invoke paid inference.
 
-The Step 2 header carries one compact mode badge — `Virtual Lab`,
-`Live AI` (ready/unverified), or `Recorded Investigation` — so the
-current execution mode is visible beside the investigation controls at
-all times. Developer telemetry (credit balances, token counts, cost
-math, mode codes) is removed from the ordinary UI; technical
-diagnostics stay available only through server-authorized access
-(`GET /api/maas/telemetry` with `traceforge:audit:read`, alongside
-`traceforge.budget.status` and the scoped `/api/maas/audit`).
+The Header, Step 2 header, and Step 3 results card share the same
+unified status badge (`Virtual Lab`, `Recorded Investigation`,
+`Live AI Ready`, `Live AI Investigating`,
+`Completed with Muse Spark 1.3`, or `Live AI Unavailable`) so the
+active execution state is consistent everywhere. Developer telemetry
+(credit balances, token counts, cost math, raw enum codes) is removed
+from the ordinary UI; technical diagnostics stay available only through
+server-authorized access (`GET /api/maas/telemetry` with
+`traceforge:audit:read`, alongside `traceforge.budget.status` and the
+scoped `/api/maas/audit`).
 
 ## G. Installation & Local Development
 
@@ -258,10 +261,15 @@ End-to-end JSON-RPC example (bearer abbreviated):
   "arguments": {"scenarioId": "scn_…"}}}
 ```
 
-OAuth clients use RFC 7591 dynamic registration plus PKCE S256
-(`POST /oauth/register` → `GET /oauth/authorize` →
-`POST /oauth/token`); each issued token is bound to its own
-`actor_oauth_<clientId>` actor with only its granted scopes.
+OAuth clients use RFC 7591 dynamic registration plus PKCE S256 and
+OAuth 2.1 refresh-token rotation (`POST /oauth/register` →
+`GET /oauth/authorize` → `POST /oauth/token` with
+`grant_type=authorization_code` or `grant_type=refresh_token` →
+`POST /oauth/revoke`); each issued token is bound to its own
+`actor_oauth_<clientId>` actor with only its granted scopes, and
+refresh-token state is persisted in `TraceForgeStateDO` so ChatGPT MCP
+connections can renew expired 1-hour access tokens without full manual
+re-authentication.
 
 ## I. Cloudflare Worker & Vercel Hobby ($0) Deployment
 
@@ -270,14 +278,16 @@ OAuth clients use RFC 7591 dynamic registration plus PKCE S256
   (`GET /api/maas/telemetry`: `Bearer` + `traceforge:audit:read`,
   `401`/`403` otherwise), browser backend
   (`/api/meta/status`, `/api/meta/chat`, `/api/meta/segment`), health,
-  and OAuth discovery. Provision the key once with
+  and OAuth 2.1 discovery/revocation (`/.well-known/*`,
+  `/oauth/register`, `/oauth/authorize`, `/oauth/token`,
+  `/oauth/revoke`). Provision the key once with
   `wrangler secret put META_API_KEY` (optionally
   `TRACEFORGE_SESSION_SECRET` to key session tokens independently);
   the key never leaves the server.
 - **Vercel Hobby frontend ($0/month, personal non-commercial
   hackathon demo):** Deployed at
   [`https://traceforge-ten.vercel.app`](https://traceforge-ten.vercel.app)
-  (preview [`https://traceforge-hsgcoutoy-aigraphixs-projects.vercel.app`](https://traceforge-hsgcoutoy-aigraphixs-projects.vercel.app)).
+  (preview [`https://traceforge-kirn4r1qz-aigraphixs-projects.vercel.app`](https://traceforge-kirn4r1qz-aigraphixs-projects.vercel.app)).
   `vercel.json` rewrites `/api/meta/*`,
   `/api/maas/*`, `/mcp`, and `/health` to the staging Worker origin —
   no paid plans, trials, add-ons, domains, or usage billing.
@@ -292,10 +302,12 @@ OAuth clients use RFC 7591 dynamic registration plus PKCE S256
   probe log, canonical investigation, immutable scorecard) and every
   mutation awaits persistence first (`Cache-Control: max-age=1800`),
   so consecutive MCP calls agree even when routed across isolates.
-  Investigation ids are deterministic per `(scenarioId, owner)`
-  (fixed sequence, SHA-256-derived IV); scenario tokens keep random
-  IVs. A per-actor Edge Cache index keeps `scenarios.list`
-  consistent across isolates without leaking sessions between actors.
+  Investigation ids are deterministic per `(scenarioId, owner)` using
+  a Synthetic IV (SIV) construction (`SHA-256` over secret, prefix,
+  seed, and exact serialized plaintext) so two distinct plaintexts can
+  never reuse a 96-bit AES-GCM IV; scenario tokens keep random IVs. A
+  per-actor Edge Cache index keeps `scenarios.list` consistent across
+  isolates without leaking sessions between actors.
 - **Strong global consistency on `*.workers.dev`
   (`TraceForgeStateDO`, `$0.00/month`):** `caches.default` is a
   no-op on `*.workers.dev` subdomains and MCP requests arrive from
@@ -303,22 +315,25 @@ OAuth clients use RFC 7591 dynamic registration plus PKCE S256
   request through the canonical Free-tier SQLite Durable Object
   singleton (`traceforge-canonical-v1`, `wrangler.toml`
   `TRACEFORGE_STATE_DO` binding), whose transactional storage backs
-  `PersistedScenarioState`. The MaaS `edgeCacheGet`/`edgeCachePut`
-  helpers and the OAuth one-time-code checks read/write that durable
-  storage FIRST, then Edge Cache, giving 100% strong session
-  consistency across isolates, PoPs, and restarts.
+  `PersistedScenarioState`, one-time OAuth authorization codes, and
+  OAuth 2.1 refresh-token rotation/revocation records.
 
 ## J. Security
 
 - **Server-side key isolation:** `META_API_KEY` is attached only by
   the local proxy and the Worker; browser bundles, responses, logs,
   and audit summaries never carry it (scrubbed + audited by tests).
-- **OAuth 2.1 S256 PKCE** with per-client actor binding
-  (`actor_oauth_<clientId>`) and granted-scope enforcement — no
-  shared operator mapping.
-- **AES-256-GCM + HMAC-SHA-256 tokens:** random 96-bit IV per token,
-  prefix bound as Additional Data, constant-time tag checks, and
-  `rotateSessionSecret` / `rotateSigningSecret` rotation.
+- **OAuth 2.1 S256 PKCE + Refresh-Token Rotation:** per-client actor
+  binding (`actor_oauth_<clientId>`), granted-scope enforcement,
+  one-time refresh-token rotation (`grant_type=refresh_token`), replay
+  rejection, scope preservation/narrowing (never escalation), and
+  `POST /oauth/revoke` persisted in `TraceForgeStateDO`.
+- **AES-256-GCM + SIV + HMAC-SHA-256 tokens:** random 96-bit IV per
+  scenario token, Synthetic IV (SIV) bound to exact serialized
+  plaintext for deterministic tokens (never reusing an AES-GCM IV on
+  distinct plaintexts), prefix bound as Additional Data, constant-time
+  tag checks, and `rotateSessionSecret` / `rotateSigningSecret`
+  rotation.
 - **Tool scopes & tenant isolation:** every non-public capability
   requires its scope; scenarios/investigations are strictly
   per-actor (`MAAS_CROSS_TENANT_ACCESS_DENIED`).

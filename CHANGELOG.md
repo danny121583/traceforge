@@ -134,3 +134,48 @@ landed on the project branches.
   + `max-width: 100%` on `body`/`.tf-app`, wrapping fault label, fluid
   fault-select width (full-width below `960px`), tighter mobile header
   padding.
+
+## Final UX layout, unified Live AI status, OAuth 2.1 refresh tokens & AES-GCM SIV hardening
+
+- **Fault scenario controls (`src/App.tsx`, `src/index.css`):** exact
+  `36px` height and top/bottom edge parity between the `Fault scenario:`
+  dropdown and `Re-roll random fault` button on desktop (`flex-wrap: nowrap`),
+  with full-width stacked controls on mobile (`<= 960px`) and complete
+  dependent-state reset on re-roll.
+- **Integrated PCB component inspection & left-column Advanced Tools
+  (`src/components/PcbCanvas.tsx`, `src/App.tsx`, `src/index.css`):**
+  moved component inspection directly inside the PCB card below the
+  test-point strip with keyboard-accessible SVG overlays, and moved
+  `Advanced Tools & Manual Bench Controls` to the left column directly
+  below the PCB (`open` by default) to balance the two-column layout.
+- **Completed investigation layout & 6-part result hierarchy
+  (`src/App.tsx`, `src/components/DiagnosticPanel.tsx`, `src/index.css`):**
+  auto-collapses `Investigation Activity & Probe Log` once an
+  investigation completes so `Step 3 · Review Results` sits immediately
+  near the top of the right column in a 6-part hierarchy (Diagnosis
+  Summary, Fault Classification & Verification Status, Supporting
+  Measurements, Ground-Truth Evaluation & Score, Recommended Next
+  Steps, and Rework Guidance).
+- **Simplified terminology & unified Live AI status model
+  (`src/lib/guided-ux.ts`, `src/components/Header.tsx`,
+  `src/components/PcbCanvas.tsx`, `src/components/DiagnosticPanel.tsx`,
+  `src/App.tsx`):** replaced developer enum strings (`LIVE_API`,
+  `[Virtual Measurements]`, `Static Fixture (KiCad)`,
+  `Video Demo Pacing (animate each probe)`) with clean user-facing
+  labels (`Circuit Reference Layout`, `Animate Investigation`,
+  `Virtual measurement`) and a single unified AI status model across
+  Header, Step 2, and Step 3 (`Virtual Lab`, `Recorded Investigation`,
+  `Live AI Ready`, `Live AI Investigating`,
+  `Completed with Muse Spark 1.3`, `Live AI Unavailable`).
+- **OAuth 2.1 refresh-token rotation & revocation (`worker/index.ts`):**
+  added `grant_type=refresh_token` and `POST /oauth/revoke` with
+  one-time refresh-token rotation, replay rejection, client binding,
+  scope preservation/narrowing, and durable persistence in
+  `TraceForgeStateDO` so ChatGPT MCP connections survive 1-hour access
+  token expiration without manual re-authentication.
+- **AES-256-GCM Synthetic IV (SIV) nonce safety (`src/maas/tools.ts`):**
+  bound any deterministic IV seed to the exact serialized plaintext via
+  `SHA-256("traceforge-aead-siv-v3::" + secret + "::" + prefix + "::" + seedHex + "::" + plaintext)`
+  so distinct plaintexts can never share a 96-bit AES-GCM IV under the
+  same key while identical `(scenarioId, ownerActorId)` payloads remain
+  deterministic across cold isolates.

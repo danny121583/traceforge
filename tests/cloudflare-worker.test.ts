@@ -1172,6 +1172,365 @@ describe('TraceForgeStateDO durable persistence across Worker restarts', () => {
   });
 });
 
+describe('OAuth 2.1 refresh tokens, rotation, revocation, and DO persistence', () => {
+  const HOOK_KEY = '__traceforgeDurableStorage';
+
+  afterEach(() => {
+    delete (globalThis as Record<string, unknown>)[HOOK_KEY];
+  });
+
+  async function issuePkcePair(
+    worker: ReturnType<typeof createTraceForgeWorker>,
+    client: RegisteredClient,
+    scope?: string,
+  ): Promise<{ accessToken: string; refreshToken: string; scope: string; expiresIn: number }> {
+    const verifier = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+    const challenge = await pkceChallenge(verifier);
+    const redirectUri = client.redirect_uris[0] as string;
+    const authorizeUrl =
+      `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent(client.client_id)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&state=st_refresh` +
+      (scope ? `&scope=${encodeURIComponent(scope)}` : '') +
+      `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`;
+    const authorized = await worker.fetch(new Request(authorizeUrl, { method: 'GET' }));
+    expect(authorized.status).toBe(302);
+    const code = new URL(authorized.headers.get('Location') ?? '').searchParams.get('code') ?? '';
+    const tokenRes = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: redirectUri,
+          code_verifier: verifier,
+        }).toString(),
+      }),
+    );
+    expect(tokenRes.status).toBe(200);
+    const body = (await readJson(tokenRes)) as {
+      access_token: string;
+      refresh_token: string;
+      token_type: string;
+      expires_in: number;
+      scope: string;
+    };
+    expect(body.token_type).toBe('Bearer');
+    expect(body.expires_in).toBe(3600);
+    expect(body.refresh_token.startsWith('tf_rt_x.')).toBe(true);
+    return {
+      accessToken: body.access_token,
+      refreshToken: body.refresh_token,
+      scope: body.scope,
+      expiresIn: body.expires_in,
+    };
+  }
+
+  it('advertises refresh_token grant and revocation_endpoint in discovery and client registration', async () => {
+    const { worker, client } = await registerClient();
+    expect(client.grant_types).toEqual(['authorization_code', 'refresh_token']);
+
+    const res = await worker.fetch(new Request(workerUrl('/.well-known/oauth-authorization-server')));
+    expect(res.status).toBe(200);
+    const meta = (await readJson(res)) as {
+      grant_types_supported: string[];
+      revocation_endpoint: string;
+    };
+    expect(meta.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
+    expect(meta.revocation_endpoint).toBe(`${ORIGIN}/oauth/revoke`);
+  });
+
+  it('issues a refresh_token on authorization_code exchange, rotates it on refresh, and rejects replay', async () => {
+    const { worker, client } = await registerClient();
+    const initial = await issuePkcePair(worker, client);
+
+    const refreshRes = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: initial.refreshToken,
+          client_id: client.client_id,
+        }).toString(),
+      }),
+    );
+    expect(refreshRes.status).toBe(200);
+    const rotated = (await readJson(refreshRes)) as {
+      access_token: string;
+      refresh_token: string;
+      token_type: string;
+      expires_in: number;
+      scope: string;
+    };
+    expect(rotated.token_type).toBe('Bearer');
+    expect(rotated.expires_in).toBe(3600);
+    expect(rotated.access_token).not.toBe(initial.accessToken);
+    expect(rotated.refresh_token).not.toBe(initial.refreshToken);
+    expect(rotated.scope).toBe(initial.scope);
+
+    // Refreshed access token works for authenticated MCP calls.
+    const statusCall = await mcpCall(
+      worker,
+      'tools/call',
+      { name: 'traceforge.system.status', arguments: {} },
+      `Bearer ${rotated.access_token}`,
+    );
+    expect((statusCall.envelope['result'] as { isError: boolean }).isError ?? false).toBe(false);
+
+    // Replaying the old (consumed) refresh token is rejected with invalid_grant.
+    const replayRes = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: initial.refreshToken,
+        }),
+      }),
+    );
+    expect(replayRes.status).toBe(400);
+    const replayErr = (await readJson(replayRes)) as { error: string };
+    expect(replayErr.error).toBe('invalid_grant');
+  });
+
+  it('rejects expired refresh tokens with invalid_grant', async () => {
+    let now = 1_700_000_000_000;
+    const worker = createTraceForgeWorker({ clock: () => now });
+    const reg = await worker.fetch(
+      new Request(workerUrl('/oauth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirect_uris: [`${ORIGIN}/callback`] }),
+      }),
+    );
+    const client = (await readJson(reg)) as RegisteredClient;
+    const initial = await issuePkcePair(worker, client);
+
+    // Advance clock past the 30-day refresh token TTL.
+    now += 31 * 24 * 3600 * 1000;
+    const expiredRes = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: initial.refreshToken,
+        }),
+      }),
+    );
+    expect(expiredRes.status).toBe(400);
+    const err = (await readJson(expiredRes)) as { error: string; error_description: string };
+    expect(err.error).toBe('invalid_grant');
+    expect(err.error_description).toContain('expired');
+  });
+
+  it('preserves or narrows scopes on refresh and rejects scope escalation with invalid_scope', async () => {
+    const { worker, client } = await registerClient();
+    const initial = await issuePkcePair(
+      worker,
+      client,
+      'traceforge:discovery:read traceforge:circuits:read traceforge:scenarios:read',
+    );
+
+    // Escalation attempt -> invalid_scope
+    const escalated = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: initial.refreshToken,
+          scope: 'traceforge:discovery:read traceforge:live_inference:execute',
+        }),
+      }),
+    );
+    expect(escalated.status).toBe(400);
+    const escErr = (await readJson(escalated)) as { error: string };
+    expect(escErr.error).toBe('invalid_scope');
+
+    // Valid narrowing -> succeeds and preserves unconsumed token until this valid exchange
+    const narrowed = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: initial.refreshToken,
+          scope: 'traceforge:discovery:read traceforge:circuits:read',
+        }),
+      }),
+    );
+    expect(narrowed.status).toBe(200);
+    const body = (await readJson(narrowed)) as { scope: string };
+    expect(body.scope).toBe('traceforge:discovery:read traceforge:circuits:read');
+  });
+
+  it('enforces client binding on refresh and supports POST /oauth/revoke across Durable Object restarts', async () => {
+    const backing = new Map<string, unknown>();
+    const storageFor = () => ({
+      get: async (key: string): Promise<unknown> => backing.get(key),
+      put: async (key: string, value: unknown): Promise<void> => {
+        backing.set(key, value);
+      },
+    });
+    let currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const env: TraceForgeWorkerEnv = {
+      TRACEFORGE_STATE_DO: {
+        idFromName: (name: string) => name,
+        get: () => ({ fetch: (req: Request) => currentDo.fetch(req) }),
+      },
+    };
+
+    const regA = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirect_uris: [`${ORIGIN}/callback`] }),
+      }),
+      env,
+    );
+    const clientA = (await readJson(regA)) as RegisteredClient;
+
+    const verifier = 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
+    const challenge = await pkceChallenge(verifier);
+    const authRes = await workerDefault.fetch(
+      new Request(`${ORIGIN}/oauth/authorize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id: clientA.client_id,
+          redirect_uri: `${ORIGIN}/callback`,
+          code_challenge: challenge,
+          code_challenge_method: 'S256',
+        }),
+      }),
+      env,
+    );
+    const { code } = (await readJson(authRes)) as { code: string };
+    const tokRes = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: `${ORIGIN}/callback`,
+          code_verifier: verifier,
+        }),
+      }),
+      env,
+    );
+    const issued = (await readJson(tokRes)) as { access_token: string; refresh_token: string };
+
+    // Simulate DO restart; wrong client_id is rejected
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const wrongClient = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: issued.refresh_token,
+          client_id: 'tf_client_other',
+        }),
+      }),
+      env,
+    );
+    expect(wrongClient.status).toBe(400);
+    expect(((await readJson(wrongClient)) as { error: string }).error).toBe('invalid_grant');
+
+    // Correct client_id succeeds after DO restart
+    const refreshedRes = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: issued.refresh_token,
+          client_id: clientA.client_id,
+        }),
+      }),
+      env,
+    );
+    expect(refreshedRes.status).toBe(200);
+    const refreshed = (await readJson(refreshedRes)) as { access_token: string; refresh_token: string };
+
+    // Replay of the first refresh token fails even after another DO restart
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const replayAfterRestart = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: issued.refresh_token,
+        }),
+      }),
+      env,
+    );
+    expect(replayAfterRestart.status).toBe(400);
+
+    // Revoke the new refresh token and access token via POST /oauth/revoke
+    const revokeRt = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/revoke'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: refreshed.refresh_token, token_type_hint: 'refresh_token' }),
+      }),
+      env,
+    );
+    expect(revokeRt.status).toBe(200);
+
+    const revokeAt = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/revoke'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: refreshed.access_token, token_type_hint: 'access_token' }),
+      }),
+      env,
+    );
+    expect(revokeAt.status).toBe(200);
+
+    // After another DO restart, both the revoked refresh token and revoked access token are rejected
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const useRevokedRt = await workerDefault.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'refresh_token',
+          refresh_token: refreshed.refresh_token,
+        }),
+      }),
+      env,
+    );
+    expect(useRevokedRt.status).toBe(400);
+
+    const useRevokedAt = await workerDefault.fetch(
+      new Request(workerUrl('/mcp'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${refreshed.access_token}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'tools/call',
+          params: { name: 'traceforge.scenarios.create', arguments: { boardId: 'f405-flight-controller' } },
+        }),
+      }),
+      env,
+    );
+    const mcpBody = (await readJson(useRevokedAt)) as {
+      result: { structuredContent: { code: string } };
+    };
+    expect(mcpBody.result.structuredContent.code).toBe('MAAS_CREDENTIALS_REVOKED');
+  });
+});
+
 describe('worker package independence', () => {
   it('contains zero Node.js built-in imports', () => {
     const source: string = workerSource;

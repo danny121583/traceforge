@@ -234,7 +234,6 @@ export function App() {
     operationalMode: string;
   } | null>(null);
 
-  const selected = board.components.find((c) => c.ref === selectedRef) ?? null;
   const pointA = board.probePoints.find((p) => p.id === probeA) ?? null;
   const pointB = board.probePoints.find((p) => p.id === probeB) ?? null;
 
@@ -295,10 +294,12 @@ export function App() {
 
   function switchFault(sel: string) {
     setFaultSel(sel);
+    setLines([]);
+    setSelectedRef(null);
     resetLabState();
   }
 
-  /** Post-run reset: re-roll a fresh hidden fault so another investigation can start immediately. */
+  /** Post-run / re-roll reset: re-roll a fresh hidden fault and clear all dependent state. */
   function tryAnotherFault() {
     setFaultSel('random');
     setRunId((n) => n + 1);
@@ -355,7 +356,7 @@ export function App() {
     setActiveProbeTarget(probeA);
     try {
       const rd = session.measureVoltage(probeA);
-      pushLine('k-rule-ok', `▸ [Virtual Measurements] ${probeA} = ${rd.formatted} (powered, vs GND)`);
+      pushLine('k-rule-ok', `▸ Virtual measurement: ${probeA} = ${rd.formatted} (powered, vs GND)`);
     } catch (err) {
       pushLine('k-rule-bad', `⏚ Probe blocked: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -369,7 +370,7 @@ export function App() {
       const rd = session.measureContinuity(probeA, probeB);
       pushLine(
         rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
-        `▸ [Virtual Measurements] ${probeA} ↔ ${probeB} = ${rd.formatted} ${rd.continuous ? '(SHORT — continuity beep)' : '(open)'}`,
+        `▸ Virtual measurement: ${probeA} ↔ ${probeB} = ${rd.formatted} ${rd.continuous ? '(SHORT — continuity beep)' : '(open)'}`,
       );
     } catch (err) {
       pushLine('k-rule-bad', `⏚ Probe blocked: ${err instanceof Error ? err.message : String(err)}`);
@@ -401,7 +402,7 @@ export function App() {
           const abnormal = Math.abs(rd.volts - spec.nominalVolts) > Math.abs(spec.nominalVolts) * spec.toleranceFrac + 1e-9;
           pushLine(
             abnormal ? 'k-rule-bad' : 'k-rule-ok',
-            `▸ [Virtual Measurements] ${spec.node} = ${rd.formatted} (nominal ${spec.nominalVolts.toFixed(3)} V) — ${abnormal ? 'ABNORMAL' : 'nominal'}`,
+            `▸ Virtual measurement: ${spec.node} = ${rd.formatted} (nominal ${spec.nominalVolts.toFixed(3)} V) — ${abnormal ? 'ABNORMAL' : 'nominal'}`,
           );
         } catch (err) {
           pushLine('k-rule-bad', `⏚ Sweep stopped: ${err instanceof Error ? err.message : String(err)}`);
@@ -418,7 +419,7 @@ export function App() {
             syncSessionState();
             pushLine(
               rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
-              `▸ [Virtual Measurements] ${abnormal.target} ↔ ${other} = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ''}`,
+              `▸ Virtual measurement: ${abnormal.target} ↔ ${other} = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ''}`,
             );
           } catch (err) {
             pushLine('k-rule-bad', `⏚ Sweep stopped: ${err instanceof Error ? err.message : String(err)}`);
@@ -451,6 +452,9 @@ export function App() {
       setRevealed(false);
       setProbeLog([]);
       setActiveProbeTarget(null);
+    }
+    if (client.mode === 'live' && proxyConfigured) {
+      setLiveModeError(null);
     }
     setRunning(true);
     setLines([]);
@@ -523,16 +527,17 @@ export function App() {
       syncSessionState();
       setTelemetry(client.getTelemetry());
       const gt = session.getGroundTruth();
+      const modeText = run.operationalMode === 'LIVE_API' ? 'Live AI' : 'Virtual Lab';
       if (gt && run.score) {
         setScore(run.score);
         setRevealed(true);
         pushLine(
           run.score.totalScore >= 70 ? 'k-dx' : 'k-rule-bad',
-          `■ AGENTIC GROUND-TRUTH EVALUATION [${run.operationalMode}]: ${run.score.totalScore}/100 — ${run.score.summary}`,
+          `■ Ground-Truth Evaluation (${modeText}): ${run.score.totalScore}/100 — ${run.score.summary}`,
         );
         pushLine(
           'k-cite',
-          `■ AGENT VERDICT: ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} (${run.proposedDiagnosis.verificationStatus}) — ${run.proposedDiagnosis.explanation}`,
+          `■ Diagnosis Verdict: ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} (${run.proposedDiagnosis.verificationStatus}) — ${run.proposedDiagnosis.explanation}`,
         );
       } else {
         pushLine('k-rule-ok', `▸ Nominal session: agent reports healthy — ${run.proposedDiagnosis.explanation}`);
@@ -546,7 +551,7 @@ export function App() {
       });
       const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
         point: p.target,
-        value: `[Virtual Measurements] ${p.detail ?? p.kind}`,
+        value: p.detail ?? p.kind,
         status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
       }));
       const evidence: ClassifiedEvidence = {
@@ -559,8 +564,8 @@ export function App() {
         hypotheses: [
           {
             claim: run.operationalMode === 'LIVE_API'
-              ? `Live Muse Spark 1.3 diagnosis (LIVE_API): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`
-              : `Virtual Investigation diagnosis (Deterministic Virtual Lab): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`,
+              ? `Live AI diagnosis (Muse Spark 1.3): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`
+              : `Virtual Lab diagnosis: ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`,
             likelihood: run.proposedDiagnosis.verificationStatus === 'confirmed' ? 'high' : 'medium',
             falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
           },
@@ -582,6 +587,9 @@ export function App() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       pushLine('k-rule-bad', `⏚ Investigation failed: ${message}`);
+      if (client.mode === 'live') {
+        setLiveModeError(message);
+      }
       setLifecycle('error');
       setLifecycleDetail(message);
       setTelemetry(client.getTelemetry());
@@ -656,11 +664,11 @@ export function App() {
         setRevealed(true);
         pushLine(
           score.totalScore >= 70 ? 'k-dx' : 'k-rule-bad',
-          `■ RECORDED LIVE REPLAY EVALUATION [RECORDED_LIVE_REPLAY]: ${score.totalScore}/100 — ${score.summary}`,
+          `■ Ground-Truth Evaluation (Recorded Investigation): ${score.totalScore}/100 — ${score.summary}`,
         );
         pushLine(
           'k-cite',
-          `■ AGENT VERDICT: ${proposed.componentRef} · ${proposed.faultType} (${proposed.verificationStatus}) — ${proposed.explanation}`,
+          `■ Diagnosis Verdict: ${proposed.componentRef} · ${proposed.faultType} (${proposed.verificationStatus}) — ${proposed.explanation}`,
         );
       } else {
         pushLine('k-rule-ok', `▸ Nominal session: recorded replay reports healthy — ${proposed.explanation}`);
@@ -674,7 +682,7 @@ export function App() {
       });
       const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
         point: p.target,
-        value: `[Virtual Measurements] ${p.detail ?? p.kind}`,
+        value: p.detail ?? p.kind,
         status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
       }));
       setDiagnosis({
@@ -687,7 +695,7 @@ export function App() {
           })),
           hypotheses: [
             {
-              claim: `Recorded Live Investigation (RECORDED_LIVE_REPLAY): ${proposed.componentRef} · ${proposed.faultType} — ${proposed.explanation}`,
+              claim: `Recorded Investigation: ${proposed.componentRef} · ${proposed.faultType} — ${proposed.explanation}`,
               likelihood: proposed.verificationStatus === 'confirmed' ? 'high' : 'medium',
               falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
             },
@@ -701,7 +709,7 @@ export function App() {
           probeMeasurements: measurements,
           hypotheses: [
             {
-              claim: `Recorded live replay: ${proposed.componentRef} · ${proposed.faultType}`,
+              claim: `Recorded Investigation: ${proposed.componentRef} · ${proposed.faultType}`,
               likelihood: proposed.verificationStatus === 'confirmed' ? 'high' : 'medium',
               falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
             },
@@ -755,27 +763,27 @@ export function App() {
     };
     attempt('VBUS_5V', () => {
       const rd = session.measureVoltage('VBUS_5V');
-      return `▸ [Virtual Measurements] VBUS_5V = ${rd.formatted} (powered, vs GND)`;
+      return `▸ Virtual measurement: VBUS_5V = ${rd.formatted} (powered, vs GND)`;
     }, () => {
       const node = fallbackRails[0] ?? 'U1-14';
       const rd = session.measureVoltage(node);
-      return `▸ [Virtual Measurements] ${node} = ${rd.formatted} (powered, vs GND)`;
+      return `▸ Virtual measurement: ${node} = ${rd.formatted} (powered, vs GND)`;
     });
     attempt('V3V3', () => {
       const rd = session.measureVoltage('V3V3');
-      return `▸ [Virtual Measurements] V3V3 = ${rd.formatted} (powered, vs GND)`;
+      return `▸ Virtual measurement: V3V3 = ${rd.formatted} (powered, vs GND)`;
     }, () => {
       const node = fallbackRails[1] ?? fallbackRails[0] ?? 'U1-15';
       const rd = session.measureVoltage(node);
-      return `▸ [Virtual Measurements] ${node} = ${rd.formatted} (powered, vs GND)`;
+      return `▸ Virtual measurement: ${node} = ${rd.formatted} (powered, vs GND)`;
     });
     attempt('NRST↔GND', () => {
       const rd = session.measureContinuity('NRST', 'GND');
-      return `▸ [Virtual Measurements] NRST ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
+      return `▸ Virtual measurement: NRST ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
     }, () => {
       const node = fallbackRails[1] ?? fallbackRails[0] ?? 'U1-15';
       const rd = session.measureContinuity(node, 'GND');
-      return `▸ [Virtual Measurements] ${node} ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
+      return `▸ Virtual measurement: ${node} ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
     });
     syncSessionState();
     setActiveProbeTarget('NRST↔GND');
@@ -807,11 +815,11 @@ export function App() {
     });
     pushLine(
       result.totalScore >= 70 ? 'k-dx' : 'k-rule-bad',
-      `■ GROUND-TRUTH EVALUATION: ${result.totalScore}/100 — ${result.summary}`,
+      `■ Ground-Truth Evaluation: ${result.totalScore}/100 — ${result.summary}`,
     );
     const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
       point: p.target,
-      value: `[Virtual Measurements] ${p.detail ?? p.kind}`,
+      value: p.detail ?? p.kind,
       status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
     }));
     const evidence: ClassifiedEvidence = {
@@ -820,7 +828,7 @@ export function App() {
       datasheetSpecs: board.datasheet.map((d) => ({ section: d.title, spec: d.title })),
       hypotheses: [
         {
-          claim: `Model-generated hypothesis: ${submission.componentRef} · ${submission.faultType}.`,
+          claim: `Candidate fault hypothesis: ${submission.componentRef} · ${submission.faultType}.`,
           likelihood: result.evidenceConfirmed ? 'high' : 'medium',
           falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
         },
@@ -980,7 +988,7 @@ export function App() {
   const activeStep = getActiveStep({ running, complete, hasActivity });
   const primaryAction = primaryWorkflowAction({ running, complete });
   const sparkStatus = client.status();
-  const modeBadge = aiModeBadge(sparkStatus.sparkMode, { proxyConfigured, liveModeError });
+  const modeBadge = aiModeBadge(sparkStatus.sparkMode, { proxyConfigured, liveModeError, running });
   const lifecycleChipClass =
     lifecycle === 'completed' ? 'tf-chip live' : lifecycle === 'error' ? 'tf-chip unavailable' : 'tf-chip sim';
   // Zero-cost replay transparency: the recorded-live chip replaces the live
@@ -988,6 +996,7 @@ export function App() {
   const replayBadge = agentVerdict?.operationalMode === 'RECORDED_LIVE_REPLAY'
     ? aiModeBadge('RECORDED_LIVE_REPLAY')
     : null;
+  const activeModeBadge = replayBadge ?? modeBadge;
   const activitySummary = formatActivitySummary(probeLog);
   // Real measurement → PCB highlight mapping (pulse ring, readout callouts,
   // continuity vector). Empty probe log + idle target yields zero highlights.
@@ -1011,7 +1020,7 @@ export function App() {
 
   return (
     <div className="tf-app">
-      <Header client={client} onToggleMode={handleToggleMode} />
+      <Header client={client} onToggleMode={handleToggleMode} badge={activeModeBadge} />
       <ol className="tf-steps" aria-label="Guided diagnostic steps">
         {GUIDE_STEPS.map((s) => (
           <li
@@ -1028,7 +1037,7 @@ export function App() {
         ))}
       </ol>
       <div className="tf-main">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+        <div className="tf-left">
           <section className="tf-card tf-step" aria-label="Step 1: Choose circuit">
             <h3>STEP 1 · CHOOSE CIRCUIT</h3>
             <div className="tf-board-cards">
@@ -1046,25 +1055,25 @@ export function App() {
                 </button>
               ))}
             </div>
+            <label className="sr-only" style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+              Select circuit:{' '}
+              <select aria-label="Select circuit" className="sr-only" value={boardId} onChange={(e) => switchBoard(e.target.value)} disabled={running}>
+                {SAMPLE_BOARDS.map((b) => (
+                  <option key={b.id} value={b.id}>{b.name}</option>
+                ))}
+              </select>
+            </label>
             <div className="tf-row tf-fault-row">
-              <label className="sr-only" style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
-                Select circuit:{' '}
-                <select aria-label="Select circuit" className="sr-only" value={boardId} onChange={(e) => switchBoard(e.target.value)} disabled={running}>
-                  {SAMPLE_BOARDS.map((b) => (
-                    <option key={b.id} value={b.id}>{b.name}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="tf-fault-label">
-                Fault scenario:{' '}
-                <select value={faultSel} onChange={(e) => switchFault(e.target.value)} disabled={running}>
+              <label className="tf-fault-label" htmlFor="tf-fault-select">
+                <span>Fault scenario:</span>
+                <select id="tf-fault-select" value={faultSel} onChange={(e) => switchFault(e.target.value)} disabled={running}>
                   {faultOptions.map((o) => (
                     <option key={o.value} value={o.value}>{o.label}</option>
                   ))}
                 </select>
               </label>
               {faultSel === 'random' && (
-                <button onClick={() => { setRunId((n) => n + 1); resetLabState(); }} disabled={running}>
+                <button className="tf-reroll-btn" onClick={tryAnotherFault} disabled={running}>
                   Re-roll random fault
                 </button>
               )}
@@ -1098,206 +1107,7 @@ export function App() {
             onSelectComponent={setSelectedRef}
             onProbePoint={handleProbePoint}
           />
-          <div className="tf-pane">
-            <div className="tf-comp-info">
-              {selected ? (
-                <>
-                  <h4>{selected.ref} · {selected.partNumber} ({selected.kind})</h4>
-                  {selected.pins && (
-                    <table>
-                      <tbody>
-                        {selected.pins.map((p) => (
-                          <tr key={p.number}>
-                            <td>Pin {p.number} · {p.name}</td>
-                            <td>{p.function}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                  {selected.notes && <div style={{ marginTop: 6 }}>{selected.notes}</div>}
-                </>
-              ) : (
-                <span style={{ color: 'var(--ink-dim)' }}>Click a component overlay to inspect part number + pinout.</span>
-              )}
-            </div>
-          </div>
-        </div>
-
-        <div className="tf-right">
-          <section className="tf-card tf-step" aria-label="Step 2: Investigate">
-            <div className="tf-investigate-head">
-              <h3>STEP 2 · INVESTIGATE</h3>
-              <span className={(replayBadge ?? modeBadge).className}>{(replayBadge ?? modeBadge).label}</span>
-            </div>
-            {mode === 'live' && liveModeError && (
-              <div className="tf-chip unavailable" role="alert" style={{ marginBottom: 8 }}>
-                Live AI unavailable: {liveModeError}
-              </div>
-            )}
-            {(running || hasActivity) && (
-              <div className={lifecycleChipClass} role="status" style={{ marginBottom: 8 }}>
-                {formatLifecycleStatus(lifecycle, lifecycleDetail)}
-              </div>
-            )}
-            {(primaryAction || !running) && (
-              <div className="tf-row tf-investigate-actions">
-                {primaryAction && (
-                  <button className="primary" onClick={runAgentInvestigation} disabled={primaryAction.disabled || running}>
-                    {primaryAction.label}
-                  </button>
-                )}
-                {!running && (
-                  <button onClick={() => void replayVerifiedLiveRun()}>
-                    Replay Recorded Investigation (Zero Cost)
-                  </button>
-                )}
-              </div>
-            )}
-            {primaryAction && (
-              <label className="tf-demo-pacing">
-                <input
-                  type="checkbox"
-                  checked={demoPacing}
-                  onChange={(e) => setDemoPacing(e.target.checked)}
-                  disabled={running}
-                />{' '}
-                Video Demo Pacing (animate each probe)
-              </label>
-            )}
-            {!complete && !hasActivity && !running && (
-              <ol className="tf-checklist">
-                <li>AI inspects the circuit layout and reported symptom</li>
-                <li>AI selects test points and virtual multimeter measures voltages &amp; continuity</li>
-                <li>AI updates its hypothesis and identifies the likely fault</li>
-              </ol>
-            )}
-            {(running || hasActivity) && (
-              <>
-                {activitySummary.length > 0 && (
-                  <>
-                    <h4>Activity Summary</h4>
-                    <ul className="tf-ev-list">
-                      {activitySummary.map((s, i) => (
-                        <li key={i}>{s}</li>
-                      ))}
-                    </ul>
-                  </>
-                )}
-                <h4>Investigation Activity</h4>
-                <div className="tf-stream">
-                  {lines.length === 0 && <span className="k-reasoning">Probing the virtual bench — measurements will stream here.</span>}
-                  {lines.filter((l) => l.text.trim()).map((l, i) => (
-                    <div key={i} className={l.cls}>{l.text.replace('__stream__', '')}</div>
-                  ))}
-                </div>
-                {probeLog.length > 0 && (
-                  <>
-                    <h4>Measurement History Timeline</h4>
-                    <table className="tf-measure-table" aria-label="Measurement history timeline">
-                      <thead>
-                        <tr>
-                          <th>#</th>
-                          <th>Test Point / Node</th>
-                          <th>Type</th>
-                          <th>Computed Value</th>
-                          <th>Status</th>
-                          <th>Source</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {probeLog.map((p, i) => {
-                          const isElectrical = p.kind === 'voltage' || p.kind === 'resistance' || p.kind === 'current';
-                          return (
-                            <tr key={i}>
-                              <td className="mute">{i + 1}</td>
-                              <td>{p.target}</td>
-                              <td className="mute">{p.kind}</td>
-                              <td>{p.detail ?? '—'}</td>
-                              <td className={p.abnormal ? 'bad' : 'ok'}>
-                                {isElectrical ? (p.abnormal ? 'Abnormal' : 'Nominal') : '—'}
-                              </td>
-                              <td className="mute">{isElectrical ? 'Virtual Measurements' : 'Context'}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  </>
-                )}
-              </>
-            )}
-            {complete && (
-              <p className="tf-note">Investigation finished — see Step 3 for the diagnosis and ground-truth comparison.</p>
-            )}
-          </section>
-          <section className="tf-card tf-step" aria-label="Step 3: Review results">
-            <h3>STEP 3 · REVIEW RESULTS</h3>
-            {!complete ? (
-              <p className="tf-note">{reworkNote}</p>
-            ) : (
-              <>
-                <h4>Investigation Results</h4>
-                {truth && agentVerdict ? (
-                  <div>
-                    <p>
-                      <strong>Identified Fault:</strong> {agentVerdict.componentRef} · {agentVerdict.faultType}{' '}
-                      {replayBadge && (
-                        <span className={replayBadge.className}>{replayBadge.label}</span>
-                      )}{' '}
-                      <span className={agentVerdict.verificationStatus === 'confirmed' ? 'tf-chip live' : 'tf-chip unverified'}>
-                        {agentVerdict.verificationStatus === 'confirmed'
-                          ? 'Confirmed by Electrical Measurement'
-                          : 'Unverified Hypothesis — Not Confirmed'}
-                      </span>
-                    </p>
-                    <p className="tf-note">{agentVerdict.explanation}</p>
-                  </div>
-                ) : (
-                  <p className="tf-note">No fault identified — the board was reported healthy.</p>
-                )}
-                <h4>Ground-Truth Verification</h4>
-                {truth ? (
-                  revealed ? (
-                    <div>
-                      <p>
-                        Hidden fault was <strong>{truth.faultId}</strong> · {truth.faultType} @ {truth.targetComponentRef} — {truth.description}
-                      </p>
-                      <p>
-                        <span className={scoreMatch ? 'tf-chip live' : 'tf-chip unverified'}>
-                          {scoreMatch ? 'Diagnosis Correct — Matched Hidden Fault' : 'Diagnosis Mismatch'}
-                        </span>
-                      </p>
-                      {score && (
-                        <p className="tf-note">
-                          Objective score: {score.totalScore}/100 · component {score.componentMatch ? 'MATCH' : 'MISS'} ·{' '}
-                          fault-type {score.faultTypeMatch ? 'MATCH' : 'MISS'} · evidence{' '}
-                          {score.evidenceConfirmed ? 'CONFIRMED' : 'NOT confirmed'} · probes {score.probeCount} ·{' '}
-                          efficiency {score.efficiencyScore} · {score.summary}
-                        </p>
-                      )}
-                    </div>
-                  ) : (
-                    <p className="tf-note">Withheld Ground Truth 🔒 — fault injected, identity hidden during probing.</p>
-                  )
-                ) : (
-                  <p className="tf-note">Nominal session — no fault was injected (healthy board).</p>
-                )}
-                <h4>Investigation Summary</h4>
-                <p className="tf-note">
-                  Probes used: <strong>{probeLog.length}/{MAX_TOOL_CALLS}</strong> · Mode:{' '}
-                  <span className={(replayBadge ?? modeBadge).className}>{(replayBadge ?? modeBadge).label}</span>
-                </p>
-                <div className="tf-row">
-                  <button className="primary" onClick={tryAnotherFault} disabled={running}>
-                    Try another fault
-                  </button>
-                </div>
-              </>
-            )}
-          </section>
-
-          <details className="tf-card tf-advanced-tools">
+          <details className="tf-card tf-advanced-tools" open>
             <summary>Advanced Tools &amp; Manual Bench Controls</summary>
             <h4>Manual Multimeter Probing</h4>
             <div className="tf-meter-inner">
@@ -1310,14 +1120,14 @@ export function App() {
               <div style={{ marginTop: 8 }}>
                 A: {pointA ? `${pointA.label} = ${meterVoltsA ?? '—'}` : '—'} · B:{' '}
                 {pointB ? `${pointB.label}` : '—'}
-                <span style={{ color: 'var(--ink-dim)' }}> · Virtual Measurements</span>
+                <span style={{ color: 'var(--ink-dim)' }}> · Virtual Multimeter</span>
               </div>
               {meterContinuity && (
                 <div className={`reading ${meterContinuity.fault ? 'fault' : ''}`} style={{ marginTop: 4 }}>
                   {meterContinuity.text}
                 </div>
               )}
-              <div style={{ marginTop: 8, display: 'flex', gap: 8 }}>
+              <div style={{ marginTop: 8, display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 <button onClick={logVoltageProbe} disabled={!probeA || running}>Log voltage probe (A vs GND)</button>
                 <button onClick={logContinuityProbe} disabled={!probeA || !probeB || running}>Log continuity (A↔B)</button>
               </div>
@@ -1387,6 +1197,219 @@ export function App() {
               <button onClick={() => setLines([])} disabled={running}>Clear stream</button>
             </div>
           </details>
+        </div>
+
+        <div className="tf-right">
+          <section className="tf-card tf-step" aria-label="Step 2: Investigate">
+            <div className="tf-investigate-head">
+              <h3>STEP 2 · INVESTIGATE</h3>
+              <span className={activeModeBadge.className}>{activeModeBadge.label}</span>
+            </div>
+            {mode === 'live' && liveModeError && (
+              <div className="tf-chip unavailable" role="alert" style={{ marginBottom: 8 }}>
+                Live AI unavailable: {liveModeError}
+              </div>
+            )}
+            {(running || hasActivity) && (
+              <div className={lifecycleChipClass} role="status" style={{ marginBottom: 8 }}>
+                {formatLifecycleStatus(lifecycle, lifecycleDetail)}
+              </div>
+            )}
+            {(primaryAction || !running) && (
+              <div className="tf-row tf-investigate-actions">
+                {primaryAction && (
+                  <button className="primary" onClick={runAgentInvestigation} disabled={primaryAction.disabled || running}>
+                    {primaryAction.label}
+                  </button>
+                )}
+                {!running && (
+                  <button onClick={() => void replayVerifiedLiveRun()}>
+                    Replay Recorded Investigation (Zero Cost)
+                  </button>
+                )}
+              </div>
+            )}
+            {primaryAction && (
+              <label className="tf-demo-pacing">
+                <input
+                  type="checkbox"
+                  checked={demoPacing}
+                  onChange={(e) => setDemoPacing(e.target.checked)}
+                  disabled={running}
+                />{' '}
+                Animate Investigation
+              </label>
+            )}
+            {!complete && !hasActivity && !running && (
+              <ol className="tf-checklist">
+                <li>AI inspects the circuit layout and reported symptom</li>
+                <li>AI selects test points and virtual multimeter measures voltages &amp; continuity</li>
+                <li>AI updates its hypothesis and identifies the likely fault</li>
+              </ol>
+            )}
+            {(running || hasActivity) && (
+              <details className="tf-activity-drawer" open={!complete}>
+                <summary>
+                  Investigation Activity &amp; Probe Log ({probeLog.length} {probeLog.length === 1 ? 'probe' : 'probes'})
+                </summary>
+                {activitySummary.length > 0 && (
+                  <>
+                    <h4>Activity Summary</h4>
+                    <ul className="tf-ev-list">
+                      {activitySummary.map((s, i) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                <h4>Investigation Activity</h4>
+                <div className="tf-stream">
+                  {lines.length === 0 && <span className="k-reasoning">Probing the virtual bench — measurements will stream here.</span>}
+                  {lines.filter((l) => l.text.trim()).map((l, i) => (
+                    <div key={i} className={l.cls}>{l.text.replace('__stream__', '')}</div>
+                  ))}
+                </div>
+                {probeLog.length > 0 && (
+                  <>
+                    <h4>Measurement History Timeline</h4>
+                    <table className="tf-measure-table" aria-label="Measurement history timeline">
+                      <thead>
+                        <tr>
+                          <th>#</th>
+                          <th>Test Point / Node</th>
+                          <th>Type</th>
+                          <th>Computed Value</th>
+                          <th>Status</th>
+                          <th>Source</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {probeLog.map((p, i) => {
+                          const isElectrical = p.kind === 'voltage' || p.kind === 'resistance' || p.kind === 'current';
+                          return (
+                            <tr key={i}>
+                              <td className="mute">{i + 1}</td>
+                              <td>{p.target}</td>
+                              <td className="mute">{p.kind}</td>
+                              <td>{p.detail ?? '—'}</td>
+                              <td className={p.abnormal ? 'bad' : 'ok'}>
+                                {isElectrical ? (p.abnormal ? 'Abnormal' : 'Nominal') : '—'}
+                              </td>
+                              <td className="mute">{isElectrical ? 'Virtual measurement' : 'Context'}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </>
+                )}
+              </details>
+            )}
+          </section>
+
+          <section className="tf-card tf-step tf-results-card" aria-label="Step 3: Review results">
+            <h3>STEP 3 · REVIEW RESULTS</h3>
+            {!complete ? (
+              <p className="tf-note">{reworkNote}</p>
+            ) : (
+              <>
+                <h4>1. Diagnosis Summary</h4>
+                {truth && agentVerdict ? (
+                  <div className="tf-result-summary">
+                    <div className="tf-result-verdict-line">
+                      <strong>Identified Fault:</strong>{' '}
+                      <span className="tf-result-target">{agentVerdict.componentRef} · {agentVerdict.faultType}</span>
+                    </div>
+                    <p className="tf-note">{agentVerdict.explanation}</p>
+                  </div>
+                ) : (
+                  <p className="tf-note">No fault identified — the board was reported healthy.</p>
+                )}
+
+                <h4>2. Fault Classification &amp; Verification Status</h4>
+                <div className="tf-result-badges">
+                  <span className={(agentVerdict?.verificationStatus ?? verificationStatus) === 'confirmed' ? 'tf-chip live' : 'tf-chip unverified'}>
+                    {(agentVerdict?.verificationStatus ?? verificationStatus) === 'confirmed'
+                      ? 'Confirmed by Electrical Measurement'
+                      : 'Unverified Hypothesis — Not Confirmed'}
+                  </span>
+                  <span className={activeModeBadge.className}>{activeModeBadge.label}</span>
+                  <span className="tf-chip">
+                    Probes used: <strong>{probeLog.length}/{MAX_TOOL_CALLS}</strong>
+                  </span>
+                </div>
+
+                {probeLog.length > 0 && (
+                  <>
+                    <h4>3. Supporting Measurements</h4>
+                    <ul className="tf-ev-list tf-supporting-measurements">
+                      {probeLog.map((p, i) => {
+                        const isElectrical = p.kind === 'voltage' || p.kind === 'resistance' || p.kind === 'current';
+                        return (
+                          <li key={i}>
+                            <span className={p.abnormal ? 'tf-ev-chip warn' : 'tf-ev-chip ok'}>
+                              {isElectrical ? (p.abnormal ? 'abnormal' : 'nominal') : p.kind}
+                            </span>{' '}
+                            <strong>{p.target}</strong> · {p.detail ?? p.kind}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </>
+                )}
+
+                <h4>4. Ground-Truth Evaluation &amp; Score</h4>
+                {truth ? (
+                  revealed ? (
+                    <div className="tf-gt-box">
+                      <p style={{ margin: '0 0 6px' }}>
+                        <span className={scoreMatch ? 'tf-chip live' : 'tf-chip unverified'}>
+                          {scoreMatch ? 'Diagnosis Correct — Matched Hidden Fault' : 'Diagnosis Mismatch'}
+                        </span>
+                        {score && (
+                          <span className="tf-chip" style={{ marginLeft: 6 }}>
+                            Score: <strong>{score.totalScore}/100</strong>
+                          </span>
+                        )}
+                      </p>
+                      <p style={{ margin: '0 0 4px' }}>
+                        Hidden fault was <strong>{truth.faultId}</strong> · {truth.faultType} @ <strong>{truth.targetComponentRef}</strong> — {truth.description}
+                      </p>
+                      {score && (
+                        <p className="tf-note" style={{ margin: 0 }}>
+                          Component {score.componentMatch ? 'MATCH' : 'MISS'} ·{' '}
+                          fault-type {score.faultTypeMatch ? 'MATCH' : 'MISS'} · evidence{' '}
+                          {score.evidenceConfirmed ? 'CONFIRMED' : 'NOT confirmed'} · probes {score.probeCount} ·{' '}
+                          efficiency {score.efficiencyScore} · {score.summary}
+                        </p>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="tf-note">Withheld Ground Truth 🔒 — fault injected, identity hidden during probing.</p>
+                  )
+                ) : (
+                  <p className="tf-note">Nominal session — no fault was injected (healthy board).</p>
+                )}
+
+                {diagnosis && diagnosis.evidence.nextVerificationSteps.length > 0 && (
+                  <>
+                    <h4>5. Recommended Next Steps</h4>
+                    <ol className="tf-ev-list">
+                      {diagnosis.evidence.nextVerificationSteps.map((s, i) => (
+                        <li key={i}>{s}</li>
+                      ))}
+                    </ol>
+                  </>
+                )}
+
+                <div className="tf-row" style={{ marginTop: 10 }}>
+                  <button className="primary" onClick={tryAnotherFault} disabled={running}>
+                    Try another fault
+                  </button>
+                </div>
+              </>
+            )}
+          </section>
 
           {complete && diagnosis && (
             <DiagnosticPanel boardName={board.name} evidence={diagnosis.evidence} verification={diagnosis.verification} />
@@ -1394,21 +1417,31 @@ export function App() {
 
           {showRework ? (
             <div className="tf-card tf-rework">
-              <h3>REWORK GUIDANCE CARD</h3>
+              <div className="tf-rework-head">
+                <h3>REWORK GUIDANCE · {board.name.toUpperCase()}</h3>
+                <span className="tf-chip live">Confirmed Fault — Rework Authorized</span>
+              </div>
+              <h4>Required Tools &amp; Station Settings</h4>
               <div className="temp">{board.rework.ironTempC} °C · {board.rework.tip}</div>
+              {board.rework.replacementPart && (
+                <p style={{ margin: '6px 0' }}>
+                  <strong>Replacement Component:</strong> {board.rework.replacementPart}
+                </p>
+              )}
+              <h4>Rework Procedure</h4>
               <ol>
                 {board.rework.steps.map((s, i) => <li key={i}>{s}</li>)}
               </ol>
-              {board.rework.replacementPart && <p><strong>Replacement:</strong> {board.rework.replacementPart}</p>}
-              <p><strong>Safety:</strong> {board.rework.safetyChecks.join(' · ')}</p>
-              <p style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--ink-dim)' }}>
-                Actual measurements · Datasheet specifications · Model-generated hypotheses · Verified faults · Recommended tests · Ground-truth evaluation results are kept distinct in the panels above.
+              <h4>Safety &amp; Verification Checks</h4>
+              <p><strong>Bench Safety:</strong> {board.rework.safetyChecks.join(' · ')}</p>
+              <p className="tf-rework-qualification">
+                Qualification note: Virtual multimeter readings confirm the fault in the simulated circuit model. For physical hardware, verify power-off rail discharge and confirm measurements on the physical bench before soldering.
               </p>
             </div>
           ) : (
             complete && (
               <div className="tf-card tf-rework">
-                <h3>REWORK GUIDANCE CARD</h3>
+                <h3>REWORK GUIDANCE · {board.name.toUpperCase()}</h3>
                 <p className="tf-note">{reworkNote}</p>
               </div>
             )

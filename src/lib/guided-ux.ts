@@ -87,26 +87,50 @@ export function formatActivitySummary(probeLog: ProbeRecord[]): string[] {
   });
 }
 
+/** Options for computing the unified header + Step 2 AI operational status badge. */
+export interface AiModeBadgeOptions {
+  proxyConfigured?: boolean;
+  liveModeError?: string | null;
+  running?: boolean;
+}
+
 /**
- * Single truthful header badge for the AI operational mode.
+ * Single truthful status badge for the AI operational mode, shared by both
+ * the workbench header and Step 2 so they always agree:
  *
- * `RECORDED_LIVE_REPLAY` marks a zero-cost replay of a previously verified
- * live run (never a fresh live call, so never `LIVE_API`).
+ * - Virtual Lab selected: `Virtual Lab` (or `Recorded Investigation` after replay)
+ * - Live AI selected, before starting a live investigation: `Live AI Ready`
+ * - Live AI selected, while an investigation is running: `Live AI Investigating`
+ * - Live AI selected, after a real model response is verified: `Completed with Muse Spark 1.3`
+ * - Live AI selected, on failure or missing proxy/key: `Live AI Unavailable`
  */
 export function aiModeBadge(
   sparkMode: OperationalMode | 'RECORDED_LIVE_REPLAY',
-  options?: { proxyConfigured?: boolean; liveModeError?: string | null },
+  options?: AiModeBadgeOptions,
 ): {
   label: string;
   className: string;
 } {
-  if (options?.liveModeError) return { label: 'AI Service Unavailable', className: 'tf-chip unavailable' };
-  if (sparkMode === 'RECORDED_LIVE_REPLAY') return { label: 'Recorded Investigation', className: 'tf-chip sim' };
-  if (sparkMode === 'LIVE_API') return { label: 'Live AI', className: 'tf-chip live' };
-  if (sparkMode === 'UNVERIFIED' && options?.proxyConfigured) return { label: 'Live AI (Ready)', className: 'tf-chip live' };
-  if (sparkMode === 'UNVERIFIED') return { label: 'Live AI (Unverified)', className: 'tf-chip unverified' };
-  if (sparkMode === 'UNAVAILABLE') return { label: 'AI Service Unavailable', className: 'tf-chip unavailable' };
-  return { label: 'Virtual Lab', className: 'tf-chip sim' };
+  if (
+    options?.liveModeError
+    || sparkMode === 'UNAVAILABLE'
+    || (sparkMode === 'UNVERIFIED' && options?.proxyConfigured === false)
+  ) {
+    return { label: 'Live AI Unavailable', className: 'tf-chip unavailable' };
+  }
+  if (sparkMode === 'RECORDED_LIVE_REPLAY') {
+    return { label: 'Recorded Investigation', className: 'tf-chip sim' };
+  }
+  if (sparkMode === 'SIMULATED' || sparkMode === 'STATIC_FIXTURE') {
+    return { label: 'Virtual Lab', className: 'tf-chip sim' };
+  }
+  if (options?.running) {
+    return { label: 'Live AI Investigating', className: 'tf-chip live' };
+  }
+  if (sparkMode === 'LIVE_API') {
+    return { label: 'Completed with Muse Spark 1.3', className: 'tf-chip live' };
+  }
+  return { label: 'Live AI Ready', className: 'tf-chip live' };
 }
 
 /**

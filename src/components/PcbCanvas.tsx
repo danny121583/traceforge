@@ -70,13 +70,14 @@ export function PcbCanvas({
   const vx = BASE_VIEW.x + (BASE_VIEW.w - viewW) / 2 + pan.x;
   const vy = BASE_VIEW.y + (BASE_VIEW.h - viewH) / 2 + pan.y;
   const activeSet = new Set(activePointIds);
+  const selectedComp = board.components.find((c) => c.ref === selectedRef) ?? null;
 
   return (
     <div className="tf-pane">
       <div className="tf-pane-head">
         <span>{board.name} — Interactive Circuit Layout</span>
-        <span className="tf-chip" title="Segmentation source: fixture masks are not live model output">
-          {segmentationMode === 'live_api' ? 'Live SAM 3.1' : 'Static Fixture (KiCad)'}
+        <span className="tf-chip" title="Reference board layout and component overlays">
+          {segmentationMode === 'live_api' ? 'Live SAM 3.1' : 'Circuit Reference Layout'}
         </span>
         <span className="tf-canvas-tools">
           <button onClick={() => setZoom((z) => Math.min(4, +(z + 0.5).toFixed(2)))}>Zoom +</button>
@@ -162,7 +163,18 @@ export function PcbCanvas({
             return (
               <g
                 key={c.ref}
+                role="button"
+                tabIndex={0}
+                aria-label={`Inspect component ${c.ref} (${c.partNumber})`}
+                aria-pressed={selected}
                 onClick={(e) => { e.stopPropagation(); onSelectComponent(c.ref); }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onSelectComponent(c.ref);
+                  }
+                }}
                 style={{ cursor: 'pointer' }}
               >
                 <polygon
@@ -261,6 +273,33 @@ export function PcbCanvas({
             </button>
           );
         })}
+      </div>
+      <div className="tf-comp-info" aria-label="Component inspection">
+        {selectedComp ? (
+          <>
+            <div className="tf-comp-head">
+              <h4>{selectedComp.ref} · {selectedComp.partNumber} ({selectedComp.kind})</h4>
+              <button className="tf-comp-clear" onClick={() => onSelectComponent(null)}>
+                Clear
+              </button>
+            </div>
+            {selectedComp.pins && selectedComp.pins.length > 0 && (
+              <table>
+                <tbody>
+                  {selectedComp.pins.map((p) => (
+                    <tr key={p.number}>
+                      <td>Pin {p.number} · {p.name}</td>
+                      <td>{p.function}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            {selectedComp.notes && <div className="tf-comp-notes">{selectedComp.notes}</div>}
+          </>
+        ) : (
+          <span className="tf-comp-hint">Click a component overlay to inspect part number + pinout.</span>
+        )}
       </div>
     </div>
   );

@@ -8,10 +8,20 @@ import { aiModeBadge } from '../lib/guided-ux';
  * in the "Technology, Telemetry & Budget Details" drawer at the page bottom.
  */
 export function Header(
-  { client, onToggleMode, telemetry }: { client: MetaClient; onToggleMode: () => void; telemetry?: UsageTelemetry },
+  {
+    client,
+    onToggleMode,
+    telemetry,
+    badge: overrideBadge,
+  }: {
+    client: MetaClient;
+    onToggleMode: () => void;
+    telemetry?: UsageTelemetry;
+    badge?: { label: string; className: string };
+  },
 ) {
   const s = client.status();
-  const badge = aiModeBadge(s.sparkMode);
+  const badge = overrideBadge ?? aiModeBadge(s.sparkMode, { proxyConfigured: s.proxyConfigured });
   void telemetry;
   return (
     <header className="tf-header">
@@ -24,7 +34,7 @@ export function Header(
         <span className={badge.className}>
           <strong>{badge.label}</strong>
         </span>
-        <button onClick={onToggleMode} title="Toggle live / simulated mode">
+        <button onClick={onToggleMode} title="Toggle live / virtual lab mode">
           {s.mode === 'live' ? 'Use Virtual Lab' : 'Use Live AI'}
         </button>
       </div>
