@@ -1021,7 +1021,7 @@ export class VirtualLabSession {
   private readonly hiddenFault: HiddenFault | null;
   private readonly faultedCircuit: Circuit;
   private readonly solution: DcSolution;
-  private readonly probeLog: ProbeRecord[] = [];
+  private probeLog: ProbeRecord[] = [];
   private toolCallsUsed = 0;
 
   constructor(boardId: string, fault: HiddenFault | null, options?: VirtualSessionOptions) {
@@ -1065,14 +1065,32 @@ export class VirtualLabSession {
     return this.toolCallsUsed;
   }
 
+  /**
+   * Cross-isolate state restoration: replace the probe log with a defensive
+   * copy of committed `records` (e.g. hydrated from Edge Cache) and restore
+   * the tool-call counter. `toolCallsUsed` never moves backwards past the
+   * restored log length.
+   */
+  restoreProbeLog(records: readonly ProbeRecord[], toolCallsUsed?: number): void {
+    this.probeLog = records.map((r) => ({ ...r }));
+    this.toolCallsUsed = typeof toolCallsUsed === 'number'
+      ? Math.max(records.length, toolCallsUsed)
+      : records.length;
+  }
+
   resolveProbeNode(padOrNode: string): string {
     const alias = this.reference.probeAliases[padOrNode];
     return alias ?? padOrNode;
   }
 
-  private chargeToolCall(): void {
-    this.toolCallsUsed += 1;
-    if (this.toolCallsUsed > this.maxToolCalls) {
+  /**
+   * Budget pre-check: throws `Tool budget exhausted` when no calls remain.
+   * The counter itself is incremented only AFTER a measurement succeeds, so
+   * failed probes (unknown node/component, self-continuity, singular bench)
+   * never consume budget.
+   */
+  private assertBudgetRemaining(): void {
+    if (this.toolCallsUsed >= this.maxToolCalls) {
       throw new CircuitSolverError(
         `Tool budget exhausted (${this.maxToolCalls} calls). Stop probing and commit to a diagnosis.`,
       );
@@ -1085,13 +1103,14 @@ export class VirtualLabSession {
 
   /** Powered DC voltage at a probe pad (or node) vs ground; logs the probe. */
   measureVoltage(padOrNode: string, refNode: string = GROUND_NODE): NodeVoltageReading {
-    this.chargeToolCall();
+    this.assertBudgetRemaining();
     const node = this.resolveProbeNode(padOrNode);
     const reading = measureNodeVoltage(this.solution, node, refNode);
     const spec = this.nominalSpecFor(node);
     const abnormal =
       spec !== undefined &&
       Math.abs(reading.volts - spec.nominalVolts) > Math.abs(spec.nominalVolts) * spec.toleranceFrac + 1e-9;
+    this.toolCallsUsed += 1;
     this.probeLog.push({
       kind: 'voltage',
       target: padOrNode,
@@ -1103,12 +1122,13 @@ export class VirtualLabSession {
 
   /** Unpowered ohmmeter/continuity between two pads; logs the probe. */
   measureContinuity(padA: string, padB: string): EffectiveResistanceReading {
-    this.chargeToolCall();
+    this.assertBudgetRemaining();
     const nodeA = this.resolveProbeNode(padA);
     const nodeB = this.resolveProbeNode(padB);
     const reading = measureEffectiveResistance(this.faultedCircuit, nodeA, nodeB, undefined, {
       supplyMode: this.supplyMode,
     });
+    this.toolCallsUsed += 1;
     this.probeLog.push({
       kind: 'resistance',
       target: `${padA}↔${padB}`,
@@ -1120,15 +1140,17 @@ export class VirtualLabSession {
 
   /** Branch current through a component; logs the probe (never abnormal by itself). */
   measureCurrent(componentId: string): BranchCurrentReading {
-    this.chargeToolCall();
+    this.assertBudgetRemaining();
     const reading = measureBranchCurrent(this.solution, componentId);
+    this.toolCallsUsed += 1;
     this.probeLog.push({ kind: 'current', target: componentId, abnormal: false, detail: reading.formatted });
     return reading;
   }
 
   /** Record a datasheet/pinout lookup (context, not electrical evidence). */
   recordLookup(target: string, detail?: string): void {
-    this.chargeToolCall();
+    this.assertBudgetRemaining();
+    this.toolCallsUsed += 1;
     this.probeLog.push({ kind: 'lookup', target, abnormal: false, detail });
   }
 }

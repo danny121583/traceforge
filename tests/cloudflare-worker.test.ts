@@ -8,8 +8,15 @@
  * isolation — plus a static guard that `worker/index.ts` carries zero
  * Node.js built-in imports.
  */
-import { describe, expect, it } from 'vitest';
-import { WORKER_DEFAULT_SCOPE, createTraceForgeWorker, verifyPkceS256 } from '../worker/index';
+import { afterEach, describe, expect, it } from 'vitest';
+import workerDefault, {
+  TRACEFORGE_STATE_DO_NAME,
+  TraceForgeStateDO,
+  WORKER_DEFAULT_SCOPE,
+  createTraceForgeWorker,
+  verifyPkceS256,
+} from '../worker/index';
+import type { TraceForgeWorkerEnv } from '../worker/index';
 import { MetaClient } from '../src/lib/meta-client';
 import { TraceForgeMaasService } from '../src/maas/tools';
 import workerSource from '../worker/index.ts?raw';
@@ -981,6 +988,187 @@ describe('OAuth per-client actor isolation on the Worker', () => {
     const { accessToken: fresh } = await fullPkceToken({ worker, client });
     const freshOk = await mcpCall(worker, 'tools/call', { name: 'traceforge.system.status', arguments: {} }, `Bearer ${fresh}`);
     expect((freshOk.envelope['result'] as { isError: boolean }).isError ?? false).toBe(false);
+  });
+});
+
+describe('server-authorized diagnostic telemetry', () => {
+  const OPERATOR_AUTH = 'Bearer tf_operator_live_token';
+  const AGENT_AUTH = 'Bearer tf_agent_local_token';
+
+  it('returns 401 without a Bearer token', async () => {
+    const worker = createTraceForgeWorker();
+    const res = await worker.fetch(new Request(workerUrl('/api/maas/telemetry')));
+    expect(res.status).toBe(401);
+    const body = (await readJson(res)) as { error: { code: string } };
+    expect(body.error.code).toBe('MAAS_AUTHENTICATION_REQUIRED');
+  });
+
+  it('returns 403 for a token without traceforge:audit:read', async () => {
+    const worker = createTraceForgeWorker();
+    const res = await worker.fetch(
+      new Request(workerUrl('/api/maas/telemetry'), { headers: { Authorization: AGENT_AUTH } }),
+    );
+    expect(res.status).toBe(403);
+    const body = (await readJson(res)) as { error: { code: string } };
+    expect(body.error.code).toBe('MAAS_AUTHORIZATION_DENIED');
+  });
+
+  it('returns models, budget, and system status for an authorized token', async () => {
+    const worker = createTraceForgeWorker();
+    const res = await worker.fetch(
+      new Request(workerUrl('/api/maas/telemetry'), { headers: { Authorization: OPERATOR_AUTH } }),
+    );
+    expect(res.status).toBe(200);
+    const body = (await readJson(res)) as {
+      systemStatus: { service: string };
+      modelsStatus: { spark: { model: string } };
+      budgetStatus: { safetyThresholdUsd: number };
+    };
+    expect(body.systemStatus.service).toBe('traceforge-maas');
+    expect(body.modelsStatus.spark.model).toBe('muse-spark-1.3');
+    expect(body.budgetStatus.safetyThresholdUsd).toBe(95);
+  });
+});
+
+describe('TraceForgeStateDO durable persistence across Worker restarts', () => {
+  const HOOK_KEY = '__traceforgeDurableStorage';
+
+  afterEach(() => {
+    // Never leak the isolate-global durable hook into other suites: the DO
+    // constructor installs it, and every other test expects it absent.
+    delete (globalThis as Record<string, unknown>)[HOOK_KEY];
+  });
+
+  it('routes default.fetch through the DO and persists probes/history/investigation/scorecard across redeploys', async () => {
+    // One shared transactional store: every reconstructed DO instance is
+    // backed by this same Map, simulating a Worker redeploy / isolate
+    // eviction where in-memory service Maps are lost but DO storage survives.
+    const backing = new Map<string, unknown>();
+    const storageFor = () => ({
+      get: async (key: string): Promise<unknown> => backing.get(key),
+      put: async (key: string, value: unknown): Promise<void> => {
+        backing.set(key, value);
+      },
+    });
+
+    let currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const routedNames: string[] = [];
+    const mockNs = {
+      idFromName: (name: string): unknown => {
+        routedNames.push(name);
+        return name;
+      },
+      get: (_id: unknown) => ({
+        fetch: (request: Request): Promise<Response> => currentDo.fetch(request),
+      }),
+    };
+    const env: TraceForgeWorkerEnv = { TRACEFORGE_STATE_DO: mockNs };
+
+    async function mcpViaDefault(
+      method: string,
+      params: Record<string, unknown>,
+      auth?: string,
+    ): Promise<Record<string, unknown>> {
+      const res = await workerDefault.fetch(
+        new Request(workerUrl('/mcp'), {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(auth ? { Authorization: auth } : {}),
+          },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+        }),
+        env,
+      );
+      return (await readJson(res)) as Record<string, unknown>;
+    }
+
+    async function toolViaDefault(
+      name: string,
+      toolArgs: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> {
+      const envelope = await mcpViaDefault('tools/call', { name, arguments: toolArgs }, AGENT);
+      const result = envelope['result'] as {
+        structuredContent: Record<string, unknown>;
+        isError: boolean;
+      };
+      expect(result.isError ?? false).toBe(false);
+      return result.structuredContent;
+    }
+
+    const created = await toolViaDefault('traceforge.scenarios.create', {
+      boardId: 'f405-flight-controller',
+      faultSelector: 'f405-nrst-gnd-short',
+    });
+    const scenarioId = created['scenarioId'] as string;
+    expect(scenarioId.startsWith('scn_')).toBe(true);
+
+    // The request was routed through the canonical singleton Durable Object
+    // (not the in-process shared worker), and scenario state landed in
+    // durable storage.
+    expect(TRACEFORGE_STATE_DO_NAME).toBe('traceforge-canonical-v1');
+    expect(routedNames).toContain('traceforge-canonical-v1');
+    expect(backing.size).toBeGreaterThan(0);
+
+    const first = await toolViaDefault('traceforge.measurements.voltage', {
+      scenarioId,
+      node: 'U1-14',
+    });
+    expect(first['probesUsed']).toBe(1);
+
+    // Simulate a Worker redeploy: a brand-new DO instance (fresh service
+    // Maps) over the SAME storage Map.
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const second = await toolViaDefault('traceforge.measurements.voltage', {
+      scenarioId,
+      node: 'U1-14',
+    });
+    expect(second['probesUsed']).toBe(2);
+
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const third = await toolViaDefault('traceforge.measurements.voltage', {
+      scenarioId,
+      node: 'U1-14',
+    });
+    expect(third['probesUsed']).toBe(3);
+
+    // Ordered measurement history survives restarts.
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const history = await toolViaDefault('traceforge.measurements.history', { scenarioId });
+    const probeLog = history['probeLog'] as unknown[];
+    expect(probeLog).toHaveLength(3);
+    expect(history['activitySummary']).toMatchObject({ total: 3 });
+
+    // One stable investigation id across restarts.
+    const started = await toolViaDefault('traceforge.investigations.start', { scenarioId });
+    expect(started['completed']).toBe(true);
+    const investigationId = started['investigationId'] as string;
+    expect(investigationId.startsWith('inv_')).toBe(true);
+
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const result = await toolViaDefault('traceforge.investigations.result', { investigationId });
+    expect(result['proposedDiagnosis']).toBeTruthy();
+    const status = await toolViaDefault('traceforge.investigations.status', { scenarioId });
+    expect(status['investigationId']).toBe(investigationId);
+
+    // Immutable evaluation scorecard across restarts: score, re-score on a
+    // fresh DO, and report all agree byte-for-byte.
+    const scored = await toolViaDefault('traceforge.evaluation.score', { scenarioId });
+    expect(scored['score']).toBeTruthy();
+
+    currentDo = new TraceForgeStateDO({ storage: storageFor() }, {});
+    const rescored = await toolViaDefault('traceforge.evaluation.score', { scenarioId });
+    expect(rescored).toEqual(scored);
+
+    const reported = await toolViaDefault('traceforge.evaluation.report', { scenarioId });
+    expect(reported['scorecard']).toEqual(scored);
+  });
+
+  it('falls back to the shared worker when no DO binding is configured', async () => {
+    const res = await workerDefault.fetch(new Request(workerUrl('/health')), {});
+    expect(res.status).toBe(200);
+    const body = (await readJson(res)) as Record<string, unknown>;
+    expect(body['worker']).toBe('traceforge-mcp-staging');
   });
 });
 

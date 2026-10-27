@@ -6,3 +6,11 @@ workers_dev = true
 [vars]
 TRACEFORGE_ENVIRONMENT = "staging"
 MCP_PROTOCOL_VERSION = "2025-06-18"
+
+[[durable_objects.bindings]]
+name = "TRACEFORGE_STATE_DO"
+class_name = "TraceForgeStateDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TraceForgeStateDO"]
