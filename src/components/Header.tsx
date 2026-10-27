@@ -25,7 +25,7 @@ export function Header(
           <strong>{badge.label}</strong>
         </span>
         <button onClick={onToggleMode} title="Toggle live / simulated mode">
-          {s.mode === 'live' ? 'Switch to Simulated' : 'Switch to Live AI'}
+          {s.mode === 'live' ? 'Use Virtual Lab' : 'Use Live AI'}
         </button>
       </div>
     </header>

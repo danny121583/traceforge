@@ -29,6 +29,21 @@ import {
   maasErrorStatus,
 } from '../src/maas/tools';
 import { MaasSecurityError } from '../src/maas/security';
+import {
+  META_PROXY_CHAT_PATH,
+  META_PROXY_MAX_BODY_BYTES,
+  META_PROXY_SEGMENT_PATH,
+  META_PROXY_STATUS_PATH,
+  PROXY_BODY_TOO_LARGE_MESSAGE,
+  PROXY_KEY_MISSING_MESSAGE,
+  clampProxyMaxTokens,
+  extractUpstreamErrorMessage,
+  normalizeProxyMessages,
+  normalizeProxyTools,
+  resolveProxyEffort,
+  safeParseToolArguments,
+  scrubApiKeyFromText,
+} from '../src/server/meta-proxy';
 
 /** Worker name registered in `wrangler.toml`. */
 export const WORKER_NAME = 'traceforge-mcp-staging';
@@ -46,6 +61,7 @@ export const WORKER_DEFAULT_SCOPE = [
   'traceforge:investigations:read',
   'traceforge:investigations:execute',
   'traceforge:evaluation:score',
+  'traceforge:live_inference:execute',
 ].join(' ');
 
 /** All MaaS scopes advertised in RFC 9728 / RFC 8414 discovery metadata. */
@@ -74,15 +90,18 @@ export interface TraceForgeWorkerOptions {
   service?: TraceForgeMaasService;
   operatorToken?: string;
   clock?: () => number;
+  signingSecret?: string;
 }
 
 export interface TraceForgeWorker {
   fetch(request: Request, env?: TraceForgeWorkerEnv): Promise<Response>;
   getService(): TraceForgeMaasService;
+  rotateSigningSecret(newSecret: string): void;
 }
 
 interface IssuedToken {
   scope: string;
+  clientId: string;
   expiresAtMs: number;
 }
 
@@ -169,23 +188,27 @@ function incomingHeaders(request: Request): Record<string, string | string[] | u
 }
 
 /* ---------------------------------------------------------------------------
- * Stateless cross-isolate OAuth signing (Phase 4)
+ * Stateless cross-isolate OAuth signing (Phase 4, hardened)
  *
  * Cloudflare may route `/oauth/authorize`, `/oauth/token`, and `/mcp` to
  * DIFFERENT Worker isolates with disjoint in-memory Maps. To survive that,
  * authorization codes and access tokens are SELF-CONTAINED: the payload
  * (client, redirect, scope, PKCE challenge, expiry) is base64url-embedded in
- * the code/token and authenticated with a SHA-256 (`crypto.subtle`) signature
- * over a module-level internal Worker secret — so ANY isolate running this
- * Worker source can verify them without shared state. One-time code
- * consumption is still enforced per isolate (`authCodes` map + the
- * `consumedStatelessCodes` set below).
+ * the code/token and authenticated with an HMAC-SHA-256 (`crypto.subtle`)
+ * signature keyed by the Worker signing secret
+ * (`TRACEFORGE_SESSION_SECRET` || `META_API_KEY` || options.signingSecret
+ * || the internal default) — so ANY isolate sharing the secret can verify
+ * them without shared state. One-time code consumption is enforced per
+ * isolate (`authCodes` map + `consumedStatelessCodes`) AND across colocation
+ * isolates via Cloudflare Edge Cache.
  * ------------------------------------------------------------------------- */
 
 /** Internal Worker signing secret (never a user credential, never leaves the Worker). */
 const STATELESS_SIGNING_SECRET = 'tf-internal-stateless-oauth-v1::worker-isolate-signing-only';
 const STATELESS_CODE_PREFIX = 'tf_code_x.';
 const STATELESS_TOKEN_PREFIX = 'tf_live_x.';
+/** Edge-cache key prefix for cross-isolate one-time auth-code consumption. */
+const EDGE_CACHE_OAUTH_CODE_PREFIX = 'https://traceforge-internal.local/oauth/code/';
 
 function b64urlEncodeText(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -203,16 +226,60 @@ function b64urlDecodeText(b64: string): string {
   return new TextDecoder().decode(bytes);
 }
 
-/** SHA-256 signature (hex) over the internal secret + payload segment. */
-async function statelessSign(payloadB64: string): Promise<string> {
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(`${STATELESS_SIGNING_SECRET}.${payloadB64}`),
+/**
+ * HMAC-SHA-256 signature (hex) over the payload segment, keyed by the
+ * Worker signing secret (`TRACEFORGE_SESSION_SECRET` || `META_API_KEY` ||
+ * options.signingSecret || the internal default).
+ */
+export async function statelessSign(payloadB64: string, signingSecret?: string): Promise<string> {
+  const secret = signingSecret && signingSecret.length > 0 ? signingSecret : STATELESS_SIGNING_SECRET;
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
   );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`traceforge-stateless-oauth-v2.${payloadB64}`));
+  const bytes = new Uint8Array(sig);
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/** SHA-256 hex digest (used for edge-cache code-consumption keys). */
+async function sha256Hex(text: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   const bytes = new Uint8Array(digest);
   let hex = '';
   for (const b of bytes) hex += b.toString(16).padStart(2, '0');
   return hex;
+}
+
+interface EdgeCacheLike {
+  match(key: string): Promise<{ json(): Promise<unknown> } | undefined>;
+  put(key: string, response: unknown): Promise<void>;
+}
+
+function getEdgeCache(): EdgeCacheLike | null {
+  try {
+    const cache = (globalThis as { caches?: { default?: EdgeCacheLike } }).caches?.default;
+    return cache ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function edgeCachePutJson(key: string, value: unknown): void {
+  const cache = getEdgeCache();
+  if (!cache) return;
+  try {
+    const ResponseCtor = (globalThis as { Response?: new (body: string, init: { headers: Record<string, string> }) => unknown }).Response;
+    if (!ResponseCtor) return;
+    void cache.put(key, new ResponseCtor(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })).catch(() => {});
+  } catch {
+    // Best-effort only.
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -222,16 +289,28 @@ async function statelessSign(payloadB64: string): Promise<string> {
 /** Create an isolated TraceForge staging worker (fresh service + OAuth stores). */
 export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): TraceForgeWorker {
   const service = options.service ?? new TraceForgeMaasService();
-  const operatorToken = options.operatorToken ?? WORKER_OPERATOR_TOKEN;
+  // `options.operatorToken` is retained for backwards compatibility: the
+  // legacy `tf_operator_live_token` remains valid via the MaaS local token
+  // registry, but PKCE-issued tokens now resolve to per-client actors.
+  void options.operatorToken;
   const clock = options.clock ?? Date.now;
+  let configuredSigningSecret = options.signingSecret ?? STATELESS_SIGNING_SECRET;
   const issuedTokens = new Map<string, IssuedToken>();
   const authCodes = new Map<string, AuthCodeRecord>();
   const oauthClients = new Map<string, OAuthClientRecord>();
   /** One-time consumption record for self-contained codes redeemed in THIS isolate. */
   const consumedStatelessCodes = new Set<string>();
 
-  /** Verify a self-contained access token in ANY isolate (stateless SHA-256 signature + expiry). */
-  async function verifyStatelessToken(token: string): Promise<IssuedToken | null> {
+  /** Resolve the HMAC signing secret for one request (env wins, then options). */
+  function resolveSigningSecret(env?: TraceForgeWorkerEnv): string {
+    return env?.['TRACEFORGE_SESSION_SECRET']
+      || env?.['META_API_KEY']
+      || configuredSigningSecret
+      || STATELESS_SIGNING_SECRET;
+  }
+
+  /** Verify a self-contained access token in ANY isolate (HMAC-SHA-256 + expiry). */
+  async function verifyStatelessToken(token: string, signingSecret: string): Promise<IssuedToken | null> {
     if (!token.startsWith(STATELESS_TOKEN_PREFIX)) return null;
     const rest = token.slice(STATELESS_TOKEN_PREFIX.length);
     const dot = rest.lastIndexOf('.');
@@ -239,32 +318,33 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     const payloadB64 = rest.slice(0, dot);
     const sig = rest.slice(dot + 1);
     if (!payloadB64 || !sig) return null;
-    if ((await statelessSign(payloadB64)) !== sig) return null;
+    if ((await statelessSign(payloadB64, signingSecret)) !== sig) return null;
     try {
       const payload = JSON.parse(b64urlDecodeText(payloadB64)) as {
-        v?: number; scope?: string; exp?: number;
+        v?: number; scope?: string; cid?: string; exp?: number;
       };
       if (payload.v !== 1 || typeof payload.scope !== 'string' || typeof payload.exp !== 'number') return null;
       if (clock() > payload.exp) return null;
-      return { scope: payload.scope, expiresAtMs: payload.exp };
+      return { scope: payload.scope, clientId: typeof payload.cid === 'string' ? payload.cid : 'default', expiresAtMs: payload.exp };
     } catch {
       return null;
     }
   }
 
-  /** Mint a self-contained access token verifiable in ANY isolate. */
-  async function mintStatelessToken(scope: string): Promise<string> {
+  /** Mint a self-contained access token (with client binding) verifiable in ANY isolate. */
+  async function mintStatelessToken(scope: string, clientId: string, signingSecret: string): Promise<string> {
     const payloadB64 = b64urlEncodeText(JSON.stringify({
       v: 1,
       scope,
+      cid: clientId,
       exp: clock() + 3600 * 1000,
       n: randomHex('tf_n', 8),
     }));
-    return `${STATELESS_TOKEN_PREFIX}${payloadB64}.${await statelessSign(payloadB64)}`;
+    return `${STATELESS_TOKEN_PREFIX}${payloadB64}.${await statelessSign(payloadB64, signingSecret)}`;
   }
 
   /** Verify a self-contained authorization code in ANY isolate (signature + expiry + shape). */
-  async function verifyStatelessAuthCode(code: string): Promise<AuthCodeRecord | null> {
+  async function verifyStatelessAuthCode(code: string, signingSecret: string): Promise<AuthCodeRecord | null> {
     if (!code.startsWith(STATELESS_CODE_PREFIX)) return null;
     const rest = code.slice(STATELESS_CODE_PREFIX.length);
     const dot = rest.lastIndexOf('.');
@@ -272,7 +352,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     const payloadB64 = rest.slice(0, dot);
     const sig = rest.slice(dot + 1);
     if (!payloadB64 || !sig) return null;
-    if ((await statelessSign(payloadB64)) !== sig) return null;
+    if ((await statelessSign(payloadB64, signingSecret)) !== sig) return null;
     try {
       const payload = JSON.parse(b64urlDecodeText(payloadB64)) as {
         v?: number; cid?: string; ruri?: string; scope?: string; ch?: string; exp?: number;
@@ -293,26 +373,42 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
   }
 
   /**
-   * Map a PKCE-issued Bearer token onto the local operator token so the
-   * MaaS service authorizes it with operator scopes. Unknown/revoked tokens
-   * pass through untouched (the service rejects them honestly).
+   * Register a verified PKCE-issued Bearer token under its own isolated
+   * actor (`actor_oauth_<clientId>`) with exactly its granted scopes — never
+   * the shared operator token. A revoked token passes through untouched so
+   * the service rejects it with `MAAS_CREDENTIALS_REVOKED`; unknown tokens
+   * pass through untouched so the service rejects them honestly.
    */
-  async function resolveServiceHeaders(request: Request): Promise<Record<string, string | string[] | undefined>> {
+  function registerOAuthToken(token: string, scope: string, clientId: string): Record<string, string> {
+    const grantedScopes = scope.split(/\s+/).map((s) => s.trim()).filter((s) => s.length > 0);
+    service.getAuthenticator().registerDynamicToken({
+      token,
+      actorId: `actor_oauth_${clientId || 'default'}`,
+      role: grantedScopes.includes('traceforge:live_inference:execute') ? 'owner' : 'agent',
+      scopes: grantedScopes,
+    });
+    return { authorization: `Bearer ${token}`, Authorization: `Bearer ${token}` };
+  }
+
+  async function resolveServiceHeaders(request: Request, env?: TraceForgeWorkerEnv): Promise<Record<string, string | string[] | undefined>> {
     const headers = incomingHeaders(request);
     const raw = headers['authorization'] ?? headers['Authorization'];
     const value = Array.isArray(raw) ? raw[0] : raw;
     const match = typeof value === 'string' ? value.match(/^\s*Bearer\s+(\S+)\s*$/i) : null;
     const token = match?.[1];
     if (token) {
+      // Revoked tokens pass through untouched: `authenticate()` throws
+      // `MAAS_CREDENTIALS_REVOKED` for them.
+      if (service.getKillSwitch().isTokenRevoked(token)) return headers;
       const issued = issuedTokens.get(token);
       if (issued && clock() <= issued.expiresAtMs) {
-        return { ...headers, authorization: `Bearer ${operatorToken}`, Authorization: `Bearer ${operatorToken}` };
+        return { ...headers, ...registerOAuthToken(token, issued.scope, issued.clientId) };
       }
       if (issued) issuedTokens.delete(token);
-      // Cross-isolate path: self-contained token verified via SHA-256 (`crypto.subtle`).
-      const stateless = await verifyStatelessToken(token);
+      // Cross-isolate path: self-contained token verified via HMAC-SHA-256.
+      const stateless = await verifyStatelessToken(token, resolveSigningSecret(env));
       if (stateless) {
-        return { ...headers, authorization: `Bearer ${operatorToken}`, Authorization: `Bearer ${operatorToken}` };
+        return { ...headers, ...registerOAuthToken(token, stateless.scope, stateless.clientId) };
       }
     }
     return headers;
@@ -339,11 +435,12 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
 
   /**
    * Mint a SELF-CONTAINED authorization code: the payload is embedded and
-   * SHA-256-signed so `/oauth/token` succeeds even on a different isolate.
-   * Also recorded in the isolate-local `authCodes` map so same-isolate
-   * exchanges (and one-time consumption) keep working exactly as before.
+   * HMAC-SHA-256-signed so `/oauth/token` succeeds even on a different
+   * isolate. Also recorded in the isolate-local `authCodes` map so
+   * same-isolate exchanges (and one-time consumption) keep working exactly
+   * as before.
    */
-  async function issueAuthCode(clientId: string, redirectUri: string, scope: string, challenge: string): Promise<string> {
+  async function issueAuthCode(clientId: string, redirectUri: string, scope: string, challenge: string, signingSecret: string): Promise<string> {
     const payloadB64 = b64urlEncodeText(JSON.stringify({
       v: 1,
       cid: clientId,
@@ -352,7 +449,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       ch: challenge,
       exp: clock() + 10 * 60 * 1000,
     }));
-    const code = `${STATELESS_CODE_PREFIX}${payloadB64}.${await statelessSign(payloadB64)}`;
+    const code = `${STATELESS_CODE_PREFIX}${payloadB64}.${await statelessSign(payloadB64, signingSecret)}`;
     authCodes.set(code, {
       challenge,
       redirectUri,
@@ -533,6 +630,19 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     const method = request.method.toUpperCase();
     const correlationId = createMaasCorrelationId();
     const origin = url.origin;
+    const signingSecret = resolveSigningSecret(env);
+    // Server-secret wiring: an explicit TRACEFORGE_SESSION_SECRET keys the
+    // service AES-256-GCM session tokens; otherwise the live-key derivation
+    // inside `configureLiveApiKey` keys them with META_API_KEY.
+    if (env?.['TRACEFORGE_SESSION_SECRET']) {
+      service.configureSessionSecret(env['TRACEFORGE_SESSION_SECRET'] as string);
+    }
+    // Live Muse Spark 1.3 wiring: when the Worker environment provides a
+    // server-side META_API_KEY, attach it to the MaaS service live client so
+    // `mode: "live"` investigations execute against the real upstream.
+    if (env?.['META_API_KEY'] && !service.hasLiveClient()) {
+      service.configureLiveApiKey(env['META_API_KEY'] as string);
+    }
 
     if (method === 'OPTIONS') {
       return emptyResponse(204, correlationId);
@@ -634,7 +744,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       for (const [key, value] of url.searchParams) input[key] = value;
       const validated = validateAuthorizeInput(input);
       if (validated instanceof Response) return validated;
-      const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge);
+      const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge, signingSecret);
       const target = new URL(validated.redirectUri);
       target.searchParams.set('code', code);
       if (validated.state) target.searchParams.set('state', validated.state);
@@ -652,7 +762,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     if (method === 'POST' && path === '/oauth/authorize') {
       const validated = validateAuthorizeInput(await readTokenParams(request));
       if (validated instanceof Response) return validated;
-      const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge);
+      const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge, signingSecret);
       return jsonResponse(200, { code, state: validated.state, redirect_uri: validated.redirectUri }, correlationId);
     }
 
@@ -669,13 +779,26 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       }
       if (!stored) {
         // Cross-isolate path: the code was minted by `/oauth/authorize` on a
-        // different isolate. Verify the self-contained SHA-256 signature.
-        const stateless = await verifyStatelessAuthCode(codeParam);
+        // different isolate. Verify the self-contained HMAC-SHA-256 signature.
+        const stateless = await verifyStatelessAuthCode(codeParam, signingSecret);
         if (!stateless) {
           return oauthError(400, 'invalid_grant', 'Authorization code is unknown or expired.', correlationId);
         }
         if (consumedStatelessCodes.has(codeParam)) {
           return oauthError(400, 'invalid_grant', 'Authorization code has already been redeemed.', correlationId);
+        }
+        // Cross-isolate replay check: a code redeemed on another isolate in
+        // the same colocation is recorded in Cloudflare Edge Cache.
+        try {
+          const cache = (globalThis as { caches?: { default?: EdgeCacheLike } }).caches?.default;
+          if (cache) {
+            const hit = await cache.match(`${EDGE_CACHE_OAUTH_CODE_PREFIX}${await sha256Hex(codeParam)}`);
+            if (hit) {
+              return oauthError(400, 'invalid_grant', 'Authorization code has already been redeemed.', correlationId);
+            }
+          }
+        } catch {
+          // Best-effort only: edge persistence must never fail token exchange.
         }
         stored = stateless;
       }
@@ -686,11 +809,18 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       if (!verifier || !(await verifyPkceS256(verifier, stored.challenge))) {
         return oauthError(400, 'invalid_grant', 'PKCE S256 code_verifier verification failed.', correlationId);
       }
-      // One-time consumption within this isolate (both code generations).
+      // One-time consumption: isolate-local (both code generations) AND
+      // Cloudflare Edge Cache, so codes cannot be replayed across isolates
+      // in the same colocation.
       authCodes.delete(codeParam);
       consumedStatelessCodes.add(codeParam);
-      const accessToken = await mintStatelessToken(stored.scope);
-      issuedTokens.set(accessToken, { scope: stored.scope, expiresAtMs: clock() + 3600 * 1000 });
+      try {
+        edgeCachePutJson(`${EDGE_CACHE_OAUTH_CODE_PREFIX}${await sha256Hex(codeParam)}`, { consumed: true, at: new Date().toISOString() });
+      } catch {
+        // Best-effort only.
+      }
+      const accessToken = await mintStatelessToken(stored.scope, stored.clientId, signingSecret);
+      issuedTokens.set(accessToken, { scope: stored.scope, clientId: stored.clientId, expiresAtMs: clock() + 3600 * 1000 });
       return jsonResponse(200, {
         access_token: accessToken,
         token_type: 'Bearer',
@@ -710,22 +840,22 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
           error: { code: JSON_RPC_PARSE_ERROR, message: 'Parse error: malformed JSON body.' },
         }, correlationId);
       }
-      return handleMcpRpc(body, await resolveServiceHeaders(request), correlationId);
+      return handleMcpRpc(body, await resolveServiceHeaders(request, env), correlationId);
     }
 
     if (method === 'GET' && path === '/api/maas/status') {
-      const payload = await service.executeTool('traceforge.system.status', {}, await resolveServiceHeaders(request));
+      const payload = await service.executeTool('traceforge.system.status', {}, await resolveServiceHeaders(request, env));
       return jsonResponse(200, payload, correlationId);
     }
 
     if (method === 'GET' && path === '/api/maas/catalog') {
-      const payload = await service.executeTool('traceforge.capabilities.list', {}, await resolveServiceHeaders(request));
+      const payload = await service.executeTool('traceforge.capabilities.list', {}, await resolveServiceHeaders(request, env));
       return jsonResponse(200, payload, correlationId);
     }
 
     if (method === 'GET' && path === '/api/maas/audit') {
       try {
-        const headers = await resolveServiceHeaders(request);
+        const headers = await resolveServiceHeaders(request, env);
         const context = service.getAuthenticator().authenticate(headers);
         service.getAuthenticator().authorize(context, 'traceforge.audit', 'traceforge:audit:read');
         return jsonResponse(200, { events: service.getAuditLog().getEvents() }, correlationId);
@@ -737,12 +867,165 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       }
     }
 
+    // Browser-facing Meta proxy: the Vercel frontend rewrites `/api/meta/*`
+    // here. `META_API_KEY` stays server-side; the browser never sees it.
+    if (method === 'GET' && path === META_PROXY_STATUS_PATH) {
+      return jsonResponse(200, {
+        configured: service.hasLiveClient(),
+        mode: service.hasLiveClient() ? (service.isLiveVerified() ? 'LIVE_API' : 'UNVERIFIED') : 'UNAVAILABLE',
+      }, correlationId);
+    }
+
+    if (method === 'POST' && path === META_PROXY_CHAT_PATH) {
+      if (service.getKillSwitch().isGlobalKillActive()) {
+        return jsonResponse(503, { error: `Meta proxy unavailable: ${service.getKillSwitch().getGlobalKillReason() ?? 'operator halt'}.` }, correlationId);
+      }
+      try {
+        service.getRateLimiter().check('browser-meta-proxy');
+      } catch (err) {
+        return jsonResponse(429, { error: err instanceof Error ? err.message : String(err) }, correlationId);
+      }
+      if (service.isBudgetSafetyBreached()) {
+        return jsonResponse(429, { error: 'Live inference blocked: spend reached the $95.00 safety threshold (see traceforge.budget.status).' }, correlationId);
+      }
+      const apiKey = env?.['META_API_KEY'];
+      if (!apiKey) {
+        return jsonResponse(503, { error: PROXY_KEY_MISSING_MESSAGE }, correlationId);
+      }
+      let rawText = '';
+      try {
+        rawText = await request.text();
+      } catch {
+        return jsonResponse(400, { error: 'Meta proxy could not read the request body.' }, correlationId);
+      }
+      if (rawText.length > META_PROXY_MAX_BODY_BYTES) {
+        return jsonResponse(413, { error: PROXY_BODY_TOO_LARGE_MESSAGE }, correlationId);
+      }
+      let proxyBody: Record<string, unknown>;
+      try {
+        proxyBody = (rawText ? JSON.parse(rawText) : {}) as Record<string, unknown>;
+      } catch {
+        return jsonResponse(400, { error: 'Meta proxy request body must be valid JSON.' }, correlationId);
+      }
+      const maxTokens = clampProxyMaxTokens(proxyBody['maxTokens']);
+      const normalizedTools = normalizeProxyTools(proxyBody['tools']);
+      const normalizedMessages = normalizeProxyMessages(proxyBody['messages'] ?? []);
+      const effort = resolveProxyEffort(proxyBody as { effort?: string; reasoning_effort?: string; reasoning?: { effort?: string } });
+      let upstream: Response;
+      try {
+        upstream = await globalThis.fetch('https://api.meta.ai/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({
+            model: typeof proxyBody['model'] === 'string' ? proxyBody['model'] : 'muse-spark-1.3',
+            messages: normalizedMessages,
+            ...(normalizedTools ? { tools: normalizedTools } : {}),
+            ...(proxyBody['responseFormat'] === 'json' ? { response_format: { type: 'json_object' } } : {}),
+            ...(effort ? { reasoning_effort: effort } : {}),
+            max_tokens: maxTokens,
+          }),
+        });
+      } catch (err) {
+        return jsonResponse(502, { error: scrubApiKeyFromText(err instanceof Error ? err.message : String(err), apiKey) }, correlationId);
+      }
+      if (!upstream.ok) {
+        const status = upstream.status >= 400 && upstream.status <= 599 ? upstream.status : 502;
+        let detail = '';
+        try {
+          detail = extractUpstreamErrorMessage(await upstream.json());
+        } catch {
+          detail = '';
+        }
+        let message = `Meta Model API error: HTTP ${upstream.status}`;
+        if (detail) message += ` — ${detail}`;
+        return jsonResponse(status, { error: scrubApiKeyFromText(message, apiKey) }, correlationId);
+      }
+      const data = (await upstream.json()) as {
+        choices?: Array<{ message?: { content?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: unknown } }> } }>;
+        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
+      };
+      const message = data.choices?.[0]?.message;
+      const promptTokens = typeof data.usage?.prompt_tokens === 'number' && Number.isFinite(data.usage.prompt_tokens)
+        ? Math.max(0, Math.floor(data.usage.prompt_tokens))
+        : Math.ceil(JSON.stringify(normalizedMessages).length / 4);
+      const completionTokens = typeof data.usage?.completion_tokens === 'number' && Number.isFinite(data.usage.completion_tokens)
+        ? Math.max(0, Math.floor(data.usage.completion_tokens))
+        : Math.ceil((message?.content ?? '').length / 4);
+      service.recordExternalLiveUsage({
+        inputTokens: promptTokens,
+        outputTokens: completionTokens,
+        providerReported: typeof data.usage?.prompt_tokens === 'number' && typeof data.usage?.completion_tokens === 'number',
+      });
+      return jsonResponse(200, {
+        content: scrubApiKeyFromText(message?.content ?? '', apiKey),
+        toolCalls: (message?.tool_calls ?? []).map((t) => ({
+          id: t.id,
+          name: t.function.name,
+          arguments: safeParseToolArguments(t.function.arguments),
+        })),
+        model: typeof proxyBody['model'] === 'string' ? proxyBody['model'] : 'muse-spark-1.3',
+        ...(data.usage ? { usage: data.usage } : {}),
+      }, correlationId);
+    }
+
+    if (method === 'POST' && path === META_PROXY_SEGMENT_PATH) {
+      const apiKey = env?.['META_API_KEY'];
+      if (!apiKey) {
+        return jsonResponse(503, { error: PROXY_KEY_MISSING_MESSAGE }, correlationId);
+      }
+      let segText = '';
+      try {
+        segText = await request.text();
+      } catch {
+        return jsonResponse(400, { error: 'Meta proxy could not read the request body.' }, correlationId);
+      }
+      if (segText.length > META_PROXY_MAX_BODY_BYTES) {
+        return jsonResponse(413, { error: PROXY_BODY_TOO_LARGE_MESSAGE }, correlationId);
+      }
+      let segBody: { image?: unknown };
+      try {
+        segBody = (segText ? JSON.parse(segText) : {}) as { image?: unknown };
+      } catch {
+        return jsonResponse(400, { error: 'Meta proxy request body must be valid JSON.' }, correlationId);
+      }
+      let segUpstream: Response;
+      try {
+        segUpstream = await globalThis.fetch('https://api.meta.ai/v1/v1/responses', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+          body: JSON.stringify({ model: 'sam-3.1', input: segBody.image ?? {} }),
+        });
+      } catch (err) {
+        return jsonResponse(502, { error: scrubApiKeyFromText(err instanceof Error ? err.message : String(err), apiKey) }, correlationId);
+      }
+      if (!segUpstream.ok) {
+        const segStatus = segUpstream.status >= 400 && segUpstream.status <= 599 ? segUpstream.status : 502;
+        let segDetail = '';
+        try {
+          segDetail = extractUpstreamErrorMessage(await segUpstream.json());
+        } catch {
+          segDetail = '';
+        }
+        let segMessage = `SAM 3.1 segmentation error: HTTP ${segUpstream.status}`;
+        if (segDetail) segMessage += ` — ${segDetail}`;
+        return jsonResponse(segStatus, { error: scrubApiKeyFromText(segMessage, apiKey) }, correlationId);
+      }
+      const segData = (await segUpstream.json()) as { masks?: unknown[]; confidence?: number };
+      return jsonResponse(200, {
+        masks: Array.isArray(segData.masks) ? segData.masks : [],
+        confidence: typeof segData.confidence === 'number' ? segData.confidence : 0,
+      }, correlationId);
+    }
+
     return jsonResponse(404, { error: { code: 'MAAS_RESOURCE_NOT_FOUND', message: `Unknown worker path '${path}'.`, correlationId } }, correlationId);
   }
 
   return {
     fetch,
     getService: () => service,
+    rotateSigningSecret: (newSecret: string): void => {
+      if (newSecret && newSecret.length > 0) configuredSigningSecret = newSecret;
+    },
   };
 }
 

@@ -41,6 +41,7 @@ import {
   MetaClient,
   STARTING_PROMOTIONAL_BALANCE_USD,
   TARGET_RESERVE_USD,
+  estimateLiveCostUsd,
   type OperationalMode,
   type UsageTelemetry,
 } from '../lib/meta-client';
@@ -258,67 +259,124 @@ let scenarioSeq = 0;
 let investigationSeq = 0;
 
 /* ---------------------------------------------------------------------------
- * Opaque signed scenario / investigation ids (cross-isolate hydration)
+ * Authenticated scenario / investigation ids (cross-isolate hydration)
  *
  * Cloudflare may route successive ChatGPT MCP calls to DIFFERENT Worker
  * isolates with disjoint in-memory Maps. To survive that, `scenarioId`
  * (`scn_...`) and `investigationId` (`inv_...`) are SELF-CONTAINED: the
- * payload (board/fault indexes, owner, expiry, sequence) is XOR-masked with
- * a fixed internal key and hex-encoded — so it carries ZERO readable
- * board/fault strings and always passes `assertGroundTruthIsolated` — and
- * authenticated with a deterministic FNV-1a hex tag, so ANY isolate running
- * this service source can verify and rehydrate the record without shared
- * state. Tenant isolation, session expiry, and ground-truth isolation are
- * enforced on every hydrate exactly as on the originating isolate.
+ * payload (board/fault indexes, owner, expiry, sequence) is encrypted with
+ * AES-256-GCM (random 96-bit IV per token, Additional Data bound to the
+ * token prefix) and hex-encoded — so it carries ZERO readable board/fault
+ * strings and always passes `assertGroundTruthIsolated` — and authenticated
+ * with BOTH the 128-bit GCM tag and an HMAC-SHA-256 tag, so ANY isolate
+ * holding the same session secret can verify and rehydrate the record
+ * without shared state. Tenant isolation, session expiry, and ground-truth
+ * isolation are enforced on every hydrate exactly as on the originating
+ * isolate. There is no XOR masking and no FNV-1a anywhere in this module.
  * ------------------------------------------------------------------------- */
 
 const SCN_TOKEN_PREFIX = 'scn_';
 const INV_TOKEN_PREFIX = 'inv_';
 
-/** Fixed internal mask key (never a user credential, never leaves the service). */
-const TOKEN_XOR_KEY: readonly number[] = [
-  0x53, 0x69, 0x6d, 0x4c, 0x61, 0x62, 0x21, 0x33,
-  0x77, 0x09, 0xbe, 0x42, 0xf0, 0x5d, 0xc7, 0x1a,
-];
+/** HMAC tag domain separating scenario/investigation signatures. */
+const TOKEN_TAG_DOMAIN = 'traceforge-maas-id-v2';
+/** AES-GCM key-derivation domain. */
+const TOKEN_AEAD_DOMAIN = 'traceforge-aead-v2::';
+/** HMAC key domain. */
+const TOKEN_HMAC_DOMAIN = 'traceforge-maas-hmac-v2::';
+/** Default session secret (overridden via options or live-key derivation). */
+export const DEFAULT_SESSION_SECRET = 'tf-default-session-secret-v2';
 
-/** Tag domain separating scenario/investigation signatures. */
-const TOKEN_TAG_DOMAIN = 'traceforge-maas-id-v1';
-
-/** Deterministic FNV-1a (32-bit) hex tag over the masked payload. */
-function fnv1a32Hex(text: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= text.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16).padStart(8, '0');
-}
-
-function encodeSignedToken(prefix: string, payload: Record<string, unknown>): string {
-  const bytes = new TextEncoder().encode(JSON.stringify(payload));
-  const masked = new Uint8Array(bytes.length);
-  for (let i = 0; i < bytes.length; i += 1) masked[i] = (bytes[i] as number) ^ (TOKEN_XOR_KEY[i % TOKEN_XOR_KEY.length] as number);
+function bytesToHex(bytes: Uint8Array): string {
   let hex = '';
-  for (const b of masked) hex += (b as number).toString(16).padStart(2, '0');
-  return `${prefix}${hex}_${fnv1a32Hex(`${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`)}`;
+  for (const b of bytes) hex += (b as number).toString(16).padStart(2, '0');
+  return hex;
 }
 
-function decodeSignedToken(prefix: string, token: string): Record<string, unknown> | null {
+function hexToBytes(hex: string): Uint8Array | null {
+  if (hex.length % 2 !== 0 || !/^[0-9a-f]+$/.test(hex)) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i += 1) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** Derive the 256-bit AES-GCM CryptoKey for one session secret. */
+async function aeadKeyForSecret(secret: string): Promise<CryptoKey> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${TOKEN_AEAD_DOMAIN}${secret}`));
+  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+}
+
+/** HMAC-SHA-256 over text under a domain-separated session-secret key. */
+async function hmacSignHex(secret: string, text: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(`${TOKEN_HMAC_DOMAIN}${secret}`),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text));
+  return bytesToHex(new Uint8Array(sig));
+}
+
+/** Constant-time equality for lowercase hex tags (lengths must match). */
+function constantTimeHexEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/**
+ * Authenticated-encrypt a token payload: AES-256-GCM (random 96-bit IV,
+ * prefix bound as Additional Data, 128-bit GCM tag) plus an 8-hex-char
+ * HMAC-SHA-256 tag so the format stays `${prefix}${hex}_${tag8}` matching
+ * `/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/`.
+ */
+export async function encryptSignedToken(prefix: string, payload: Record<string, unknown>, secret: string): Promise<string> {
+  const aesKey = await aeadKeyForSecret(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const sealed = new Uint8Array(
+    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix) }, aesKey, plaintext as unknown as BufferSource),
+  );
+  const combined = new Uint8Array(iv.length + sealed.length);
+  combined.set(iv, 0);
+  combined.set(sealed, iv.length);
+  const hex = bytesToHex(combined);
+  const tag8 = (await hmacSignHex(secret, `${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`)).slice(0, 8);
+  return `${prefix}${hex}_${tag8}`;
+}
+
+/**
+ * Verify and decrypt a token: validates prefix, `_${tag8}` suffix, and hex
+ * shape, checks the HMAC-SHA-256 tag in constant time, then AES-256-GCM
+ * decrypts (128-bit GCM tag verification included). Returns `null` on any
+ * failure — wrong key, bit flip, truncation, or malformed JSON.
+ */
+export async function decryptSignedToken(prefix: string, token: string, secret: string): Promise<Record<string, unknown> | null> {
   if (typeof token !== 'string' || !token.startsWith(prefix)) return null;
   const rest = token.slice(prefix.length);
   const sep = rest.lastIndexOf('_');
   if (sep <= 0) return null;
   const hex = rest.slice(0, sep);
   const tag = rest.slice(sep + 1);
-  if (hex.length === 0 || hex.length > 4096 || hex.length % 2 !== 0) return null;
+  if (hex.length < 56 || hex.length > 8192 || hex.length % 2 !== 0) return null;
   if (!/^[0-9a-f]+$/.test(hex) || !/^[0-9a-f]{8}$/.test(tag)) return null;
-  if (fnv1a32Hex(`${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`) !== tag) return null;
-  const masked = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < masked.length; i += 1) masked[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  const bytes = new Uint8Array(masked.length);
-  for (let i = 0; i < masked.length; i += 1) bytes[i] = (masked[i] as number) ^ (TOKEN_XOR_KEY[i % TOKEN_XOR_KEY.length] as number);
+  const expected = (await hmacSignHex(secret, `${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`)).slice(0, 8);
+  if (!constantTimeHexEqual(expected, tag)) return null;
+  const combined = hexToBytes(hex);
+  if (!combined || combined.length < 12 + 16) return null;
+  const iv = combined.slice(0, 12);
+  const sealed = combined.slice(12);
   try {
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    const aesKey = await aeadKeyForSecret(secret);
+    const plain = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix) },
+      aesKey,
+      sealed as unknown as BufferSource,
+    );
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(plain));
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
     return parsed as Record<string, unknown>;
   } catch {
@@ -326,12 +384,12 @@ function decodeSignedToken(prefix: string, token: string): Record<string, unknow
   }
 }
 
-function encodeScenarioToken(payload: { b: number; f: number; o: string; x: number; q: number }): string {
-  return encodeSignedToken(SCN_TOKEN_PREFIX, payload as unknown as Record<string, unknown>);
+async function encodeScenarioToken(payload: { b: number; f: number; o: string; x: number; q: number }, secret: string): Promise<string> {
+  return encryptSignedToken(SCN_TOKEN_PREFIX, payload as unknown as Record<string, unknown>, secret);
 }
 
-function decodeScenarioToken(token: string): { b: number; f: number; o: string; x: number; q: number } | null {
-  const decoded = decodeSignedToken(SCN_TOKEN_PREFIX, token);
+async function decodeScenarioToken(token: string, secret: string): Promise<{ b: number; f: number; o: string; x: number; q: number } | null> {
+  const decoded = await decryptSignedToken(SCN_TOKEN_PREFIX, token, secret);
   if (!decoded) return null;
   const { b, f, o, x, q } = decoded as { b: unknown; f: unknown; o: unknown; x: unknown; q: unknown };
   if (!Number.isInteger(b) || !Number.isInteger(f) || typeof o !== 'string' || o.length === 0) return null;
@@ -339,17 +397,143 @@ function decodeScenarioToken(token: string): { b: number; f: number; o: string; 
   return { b: b as number, f: f as number, o, x, q };
 }
 
-function encodeInvestigationToken(payload: { s: string; o: string; q: number }): string {
-  return encodeSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>);
+export interface InvestigationTokenExtras {
+  /** Stored operational mode (e.g. 'LIVE_API') for cross-isolate restoration. */
+  m?: OperationalMode;
+  /** Stored turn count. */
+  t?: number;
+  /** Stored proposed diagnosis. */
+  d?: ProposedDiagnosis;
+  /** Stored diagnosis source ('model_final_diagnosis' | 'evidence_fallback'). */
+  src?: string;
+  /** Stored usage telemetry snapshot. */
+  u?: UsageTelemetry;
 }
 
-function decodeInvestigationToken(token: string): { s: string; o: string; q: number } | null {
-  const decoded = decodeSignedToken(INV_TOKEN_PREFIX, token);
+async function encodeInvestigationToken(payload: { s: string; o: string; q: number } & InvestigationTokenExtras, secret: string): Promise<string> {
+  return encryptSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>, secret);
+}
+
+async function decodeInvestigationToken(token: string, secret: string): Promise<({ s: string; o: string; q: number } & InvestigationTokenExtras) | null> {
+  const decoded = await decryptSignedToken(INV_TOKEN_PREFIX, token, secret);
   if (!decoded) return null;
-  const { s, o, q } = decoded as { s: unknown; o: unknown; q: unknown };
+  const { s, o, q, m, t, d, src, u } = decoded as {
+    s: unknown; o: unknown; q: unknown; m: unknown; t: unknown; d: unknown; src: unknown; u: unknown;
+  };
   if (typeof s !== 'string' || s.length === 0 || typeof o !== 'string' || o.length === 0) return null;
   if (typeof q !== 'number' || !Number.isFinite(q)) return null;
-  return { s, o, q };
+  const extras: InvestigationTokenExtras = {};
+  if (typeof m === 'string' && m.length > 0) extras.m = m as OperationalMode;
+  if (typeof t === 'number' && Number.isFinite(t)) extras.t = t;
+  if (d !== null && typeof d === 'object' && !Array.isArray(d)) extras.d = d as ProposedDiagnosis;
+  if (typeof src === 'string' && src.length > 0) extras.src = src;
+  if (u !== null && typeof u === 'object' && !Array.isArray(u)) extras.u = u as UsageTelemetry;
+  return { s, o, q, ...extras };
+}
+
+/* ---------------------------------------------------------------------------
+ * Best-effort Cloudflare Edge Cache persistence (cross-isolate, same colo)
+ *
+ * In addition to the self-contained signed tokens above, completed
+ * investigations and evaluated scorecards are best-effort stored in
+ * `caches.default` (present on Cloudflare Workers, absent in Node/tests)
+ * keyed by stable internal URLs. A cold isolate in the same edge colocation
+ * can then hydrate the EXACT `LIVE_API` InvestigationRecord and scorecard
+ * when the caller passes only a scenarioId — no second live API call.
+ * All payloads are ground-truth-free (verified by
+ * `assertGroundTruthIsolated` before they are stored or returned).
+ * ------------------------------------------------------------------------- */
+
+const EDGE_CACHE_SCENARIO_PREFIX = 'https://traceforge-internal.local/scn/';
+const EDGE_CACHE_INVESTIGATION_PREFIX = 'https://traceforge-internal.local/inv/';
+
+interface EdgeCacheLike {
+  match(key: string): Promise<{ json(): Promise<unknown> } | undefined>;
+  put(key: string, response: unknown): Promise<void>;
+}
+
+function getEdgeCache(): EdgeCacheLike | null {
+  try {
+    const cache = (globalThis as { caches?: { default?: EdgeCacheLike } }).caches?.default;
+    return cache ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function edgeCacheGet<T>(key: string): Promise<T | null> {
+  const cache = getEdgeCache();
+  if (!cache) return null;
+  try {
+    const res = await cache.match(key);
+    if (!res) return null;
+    return (await res.json()) as T;
+  } catch {
+    return null;
+  }
+}
+
+function edgeCachePut(key: string, value: unknown): void {
+  const cache = getEdgeCache();
+  if (!cache) return;
+  try {
+    const ResponseCtor = (globalThis as { Response?: new (body: string, init: { headers: Record<string, string> }) => unknown }).Response;
+    if (!ResponseCtor) return;
+    void cache.put(key, new ResponseCtor(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })).catch(() => {});
+  } catch {
+    // Best-effort only: edge persistence must never fail a tool call.
+  }
+}
+
+function edgeScenarioKey(scenarioId: string): string {
+  return `${EDGE_CACHE_SCENARIO_PREFIX}${scenarioId}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Runtime live-AI telemetry snapshot (cross-isolate, same colo)
+ *
+ * Whenever a real live call succeeds — `investigationsStart` with an
+ * explicit `mode: "live"` or a browser Live AI call via `/api/meta/chat` on
+ * the Worker — the cumulative live spend and `liveVerified: true` flag are
+ * persisted to `caches.default` under this key. Read-only tools
+ * (`traceforge.models.status`, `traceforge.budget.status`) read/merge the
+ * snapshot instead of invoking paid inference, so every isolate in the
+ * colocation reports the same Worker runtime ledger without spending.
+ * ------------------------------------------------------------------------- */
+
+const EDGE_CACHE_RUNTIME_TELEMETRY_KEY = 'https://traceforge-internal.local/runtime/telemetry';
+
+interface EdgeRuntimeTelemetrySnapshot {
+  incurredCostUsd?: unknown;
+  inputTokens?: unknown;
+  outputTokens?: unknown;
+  totalRequests?: unknown;
+  liveVerified?: unknown;
+}
+
+function asNonNegativeNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function edgeInvestigationKey(investigationId: string): string {
+  return `${EDGE_CACHE_INVESTIGATION_PREFIX}${investigationId}`;
+}
+
+interface EdgeCachedScenario {
+  investigation?: InvestigationRecord;
+  evaluated?: boolean;
+  evaluatedAt?: string;
+  scorecard?: Record<string, unknown>;
+}
+
+function isEdgeCachedScenario(value: unknown): value is EdgeCachedScenario {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isInvestigationRecord(value: unknown): value is InvestigationRecord {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  return typeof r['investigationId'] === 'string' && typeof r['scenarioId'] === 'string' && typeof r['ownerActorId'] === 'string';
 }
 
 function asString(value: unknown): string | undefined {
@@ -434,7 +618,19 @@ export class TraceForgeMaasService {
   private readonly maxSessionsPerActor: number;
   private injectedLiveSpendUsd: number;
   private readonly sessionTtlMs: number;
-  private readonly liveClient?: MetaClient;
+  private liveClient?: MetaClient;
+  private liveVerificationError: string | null = null;
+  /** AES-256-GCM + HMAC-SHA-256 session secret for `scn_`/`inv_` tokens. */
+  private sessionSecret: string;
+  /** Live spend recorded via `recordExternalLiveUsage` (browser `/api/meta/chat` + MCP live calls). */
+  private externalLiveSpendUsd = 0;
+  private externalInputTokens = 0;
+  private externalOutputTokens = 0;
+  private externalTotalRequests = 0;
+  private externalProviderReported = false;
+  /** Remote-colo spend/verified flag merged from the edge-cached runtime snapshot. */
+  private edgeCachedLiveSpendUsd = 0;
+  private edgeLiveVerified = false;
 
   constructor(options: MaasServiceOptions = {}) {
     for (const d of TRACEFORGE_MAAS_TOOL_DESCRIPTORS) this.descriptors.set(d.name, d);
@@ -444,7 +640,19 @@ export class TraceForgeMaasService {
     this.maxSessionsPerActor = options.maxSessionsPerActor ?? 25;
     this.injectedLiveSpendUsd = options.initialIncurredCostUsd ?? 0;
     this.sessionTtlMs = options.sessionTtlMs ?? 30 * 60 * 1000;
+    this.sessionSecret = options.verificationKey ?? DEFAULT_SESSION_SECRET;
     if (options.liveClient) this.liveClient = options.liveClient;
+  }
+
+  /** Override the AES-256-GCM session secret (tests, key rotation). */
+  configureSessionSecret(secret: string): void {
+    if (!secret || secret.length === 0) return;
+    this.sessionSecret = secret;
+  }
+
+  /** Rotate the session secret: tokens minted under the old secret stop verifying. */
+  rotateSessionSecret(newSecret: string): void {
+    this.configureSessionSecret(newSecret);
   }
 
   /* -- accessors for middleware / tests ----------------------------------- */
@@ -493,8 +701,108 @@ export class TraceForgeMaasService {
     record.expiresAtMs = Date.now() - 1;
   }
 
+  /** True once a live Muse Spark 1.3 client is attached (env key or injected). */
+  hasLiveClient(): boolean {
+    return this.liveClient !== undefined;
+  }
+
+  /**
+   * Attach a live Muse Spark 1.3 client from a server-side `META_API_KEY`.
+   * The key is consumed strictly server-side and never exposed in payloads.
+   * When the session secret is still the default, it is derived from the
+   * live key so the deployed Worker automatically keys AES-256-GCM with its
+   * server-side Cloudflare secret (`META_API_KEY` / `TRACEFORGE_SESSION_SECRET`).
+   */
+  configureLiveApiKey(apiKey: string): void {
+    if (!apiKey || !apiKey.trim()) return;
+    this.liveClient = new MetaClient({ mode: 'live', apiKey: apiKey.trim(), segmentationMode: 'static_fixture' });
+    if (this.sessionSecret === DEFAULT_SESSION_SECRET) {
+      this.sessionSecret = `tf-live-derived::${apiKey.trim()}`;
+    }
+    this.liveVerificationError = null;
+  }
+
+  /**
+   * Record externally observed live usage (browser Live AI calls via
+   * `/api/meta/chat` and MCP `mode: "live"` calls) into the shared Worker
+   * runtime ledger, and persist it to `caches.default` so every isolate in
+   * the colocation reports the same spend without invoking paid inference.
+   */
+  recordExternalLiveUsage(usage: { inputTokens: number; outputTokens: number; providerReported: boolean }): void {
+    const input = asNonNegativeNumber(usage.inputTokens);
+    const output = asNonNegativeNumber(usage.outputTokens);
+    const cost = estimateLiveCostUsd(input, output);
+    this.externalInputTokens += input;
+    this.externalOutputTokens += output;
+    this.externalTotalRequests += 1;
+    this.externalLiveSpendUsd += cost;
+    if (usage.providerReported) this.externalProviderReported = true;
+    this.edgeLiveVerified = true;
+    void this.persistEdgeRuntimeSnapshot();
+  }
+
+  /** Merge the edge-cached runtime snapshot into the in-memory ledger view. */
+  private async refreshEdgeRuntimeSnapshot(): Promise<void> {
+    const snapshot = await edgeCacheGet<EdgeRuntimeTelemetrySnapshot>(EDGE_CACHE_RUNTIME_TELEMETRY_KEY);
+    if (!snapshot || typeof snapshot !== 'object') return;
+    if (snapshot['liveVerified'] === true) this.edgeLiveVerified = true;
+    // The snapshot holds cumulative cross-isolate spend; only the remote
+    // portion (beyond this isolate's own external ledger) is added to avoid
+    // double counting.
+    const remote = asNonNegativeNumber(snapshot['incurredCostUsd']) - this.externalLiveSpendUsd;
+    if (remote > this.edgeCachedLiveSpendUsd) this.edgeCachedLiveSpendUsd = remote;
+  }
+
+  /** Best-effort persist of the cumulative runtime snapshot (never throws). */
+  private async persistEdgeRuntimeSnapshot(): Promise<void> {
+    try {
+      const previous = await edgeCacheGet<EdgeRuntimeTelemetrySnapshot>(EDGE_CACHE_RUNTIME_TELEMETRY_KEY);
+      const previousSpend = previous && typeof previous === 'object' ? asNonNegativeNumber(previous['incurredCostUsd']) : 0;
+      const cumulative = Math.max(
+        previousSpend,
+        this.externalLiveSpendUsd + this.edgeCachedLiveSpendUsd + (this.liveClient?.getTelemetry().incurredCostUsd ?? 0),
+      );
+      edgeCachePut(EDGE_CACHE_RUNTIME_TELEMETRY_KEY, {
+        incurredCostUsd: cumulative,
+        inputTokens: this.externalInputTokens + (this.liveClient?.getTelemetry().inputTokens ?? 0),
+        outputTokens: this.externalOutputTokens + (this.liveClient?.getTelemetry().outputTokens ?? 0),
+        totalRequests: this.externalTotalRequests + (this.liveClient?.getTelemetry().totalRequests ?? 0),
+        liveVerified: true,
+      });
+      this.edgeCachedLiveSpendUsd = Math.max(0, cumulative - this.externalLiveSpendUsd);
+      this.edgeLiveVerified = true;
+    } catch {
+      // Best-effort only.
+    }
+  }
+
+  /** True once any real live call has verified this runtime (isolate or colo). */
+  isLiveVerified(): boolean {
+    return (this.liveClient?.status().liveVerified ?? false) || this.edgeLiveVerified;
+  }
+
+  /** True when the $95.00 safety stop is breached by either spend measure. */
+  isBudgetSafetyBreached(): boolean {
+    const incurred = this.effectiveIncurredCostUsd();
+    return incurred >= BUDGET_SAFETY_THRESHOLD_USD
+      || (LAST_VERIFIED_CONSUMED_USD + incurred) >= BUDGET_SAFETY_THRESHOLD_USD;
+  }
+
+  private combinedTelemetry(): { incurredCostUsd: number; projectedLiveCostUsd: number; inputTokens: number; outputTokens: number; totalRequests: number; providerReportedUsage: boolean } {
+    const sim = this.simClient.getTelemetry();
+    const live = this.liveClient?.getTelemetry();
+    return {
+      incurredCostUsd: sim.incurredCostUsd + (live?.incurredCostUsd ?? 0) + this.externalLiveSpendUsd,
+      projectedLiveCostUsd: sim.projectedLiveCostUsd + (live?.projectedLiveCostUsd ?? 0) + this.externalLiveSpendUsd,
+      inputTokens: sim.inputTokens + (live?.inputTokens ?? 0) + this.externalInputTokens,
+      outputTokens: sim.outputTokens + (live?.outputTokens ?? 0) + this.externalOutputTokens,
+      totalRequests: sim.totalRequests + (live?.totalRequests ?? 0) + this.externalTotalRequests,
+      providerReportedUsage: sim.providerReportedUsage || (live?.providerReportedUsage ?? false) || this.externalProviderReported,
+    };
+  }
+
   private effectiveIncurredCostUsd(): number {
-    return this.simClient.getTelemetry().incurredCostUsd + this.injectedLiveSpendUsd;
+    return this.combinedTelemetry().incurredCostUsd + this.injectedLiveSpendUsd + this.edgeCachedLiveSpendUsd;
   }
 
   /* -- central execution gate --------------------------------------------- */
@@ -571,7 +879,7 @@ export class TraceForgeMaasService {
     }
   }
 
-  private dispatch(capability: string, args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> | unknown {
+  private async dispatch(capability: string, args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     switch (capability) {
       case 'traceforge.capabilities.list': return this.capabilitiesList();
       case 'traceforge.system.status': return this.systemStatus();
@@ -598,7 +906,7 @@ export class TraceForgeMaasService {
 
   /* -- scenario / investigation helpers ------------------------------------ */
 
-  private requireOwnedScenario(scenarioId: string, context: MaasAuthContext, correlationId: string, capability: string): ScenarioRecord {
+  private async requireOwnedScenario(scenarioId: string, context: MaasAuthContext, correlationId: string, capability: string): Promise<ScenarioRecord> {
     const record = this.scenarios.get(scenarioId);
     if (record) {
       if (record.ownerActorId !== context.actorId) {
@@ -609,10 +917,10 @@ export class TraceForgeMaasService {
       }
       return record;
     }
-    // Cold-isolate path: rehydrate from the self-contained signed `scn_...`
-    // token minted by whichever isolate created the scenario. Invalid or
-    // unparseable tokens fail exactly as before.
-    const decoded = decodeScenarioToken(scenarioId);
+    // Cold-isolate path: rehydrate from the self-contained AES-256-GCM
+    // `scn_...` token minted by whichever isolate created the scenario.
+    // Invalid or unparseable tokens fail exactly as before.
+    const decoded = await decodeScenarioToken(scenarioId, this.sessionSecret);
     if (!decoded) {
       throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown scenario '${scenarioId}'.`, correlationId, capability);
     }
@@ -696,12 +1004,14 @@ export class TraceForgeMaasService {
       createdAt: new Date().toISOString(),
     };
     this.investigations.set(investigationId, stored);
+    edgeCachePut(edgeInvestigationKey(investigationId), stored);
+    edgeCachePut(edgeScenarioKey(scenarioRecord.scenarioId), { investigation: stored });
     return stored;
   }
 
-  private nextSignedInvestigationId(scenarioId: string, ownerActorId: string): string {
+  private async nextSignedInvestigationId(scenarioId: string, ownerActorId: string, extras: InvestigationTokenExtras = {}): Promise<string> {
     investigationSeq += 1;
-    return encodeInvestigationToken({ s: scenarioId, o: ownerActorId, q: investigationSeq });
+    return encodeInvestigationToken({ s: scenarioId, o: ownerActorId, q: investigationSeq, ...extras }, this.sessionSecret);
   }
 
   private async resolveInvestigation(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string, capability: string): Promise<InvestigationRecord> {
@@ -718,25 +1028,53 @@ export class TraceForgeMaasService {
         }
         return existing;
       }
-      // Cold-isolate path: rehydrate from the signed `inv_...` token. Only a
-      // valid token hydrates; anything else fails exactly as before.
-      const decoded = decodeInvestigationToken(investigationId);
+      // Cold-isolate path: rehydrate from the AES-256-GCM `inv_...` token.
+      // Only a valid token hydrates; anything else fails exactly as before.
+      const decoded = await decodeInvestigationToken(investigationId, this.sessionSecret);
       if (!decoded) {
         throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${investigationId}'.`, correlationId, capability);
       }
       if (decoded.o !== context.actorId) {
         throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${investigationId}' belongs to another actor.`, correlationId, capability);
       }
-      const scenarioRecord = this.requireOwnedScenario(decoded.s, context, correlationId, capability);
-      return this.diagnoseAndStoreInvestigation(investigationId, scenarioRecord, context.actorId);
+      // Same-colo edge fast path: the exact completed record (LIVE_API or
+      // simulated) may already be cached — restore it with zero new API calls.
+      const cached = await edgeCacheGet<unknown>(edgeInvestigationKey(investigationId));
+      if (isInvestigationRecord(cached) && cached.ownerActorId === context.actorId && cached.investigationId === investigationId) {
+        this.investigations.set(investigationId, cached);
+        return cached;
+      }
+      const scenarioRecord = await this.requireOwnedScenario(decoded.s, context, correlationId, capability);
+      // Populate the session bench deterministically when this cold isolate
+      // has logged no probes yet (needed for history/evaluation views).
+      const stored = await this.diagnoseAndStoreInvestigation(investigationId, scenarioRecord, context.actorId);
+      // Token-carried completed fields win: a LIVE_API investigation started
+      // on Isolate A still reports operationalMode LIVE_API (and its exact
+      // diagnosis/telemetry) on Isolate B without a second live API call.
+      if (decoded.m !== undefined) stored.operationalMode = decoded.m;
+      if (decoded.t !== undefined) stored.turns = decoded.t;
+      if (decoded.d !== undefined) stored.proposedDiagnosis = decoded.d;
+      if (decoded.src !== undefined) stored.diagnosisSource = decoded.src;
+      if (decoded.u !== undefined) stored.telemetry = decoded.u;
+      return stored;
     }
-    const owned = this.requireOwnedScenario(scenarioId as string, context, correlationId, capability);
+    const owned = await this.requireOwnedScenario(scenarioId as string, context, correlationId, capability);
     const record = [...this.investigations.values()].filter((r) => r.scenarioId === owned.scenarioId).pop();
     if (record) {
       if (record.ownerActorId !== context.actorId) {
         throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${record.investigationId}' belongs to another actor.`, correlationId, capability);
       }
       return record;
+    }
+    // Same-colo edge fast path for scenario-only lookups: restore the exact
+    // cached LIVE_API record when the caller passes only a scenarioId.
+    const cachedByScenario = await edgeCacheGet<unknown>(edgeScenarioKey(owned.scenarioId));
+    if (isEdgeCachedScenario(cachedByScenario) && isInvestigationRecord(cachedByScenario.investigation)) {
+      const inv = cachedByScenario.investigation;
+      if (inv.ownerActorId === context.actorId && inv.scenarioId === owned.scenarioId) {
+        this.investigations.set(inv.investigationId, inv);
+        return inv;
+      }
     }
     // Cold-isolate path: the scenario hydrated from a foreign `scn_...` token
     // (never created in this isolate's map) carries no investigation yet, so
@@ -745,7 +1083,7 @@ export class TraceForgeMaasService {
     if (!owned.hydratedFromToken) {
       throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${scenarioId}'.`, correlationId, capability);
     }
-    return this.diagnoseAndStoreInvestigation(this.nextSignedInvestigationId(owned.scenarioId, context.actorId), owned, context.actorId);
+    return this.diagnoseAndStoreInvestigation(await this.nextSignedInvestigationId(owned.scenarioId, context.actorId), owned, context.actorId);
   }
 
   private issueReceipt(capability: string, targetEntityId: string, assertions: string[], summary: string, correlationId: string): MaasVerificationReceipt {
@@ -779,17 +1117,42 @@ export class TraceForgeMaasService {
     };
   }
 
-  private modelsStatus(): unknown {
-    const status = this.simClient.status();
+  private async modelsStatus(): Promise<unknown> {
+    if (!this.liveClient) {
+      const status = this.simClient.status();
+      return {
+        spark: { model: 'muse-spark-1.3', operationalMode: status.sparkMode, liveVerified: status.liveVerified, executionSource: 'Deterministic Virtual Lab', liveCredentialConfigured: false },
+        sam: { model: 'sam-3.1', operationalMode: status.samMode, executionSource: 'Static Reference Fixture', note: 'Live SAM 3.1 deferred; static KiCad fixture overlays labeled STATIC_FIXTURE.' },
+        transparencyNote: 'SIMULATED = deterministic mock; LIVE_API only after a verified real response. Simulated results are never presented as live inference.',
+      };
+    }
+    // Explicit spending control: this read-only tool NEVER calls
+    // `live.chat(...)` — paid inference is only triggered by an explicit
+    // `mode: "live"` investigation or a browser `/api/meta/chat` call. The
+    // live-verified flag comes from this isolate's client plus the
+    // edge-cached runtime snapshot persisted by real live calls.
+    await this.refreshEdgeRuntimeSnapshot();
+    const status = this.liveClient.status();
+    const verified = status.liveVerified || this.edgeLiveVerified;
+    const operationalMode: OperationalMode = verified ? 'LIVE_API' : 'UNVERIFIED';
+    const executionSource = 'Live Muse Spark 1.3';
     return {
-      spark: { model: 'muse-spark-1.3', operationalMode: status.sparkMode, liveVerified: status.liveVerified },
-      sam: { model: 'sam-3.1', operationalMode: status.samMode, note: 'Live SAM 3.1 deferred; static KiCad fixture overlays labeled STATIC_FIXTURE.' },
+      spark: {
+        model: 'muse-spark-1.3',
+        operationalMode,
+        liveVerified: verified,
+        executionSource,
+        liveCredentialConfigured: true,
+        ...(this.liveVerificationError ? { error: this.liveVerificationError } : {}),
+      },
+      sam: { model: 'sam-3.1', operationalMode: status.samMode, executionSource: 'Static Reference Fixture', note: 'Live SAM 3.1 deferred; static KiCad fixture overlays labeled STATIC_FIXTURE.' },
       transparencyNote: 'SIMULATED = deterministic mock; LIVE_API only after a verified real response. Simulated results are never presented as live inference.',
     };
   }
 
-  private budgetStatus(): unknown {
-    const telemetry = this.simClient.getTelemetry();
+  private async budgetStatus(): Promise<unknown> {
+    await this.refreshEdgeRuntimeSnapshot();
+    const telemetry = this.combinedTelemetry();
     const incurred = this.effectiveIncurredCostUsd();
     return {
       startingBalanceUsd: STARTING_PROMOTIONAL_BALANCE_USD,
@@ -800,7 +1163,7 @@ export class TraceForgeMaasService {
       lastVerifiedBalanceUsd: LAST_VERIFIED_BALANCE_USD,
       lastVerifiedConsumedUsd: LAST_VERIFIED_CONSUMED_USD,
       lastVerifiedTimestamp: LAST_VERIFIED_TIMESTAMP,
-      verifiedNote: 'Verified $132.38 balance ($14.88 consumed across Muse Code CLI + live API; $85.12 remaining of $100.00 authorized budget) as of 2026-10-26T18:49:40-05:00.',
+      verifiedNote: 'Verified $122.78 balance ($24.48 consumed across Muse Code CLI + live API; $75.52 remaining of $100.00 authorized budget) as of 2026-10-26T20:08:24-05:00.',
       verifiedRemainingBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD - LAST_VERIFIED_CONSUMED_USD,
       ledger: {
         incurredCostUsd: incurred,
@@ -810,8 +1173,9 @@ export class TraceForgeMaasService {
         totalRequests: telemetry.totalRequests,
         providerReportedUsage: telemetry.providerReportedUsage,
       },
+      ledgerScopeNote: 'ledger tracks runtime Meta API calls observed by this Worker isolate/colo since deployment, while lastVerifiedConsumedUsd ($24.48) is the provider-confirmed cumulative consumption across Muse Code CLI and runtime API.',
       remainingBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD - incurred,
-      safetyThresholdBreached: incurred >= BUDGET_SAFETY_THRESHOLD_USD,
+      safetyThresholdBreached: this.isBudgetSafetyBreached(),
     };
   }
 
@@ -876,7 +1240,7 @@ export class TraceForgeMaasService {
     return 'explicit';
   }
 
-  private createSessionForActor(boardId: string, faultSelector: string, ownerActorId: string): ScenarioRecord {
+  private async createSessionForActor(boardId: string, faultSelector: string, ownerActorId: string): Promise<ScenarioRecord> {
     const reference = getReferenceBoard(boardId);
     if (!reference) {
       throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown board '${boardId}'.`, createMaasCorrelationId(), 'traceforge.scenarios.create');
@@ -899,11 +1263,12 @@ export class TraceForgeMaasService {
       faultId = fault.faultId;
     }
     const session = createVirtualSession(boardId, faultId);
-    // Self-contained signed id: board/fault indexes (never readable strings),
-    // owner, expiry, and sequence — XOR-masked hex plus an FNV-1a tag, so any
-    // cold isolate can verify and rehydrate without shared state. The fault
-    // index is read back from the session ground truth so `random` selectors
-    // rehydrate to the exact injected fault.
+    // Self-contained AES-256-GCM id: board/fault indexes (never readable
+    // strings), owner, expiry, and sequence — authenticated encryption plus
+    // an HMAC-SHA-256 tag, so any cold isolate with the session secret can
+    // verify and rehydrate without shared state. The fault index is read
+    // back from the session ground truth so `random` selectors rehydrate to
+    // the exact injected fault.
     const boards = listReferenceBoards();
     const boardIdx = boards.findIndex((b) => b.boardId === boardId);
     const groundTruth = session.getGroundTruth();
@@ -912,7 +1277,7 @@ export class TraceForgeMaasService {
       : -1;
     const expiresAtMs = Date.now() + this.sessionTtlMs;
     scenarioSeq += 1;
-    const scenarioId = encodeScenarioToken({ b: boardIdx, f: faultIdx, o: ownerActorId, x: expiresAtMs, q: scenarioSeq });
+    const scenarioId = await encodeScenarioToken({ b: boardIdx, f: faultIdx, o: ownerActorId, x: expiresAtMs, q: scenarioSeq }, this.sessionSecret);
     const record: ScenarioRecord = {
       scenarioId,
       boardId,
@@ -928,11 +1293,11 @@ export class TraceForgeMaasService {
     return record;
   }
 
-  private scenariosCreate(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): unknown {
+  private async scenariosCreate(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     const capability = 'traceforge.scenarios.create';
     const boardId = requireString(args, 'boardId', correlationId, capability);
     const faultSelector = asString(args['faultSelector']) ?? 'random';
-    const record = this.createSessionForActor(boardId, faultSelector, context.actorId);
+    const record = await this.createSessionForActor(boardId, faultSelector, context.actorId);
     const agentView = record.session.getAgentView();
     const payload = {
       scenarioId: record.scenarioId,
@@ -956,12 +1321,12 @@ export class TraceForgeMaasService {
 
   /* -- measurements ----------------------------------------------------------- */
 
-  private measureVoltage(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): unknown {
+  private async measureVoltage(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     const capability = 'traceforge.measurements.voltage';
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const node = requireString(args, 'node', correlationId, capability);
     const refNode = asString(args['refNode']) ?? 'GND';
-    const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
     const session = this.requireUsableSession(record, correlationId, capability);
     this.checkProbeBudget(session, scenarioId, correlationId, capability);
     const resolved = session.resolveProbeNode(node);
@@ -1003,11 +1368,11 @@ export class TraceForgeMaasService {
     }
   }
 
-  private measureCurrent(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): unknown {
+  private async measureCurrent(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     const capability = 'traceforge.measurements.current';
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const componentId = requireString(args, 'componentId', correlationId, capability);
-    const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
     const session = this.requireUsableSession(record, correlationId, capability);
     this.checkProbeBudget(session, scenarioId, correlationId, capability);
     try {
@@ -1040,12 +1405,12 @@ export class TraceForgeMaasService {
     }
   }
 
-  private measureContinuity(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): unknown {
+  private async measureContinuity(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     const capability = 'traceforge.measurements.continuity';
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const probeA = requireString(args, 'probeA', correlationId, capability);
     const probeB = requireString(args, 'probeB', correlationId, capability);
-    const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
     const session = this.requireUsableSession(record, correlationId, capability);
     this.checkProbeBudget(session, scenarioId, correlationId, capability);
     const resolvedA = session.resolveProbeNode(probeA);
@@ -1082,10 +1447,10 @@ export class TraceForgeMaasService {
     }
   }
 
-  private measureHistory(args: Record<string, unknown>, context: MaasAuthContext): unknown {
+  private async measureHistory(args: Record<string, unknown>, context: MaasAuthContext): Promise<unknown> {
     const capability = 'traceforge.measurements.history';
     const scenarioId = requireString(args, 'scenarioId', createMaasCorrelationId(), capability);
-    const record = this.requireOwnedScenario(scenarioId, context, createMaasCorrelationId(), capability);
+    const record = await this.requireOwnedScenario(scenarioId, context, createMaasCorrelationId(), capability);
     const probeLog = record.session.getProbeLog();
     return {
       scenarioId,
@@ -1103,39 +1468,69 @@ export class TraceForgeMaasService {
     const capability = 'traceforge.investigations.start';
     const scenarioIdArg = asString(args['scenarioId']);
     const boardIdArg = asString(args['boardId']);
-    const mode = asString(args['mode']) ?? 'simulated';
+    const explicitMode = asString(args['mode']);
+    let mode: string;
+    if (explicitMode === 'simulated' || explicitMode === 'live') {
+      mode = explicitMode;
+    } else if (explicitMode !== undefined) {
+      throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', `Invalid mode '${explicitMode}': expected 'simulated' or 'live'.`, correlationId, capability);
+    } else {
+      // Explicit live-AI spending control: an omitted `mode` ALWAYS defaults
+      // to 'simulated' (non-billable Virtual Lab execution, $0.00), even when
+      // a live client is attached. Only an explicit `mode: "live"` argument
+      // can trigger paid `muse-spark-1.3` inference.
+      mode = 'simulated';
+    }
     if (!scenarioIdArg && !boardIdArg) {
       throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', 'Either scenarioId or boardId is required.', correlationId, capability);
     }
-    if (mode !== 'simulated' && mode !== 'live') {
-      throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', `Invalid mode '${mode}': expected 'simulated' or 'live'.`, correlationId, capability);
-    }
     let record: ScenarioRecord;
     if (scenarioIdArg) {
-      record = this.requireOwnedScenario(scenarioIdArg, context, correlationId, capability);
+      record = await this.requireOwnedScenario(scenarioIdArg, context, correlationId, capability);
       this.requireUsableSession(record, correlationId, capability);
     } else {
-      const created = this.createSessionForActor(boardIdArg as string, 'random', context.actorId);
+      const created = await this.createSessionForActor(boardIdArg as string, 'random', context.actorId);
       record = created;
     }
     if (mode === 'live') {
       if (!context.scopes.includes('traceforge:live_inference:execute')) {
         throw new MaasToolError('MAAS_AUTHORIZATION_DENIED', `Actor '${context.actorId}' lacks required scope 'traceforge:live_inference:execute' for live inference.`, correlationId, capability);
       }
-      if (this.effectiveIncurredCostUsd() >= BUDGET_SAFETY_THRESHOLD_USD) {
+      if (this.isBudgetSafetyBreached()) {
         throw new MaasToolError('MAAS_BUDGET_THRESHOLD_EXCEEDED', `Live inference blocked: incurred cost $${this.effectiveIncurredCostUsd().toFixed(2)} reached the $${BUDGET_SAFETY_THRESHOLD_USD.toFixed(2)} safety threshold.`, correlationId, capability);
       }
       if (!this.liveClient) {
         throw new MaasToolError('MAAS_UPSTREAM_UNAVAILABLE', 'Live Muse Spark 1.3 upstream is not configured on this server (zero-cost simulated mode). No live call was attempted and no cost was incurred.', correlationId, capability);
       }
     }
-    const run = mode === 'live' && this.liveClient
-      ? await runAgenticDiagnosis(record.session, this.liveClient)
-      : await runAgenticDiagnosis(record.session, this.simClient);
+    let run: AgenticDiagnosisRun;
+    if (mode === 'live' && this.liveClient) {
+      // Live failures NEVER fall back to the simulator: an upstream error is
+      // reported honestly so simulated output is never shown as live.
+      try {
+        run = await runAgenticDiagnosis(record.session, this.liveClient);
+      } catch (err) {
+        throw new MaasToolError('MAAS_UPSTREAM_UNAVAILABLE', err instanceof Error ? err.message : String(err), correlationId, capability);
+      }
+      // A real live call succeeded: persist the lightweight runtime telemetry
+      // + verification snapshot so read-only tools report LIVE_API without
+      // invoking paid inference again.
+      this.edgeLiveVerified = true;
+      void this.persistEdgeRuntimeSnapshot();
+    } else {
+      run = await runAgenticDiagnosis(record.session, this.simClient);
+    }
     const probeLog = record.session.getProbeLog();
     const abnormalVoltages = probeLog.filter((p) => p.kind === 'voltage' && p.abnormal).map((p) => p.target);
     const shortedContinuities = probeLog.filter((p) => p.kind === 'resistance' && p.abnormal).map((p) => p.target);
-    const investigationId = this.nextSignedInvestigationId(record.scenarioId, context.actorId);
+    const executionSource = run.operationalMode === 'LIVE_API' ? 'Live Muse Spark 1.3' : 'Deterministic Virtual Lab';
+    const investigationId = await this.nextSignedInvestigationId(record.scenarioId, context.actorId, {
+      m: run.operationalMode,
+      t: run.turns,
+      d: run.proposedDiagnosis,
+      src: run.diagnosisSource,
+      u: run.telemetry,
+    });
     const stored: InvestigationRecord = {
       investigationId,
       scenarioId: record.scenarioId,
@@ -1152,12 +1547,19 @@ export class TraceForgeMaasService {
       createdAt: new Date().toISOString(),
     };
     this.investigations.set(investigationId, stored);
+    // Best-effort edge persistence so a cold isolate in the same colocation
+    // hydrates this exact completed record (LIVE_API included) with no new
+    // API call, even for scenarioId-only lookups.
+    edgeCachePut(edgeInvestigationKey(investigationId), stored);
+    edgeCachePut(edgeScenarioKey(record.scenarioId), { investigation: stored });
     // The response carries counts and telemetry only — never the withheld fault.
     const payload = {
       investigationId,
       scenarioId: record.scenarioId,
       boardId: record.boardId,
       operationalMode: run.operationalMode,
+      executionSource,
+      diagnosisSource: run.diagnosisSource,
       turns: run.turns,
       steps: run.steps.length,
       probesUsed: record.session.getToolCallsUsed(),
@@ -1179,6 +1581,8 @@ export class TraceForgeMaasService {
       scenarioId: record.scenarioId,
       status: 'completed' as const,
       operationalMode: record.operationalMode,
+      executionSource: record.operationalMode === 'LIVE_API' ? 'Live Muse Spark 1.3' : 'Deterministic Virtual Lab',
+      diagnosisSource: record.diagnosisSource,
       turns: record.turns,
       probesUsed: scenario?.session.getToolCallsUsed() ?? record.probeEvents.length,
       maxToolCalls: scenario?.session.maxToolCalls ?? MAX_TOOL_CALLS,
@@ -1208,6 +1612,7 @@ export class TraceForgeMaasService {
       classifiedEvidence: record.classifiedEvidence,
       verificationStatus: record.proposedDiagnosis.verificationStatus,
       operationalMode: record.operationalMode,
+      executionSource: record.operationalMode === 'LIVE_API' ? 'Live Muse Spark 1.3' : 'Deterministic Virtual Lab',
       diagnosisSource: record.diagnosisSource,
       telemetry: record.telemetry,
     };
@@ -1218,8 +1623,25 @@ export class TraceForgeMaasService {
   private async evaluationScore(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     const capability = 'traceforge.evaluation.score';
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
-    const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
     if (record.evaluated && record.scorecard) return record.scorecard;
+    // Same-colo edge fast path: a cold isolate restores the exact cached
+    // LIVE_API investigation + scorecard when the caller passes only a
+    // scenarioId — no second live API call, no re-probing.
+    if (record.hydratedFromToken) {
+      const cached = await edgeCacheGet<unknown>(edgeScenarioKey(scenarioId));
+      if (isEdgeCachedScenario(cached)) {
+        if (isInvestigationRecord(cached.investigation) && cached.investigation.ownerActorId === context.actorId && cached.investigation.scenarioId === scenarioId) {
+          this.investigations.set(cached.investigation.investigationId, cached.investigation);
+        }
+        if (cached.evaluated === true && cached.scorecard !== undefined) {
+          record.evaluated = true;
+          if (typeof cached.evaluatedAt === 'string') record.evaluatedAt = cached.evaluatedAt;
+          record.scorecard = cached.scorecard as Record<string, unknown>;
+          return record.scorecard;
+        }
+      }
+    }
     // Cold-isolate path: a scenario hydrated from a foreign `scn_...` token
     // arrives with zero local probes, so run the deterministic diagnosis here
     // (and persist it as the latest investigation) before scoring. Scenarios
@@ -1227,7 +1649,7 @@ export class TraceForgeMaasService {
     // `MAAS_INVESTIGATION_INCOMPLETE` below.
     if (record.hydratedFromToken && record.session.getProbeLog().length === 0) {
       await this.diagnoseAndStoreInvestigation(
-        this.nextSignedInvestigationId(record.scenarioId, context.actorId),
+        await this.nextSignedInvestigationId(record.scenarioId, context.actorId),
         record,
         context.actorId,
       );
@@ -1263,6 +1685,7 @@ export class TraceForgeMaasService {
         ...payload,
         verificationReceipt: this.issueReceipt(capability, scenarioId, ['nominal session evaluated: no fault present', 'scenario locked against further probing'], `Scenario ${scenarioId} evaluated: healthy board.`, correlationId),
       };
+      edgeCachePut(edgeScenarioKey(scenarioId), { evaluated: true, evaluatedAt: record.evaluatedAt, scorecard: record.scorecard });
       return record.scorecard;
     }
     const score = scoreDiagnosis({ componentRef, faultType, verificationStatus }, groundTruth, probeLog);
@@ -1288,6 +1711,12 @@ export class TraceForgeMaasService {
       },
       verificationReceipt: this.issueReceipt(capability, scenarioId, ['diagnosis scored against withheld HiddenFault', 'ground truth disclosed to owning actor only', 'scenario locked against further probing'], `Scenario ${scenarioId} scored ${score.totalScore}/100.`, correlationId),
     };
+    edgeCachePut(edgeScenarioKey(scenarioId), {
+      investigation: latestInvestigation,
+      evaluated: true,
+      evaluatedAt: record.evaluatedAt,
+      scorecard: record.scorecard,
+    });
     return record.scorecard;
   }
 
@@ -1295,7 +1724,7 @@ export class TraceForgeMaasService {
     const capability = 'traceforge.evaluation.report';
     const correlationId = createMaasCorrelationId();
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
-    const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
     // Cold-isolate path: score on this isolate first when the hydrated
     // scenario has never been evaluated here. Local scenarios still throw
     // `MAAS_INVESTIGATION_INCOMPLETE` when unevaluated.

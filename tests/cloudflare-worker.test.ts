@@ -9,7 +9,9 @@
  * Node.js built-in imports.
  */
 import { describe, expect, it } from 'vitest';
-import { createTraceForgeWorker, verifyPkceS256 } from '../worker/index';
+import { WORKER_DEFAULT_SCOPE, createTraceForgeWorker, verifyPkceS256 } from '../worker/index';
+import { MetaClient } from '../src/lib/meta-client';
+import { TraceForgeMaasService } from '../src/maas/tools';
 import workerSource from '../worker/index.ts?raw';
 
 const ORIGIN = 'https://traceforge-mcp-staging.workers.dev';
@@ -698,6 +700,287 @@ describe('Phase 5: cross-isolate scenario/investigation hydration', () => {
     expect(
       (crossed.envelope['result'] as { structuredContent: { code: string }; isError: boolean }).structuredContent.code,
     ).toBe('MAAS_CROSS_TENANT_ACCESS_DENIED');
+  });
+});
+
+describe('Phase 6: live mode via env.META_API_KEY', () => {
+  it('mints PKCE tokens carrying the live_inference scope', async () => {
+    expect(WORKER_DEFAULT_SCOPE).toContain('traceforge:live_inference:execute');
+    const { worker, client } = await registerClient();
+    const { scope } = await fullPkceToken({ worker, client });
+    expect(scope).toContain('traceforge:live_inference:execute');
+  });
+
+  it('attaches a live client when env.META_API_KEY is present without exposing the key', async () => {
+    const worker = createTraceForgeWorker();
+    expect(worker.getService().hasLiveClient()).toBe(false);
+    const res = await worker.fetch(new Request(workerUrl('/health')), { META_API_KEY: 'tf-test-server-key' });
+    expect(res.status).toBe(200);
+    expect(worker.getService().hasLiveClient()).toBe(true);
+    expect(JSON.stringify(await readJson(res))).not.toContain('tf-test-server-key');
+
+    const blank = createTraceForgeWorker();
+    await blank.fetch(new Request(workerUrl('/health')), { META_API_KEY: '   ' });
+    expect(blank.getService().hasLiveClient()).toBe(false);
+
+    const missing = createTraceForgeWorker();
+    await missing.fetch(new Request(workerUrl('/health')));
+    expect(missing.getService().hasLiveClient()).toBe(false);
+  });
+});
+
+describe('Phase 6: cross-isolate LIVE_API preservation', () => {
+  const LIVE_OPERATOR = { authorization: 'Bearer tf_operator_live_token' };
+
+  it('preserves LIVE_API investigation results across isolates without a second live call', async () => {
+    let liveCalls = 0;
+    const liveClient = new MetaClient({
+      mode: 'live',
+      apiKey: 'tf-test-live-key',
+      segmentationMode: 'static_fixture',
+      fetchFn: async () => {
+        liveCalls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [{
+              message: {
+                content: 'Stubbed live reasoning. FINAL_DIAGNOSIS: {"componentRef":"U1","faultType":"solder_bridge","verificationStatus":"confirmed","explanation":"Stubbed live verdict from canned upstream."}',
+              },
+            }],
+            usage: { prompt_tokens: 12, completion_tokens: 6 },
+          }),
+        };
+      },
+    });
+    const serviceA = new TraceForgeMaasService({ liveClient });
+    const created = (await serviceA.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+      LIVE_OPERATOR,
+    )) as { scenarioId: string };
+    const started = (await serviceA.executeTool(
+      'traceforge.investigations.start',
+      { scenarioId: created.scenarioId, mode: 'live' },
+      LIVE_OPERATOR,
+    )) as {
+      investigationId: string;
+      operationalMode: string;
+      executionSource: string;
+      diagnosisSource: string;
+      completed: boolean;
+    };
+    expect(started.completed).toBe(true);
+    expect(started.operationalMode).toBe('LIVE_API');
+    expect(started.executionSource).toBe('Live Muse Spark 1.3');
+    expect(liveCalls).toBeGreaterThan(0);
+
+    // The signed token is opaque hex: zero readable ground-truth strings.
+    expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(started.investigationId).not.toContain('f405-nrst-gnd-short');
+
+    // Cold isolate B has no live client, so any LIVE_API label it reports
+    // must come from the hydrated token — never a second live API call.
+    const serviceB = new TraceForgeMaasService();
+    expect(serviceB.hasLiveClient()).toBe(false);
+    const resultB = (await serviceB.executeTool(
+      'traceforge.investigations.result',
+      { investigationId: started.investigationId },
+      LIVE_OPERATOR,
+    )) as {
+      operationalMode: string;
+      executionSource: string;
+      diagnosisSource: string;
+      proposedDiagnosis: { componentRef: string; faultType: string };
+    };
+    expect(resultB.operationalMode).toBe('LIVE_API');
+    expect(resultB.executionSource).toBe('Live Muse Spark 1.3');
+    expect(resultB.diagnosisSource).toBe(started.diagnosisSource);
+    expect(resultB.proposedDiagnosis.componentRef).toBe('U1');
+
+    const statusB = (await serviceB.executeTool(
+      'traceforge.investigations.status',
+      { investigationId: started.investigationId },
+      LIVE_OPERATOR,
+    )) as { operationalMode: string; executionSource: string };
+    expect(statusB.operationalMode).toBe('LIVE_API');
+    expect(statusB.executionSource).toBe('Live Muse Spark 1.3');
+  });
+});
+
+describe('browser backend routes /api/meta/*', () => {
+  const CHAT_KEY = 'tf-test-worker-meta-key';
+
+  async function postMetaChat(
+    worker: ReturnType<typeof createTraceForgeWorker>,
+    body: unknown,
+    env?: Record<string, string>,
+  ): Promise<{ status: number; payload: Record<string, unknown> }> {
+    const res = await worker.fetch(
+      new Request(workerUrl('/api/meta/chat'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: typeof body === 'string' ? body : JSON.stringify(body),
+      }),
+      env as unknown as Parameters<ReturnType<typeof createTraceForgeWorker>['fetch']>[1],
+    );
+    return { status: res.status, payload: (await res.json()) as Record<string, unknown> };
+  }
+
+  it('GET /api/meta/status reports UNCONFIGURED vs live-ready without leaking the key', async () => {
+    const worker = createTraceForgeWorker();
+    const missing = await worker.fetch(new Request(workerUrl('/api/meta/status')));
+    expect(missing.status).toBe(200);
+    expect(await missing.json()).toEqual({ configured: false, mode: 'UNAVAILABLE' });
+
+    const configuredWorker = createTraceForgeWorker();
+    const ready = await configuredWorker.fetch(new Request(workerUrl('/api/meta/status')), { META_API_KEY: CHAT_KEY });
+    expect(ready.status).toBe(200);
+    expect(await ready.json()).toEqual({ configured: true, mode: 'UNVERIFIED' });
+  });
+
+  it('POST /api/meta/chat answers 503 without a key and never echoes one', async () => {
+    const worker = createTraceForgeWorker();
+    const { status, payload } = await postMetaChat(worker, { messages: [{ role: 'user', content: 'hi' }] });
+    expect(status).toBe(503);
+    expect(payload['error']).toContain('not configured on the local server proxy');
+  });
+
+  it('POST /api/meta/chat forwards with the key, records usage, and scrubs it', async () => {
+    const worker = createTraceForgeWorker();
+    const seen: string[] = [];
+    const originalFetch = globalThis.fetch;
+    (globalThis as { fetch?: unknown }).fetch = async (url: unknown, init?: { body?: string }) => {
+      if (typeof url === 'string' && url.includes('api.meta.ai')) {
+        seen.push(String(init?.body ?? ''));
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: 'live answer', tool_calls: [] } }],
+          usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return originalFetch(url as string, init as RequestInit);
+    };
+    try {
+      const { status, payload } = await postMetaChat(
+        worker,
+        { messages: [{ role: 'user', content: 'Hello, Forge!' }], maxTokens: 32, effort: 'low' },
+        { META_API_KEY: CHAT_KEY },
+      );
+      expect(status).toBe(200);
+      expect(payload['content']).toBe('live answer');
+      expect(payload['model']).toBe('muse-spark-1.3');
+      expect(JSON.stringify(payload)).not.toContain(CHAT_KEY);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toContain('"reasoning_effort":"low"');
+      expect(seen[0]).not.toContain(CHAT_KEY);
+
+      const budget = (await worker.getService().executeTool('traceforge.budget.status', {}, {})) as {
+        ledger: { incurredCostUsd: number; totalRequests: number; providerReportedUsage: boolean };
+      };
+      expect(budget.ledger.totalRequests).toBe(1);
+      expect(budget.ledger.incurredCostUsd).toBeGreaterThan(0);
+      expect(budget.ledger.providerReportedUsage).toBe(true);
+
+      const models = (await worker.getService().executeTool('traceforge.models.status', {}, {})) as {
+        spark: { operationalMode: string; liveVerified: boolean };
+      };
+      expect(models.spark.operationalMode).toBe('LIVE_API');
+      expect(models.spark.liveVerified).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('POST /api/meta/chat is blocked by the $95.00 budget safety stop', async () => {
+    const worker = createTraceForgeWorker();
+    worker.getService().injectLiveSpendForTesting(96);
+    const { status, payload } = await postMetaChat(
+      worker,
+      { messages: [{ role: 'user', content: 'hi' }] },
+      { META_API_KEY: CHAT_KEY },
+    );
+    expect(status).toBe(429);
+    expect(String(payload['error'])).toContain('$95.00');
+  });
+
+  it('POST /api/meta/segment answers 503 without a key', async () => {
+    const worker = createTraceForgeWorker();
+    const res = await worker.fetch(
+      new Request(workerUrl('/api/meta/segment'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: {} }),
+      }),
+    );
+    expect(res.status).toBe(503);
+  });
+});
+
+describe('OAuth per-client actor isolation on the Worker', () => {
+  it('binds each clientId to its own actorId with only granted scopes', async () => {
+    const worker = createTraceForgeWorker();
+    const first = await worker.fetch(
+      new Request(workerUrl('/oauth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirect_uris: [`${ORIGIN}/callback`] }),
+      }),
+    );
+    const clientA = (await readJson(first)) as { client_id: string; redirect_uris: string[] };
+    const second = await worker.fetch(
+      new Request(workerUrl('/oauth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirect_uris: [`${ORIGIN}/callback`] }),
+      }),
+    );
+    const clientB = (await readJson(second)) as { client_id: string; redirect_uris: string[] };
+    const { accessToken: tokenA } = await fullPkceToken({ worker, client: { ...clientA, grant_types: ['authorization_code'], token_endpoint_auth_method: 'none' } });
+    const { accessToken: tokenB } = await fullPkceToken({ worker, client: { ...clientB, grant_types: ['authorization_code'], token_endpoint_auth_method: 'none' } });
+
+    const created = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.scenarios.create',
+      arguments: { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+    }, `Bearer ${tokenA}`);
+    const scenarioId = (created.envelope['result'] as { structuredContent: { scenarioId: string } }).structuredContent.scenarioId;
+    expect(scenarioId.startsWith('scn_')).toBe(true);
+
+    const crossed = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.measurements.voltage',
+      arguments: { scenarioId, node: 'U1-14' },
+    }, `Bearer ${tokenB}`);
+    expect(
+      (crossed.envelope['result'] as { structuredContent: { code: string } }).structuredContent.code,
+    ).toBe('MAAS_CROSS_TENANT_ACCESS_DENIED');
+
+    worker.getService().getKillSwitch().revokeToken(tokenA);
+    const revoked = await mcpCall(worker, 'tools/call', {
+      name: 'traceforge.measurements.voltage',
+      arguments: { scenarioId, node: 'U1-14' },
+    }, `Bearer ${tokenA}`);
+    expect(
+      (revoked.envelope['result'] as { structuredContent: { code: string } }).structuredContent.code,
+    ).toBe('MAAS_CREDENTIALS_REVOKED');
+    worker.getService().getKillSwitch().restoreToken(tokenA);
+  });
+
+  it('rotates the stateless signing secret', async () => {
+    const { worker, client } = await registerClient();
+    const { accessToken } = await fullPkceToken({ worker, client });
+    const ok = await mcpCall(worker, 'tools/call', { name: 'traceforge.system.status', arguments: {} }, `Bearer ${accessToken}`);
+    expect((ok.envelope['result'] as { isError: boolean }).isError ?? false).toBe(false);
+    // A worker holding a different secret rejects the foreign stateless token.
+    const rotated = createTraceForgeWorker({ signingSecret: 'tf-worker-rotated-signing-secret' });
+    const denied = await mcpCall(rotated, 'tools/call', { name: 'traceforge.system.status', arguments: {} }, `Bearer ${accessToken}`);
+    expect(
+      (denied.envelope['result'] as { structuredContent: { code: string } }).structuredContent.code,
+    ).toBe('MAAS_AUTHENTICATION_REQUIRED');
+    // Same-worker rotation keeps fresh PKCE flows working.
+    worker.rotateSigningSecret('tf-worker-fresh-secret');
+    const { accessToken: fresh } = await fullPkceToken({ worker, client });
+    const freshOk = await mcpCall(worker, 'tools/call', { name: 'traceforge.system.status', arguments: {} }, `Bearer ${fresh}`);
+    expect((freshOk.envelope['result'] as { isError: boolean }).isError ?? false).toBe(false);
   });
 });
 
