@@ -46,6 +46,7 @@ export const WORKER_DEFAULT_SCOPE = [
   'traceforge:investigations:read',
   'traceforge:investigations:execute',
   'traceforge:evaluation:score',
+  'traceforge:live_inference:execute',
 ].join(' ');
 
 /** All MaaS scopes advertised in RFC 9728 / RFC 8414 discovery metadata. */
@@ -533,6 +534,12 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     const method = request.method.toUpperCase();
     const correlationId = createMaasCorrelationId();
     const origin = url.origin;
+    // Live Muse Spark 1.3 wiring: when the Worker environment provides a
+    // server-side META_API_KEY, attach it to the MaaS service live client so
+    // `mode: "live"` investigations execute against the real upstream.
+    if (env?.['META_API_KEY'] && !service.hasLiveClient()) {
+      service.configureLiveApiKey(env['META_API_KEY'] as string);
+    }
 
     if (method === 'OPTIONS') {
       return emptyResponse(204, correlationId);

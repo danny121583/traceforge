@@ -9,7 +9,9 @@
  * Node.js built-in imports.
  */
 import { describe, expect, it } from 'vitest';
-import { createTraceForgeWorker, verifyPkceS256 } from '../worker/index';
+import { WORKER_DEFAULT_SCOPE, createTraceForgeWorker, verifyPkceS256 } from '../worker/index';
+import { MetaClient } from '../src/lib/meta-client';
+import { TraceForgeMaasService } from '../src/maas/tools';
 import workerSource from '../worker/index.ts?raw';
 
 const ORIGIN = 'https://traceforge-mcp-staging.workers.dev';
@@ -698,6 +700,112 @@ describe('Phase 5: cross-isolate scenario/investigation hydration', () => {
     expect(
       (crossed.envelope['result'] as { structuredContent: { code: string }; isError: boolean }).structuredContent.code,
     ).toBe('MAAS_CROSS_TENANT_ACCESS_DENIED');
+  });
+});
+
+describe('Phase 6: live mode via env.META_API_KEY', () => {
+  it('mints PKCE tokens carrying the live_inference scope', async () => {
+    expect(WORKER_DEFAULT_SCOPE).toContain('traceforge:live_inference:execute');
+    const { worker, client } = await registerClient();
+    const { scope } = await fullPkceToken({ worker, client });
+    expect(scope).toContain('traceforge:live_inference:execute');
+  });
+
+  it('attaches a live client when env.META_API_KEY is present without exposing the key', async () => {
+    const worker = createTraceForgeWorker();
+    expect(worker.getService().hasLiveClient()).toBe(false);
+    const res = await worker.fetch(new Request(workerUrl('/health')), { META_API_KEY: 'tf-test-server-key' });
+    expect(res.status).toBe(200);
+    expect(worker.getService().hasLiveClient()).toBe(true);
+    expect(JSON.stringify(await readJson(res))).not.toContain('tf-test-server-key');
+
+    const blank = createTraceForgeWorker();
+    await blank.fetch(new Request(workerUrl('/health')), { META_API_KEY: '   ' });
+    expect(blank.getService().hasLiveClient()).toBe(false);
+
+    const missing = createTraceForgeWorker();
+    await missing.fetch(new Request(workerUrl('/health')));
+    expect(missing.getService().hasLiveClient()).toBe(false);
+  });
+});
+
+describe('Phase 6: cross-isolate LIVE_API preservation', () => {
+  const LIVE_OPERATOR = { authorization: 'Bearer tf_operator_live_token' };
+
+  it('preserves LIVE_API investigation results across isolates without a second live call', async () => {
+    let liveCalls = 0;
+    const liveClient = new MetaClient({
+      mode: 'live',
+      apiKey: 'tf-test-live-key',
+      segmentationMode: 'static_fixture',
+      fetchFn: async () => {
+        liveCalls += 1;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            choices: [{
+              message: {
+                content: 'Stubbed live reasoning. FINAL_DIAGNOSIS: {"componentRef":"U1","faultType":"solder_bridge","verificationStatus":"confirmed","explanation":"Stubbed live verdict from canned upstream."}',
+              },
+            }],
+            usage: { prompt_tokens: 12, completion_tokens: 6 },
+          }),
+        };
+      },
+    });
+    const serviceA = new TraceForgeMaasService({ liveClient });
+    const created = (await serviceA.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+      LIVE_OPERATOR,
+    )) as { scenarioId: string };
+    const started = (await serviceA.executeTool(
+      'traceforge.investigations.start',
+      { scenarioId: created.scenarioId, mode: 'live' },
+      LIVE_OPERATOR,
+    )) as {
+      investigationId: string;
+      operationalMode: string;
+      executionSource: string;
+      diagnosisSource: string;
+      completed: boolean;
+    };
+    expect(started.completed).toBe(true);
+    expect(started.operationalMode).toBe('LIVE_API');
+    expect(started.executionSource).toBe('Live Muse Spark 1.3');
+    expect(liveCalls).toBeGreaterThan(0);
+
+    // The signed token is opaque hex: zero readable ground-truth strings.
+    expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(started.investigationId).not.toContain('f405-nrst-gnd-short');
+
+    // Cold isolate B has no live client, so any LIVE_API label it reports
+    // must come from the hydrated token — never a second live API call.
+    const serviceB = new TraceForgeMaasService();
+    expect(serviceB.hasLiveClient()).toBe(false);
+    const resultB = (await serviceB.executeTool(
+      'traceforge.investigations.result',
+      { investigationId: started.investigationId },
+      LIVE_OPERATOR,
+    )) as {
+      operationalMode: string;
+      executionSource: string;
+      diagnosisSource: string;
+      proposedDiagnosis: { componentRef: string; faultType: string };
+    };
+    expect(resultB.operationalMode).toBe('LIVE_API');
+    expect(resultB.executionSource).toBe('Live Muse Spark 1.3');
+    expect(resultB.diagnosisSource).toBe(started.diagnosisSource);
+    expect(resultB.proposedDiagnosis.componentRef).toBe('U1');
+
+    const statusB = (await serviceB.executeTool(
+      'traceforge.investigations.status',
+      { investigationId: started.investigationId },
+      LIVE_OPERATOR,
+    )) as { operationalMode: string; executionSource: string };
+    expect(statusB.operationalMode).toBe('LIVE_API');
+    expect(statusB.executionSource).toBe('Live Muse Spark 1.3');
   });
 });
 

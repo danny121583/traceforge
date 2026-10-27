@@ -100,13 +100,30 @@ export function aiModeBadge(
   label: string;
   className: string;
 } {
-  if (options?.liveModeError) return { label: 'AI Mode: Live Unavailable', className: 'tf-chip unavailable' };
-  if (sparkMode === 'RECORDED_LIVE_REPLAY') return { label: 'Recorded Live Replay (Muse Spark 1.3)', className: 'tf-chip sim' };
-  if (sparkMode === 'LIVE_API') return { label: 'AI Mode: Live API', className: 'tf-chip live' };
-  if (sparkMode === 'UNVERIFIED' && options?.proxyConfigured) return { label: 'AI Mode: Live AI (Ready)', className: 'tf-chip live' };
-  if (sparkMode === 'UNVERIFIED') return { label: 'AI Mode: Unverified', className: 'tf-chip unverified' };
-  if (sparkMode === 'UNAVAILABLE') return { label: 'AI Mode: Unavailable', className: 'tf-chip unavailable' };
-  return { label: 'AI Mode: Simulated', className: 'tf-chip sim' };
+  if (options?.liveModeError) return { label: 'AI Service Unavailable', className: 'tf-chip unavailable' };
+  if (sparkMode === 'RECORDED_LIVE_REPLAY') return { label: 'Recorded Investigation', className: 'tf-chip sim' };
+  if (sparkMode === 'LIVE_API') return { label: 'Live AI', className: 'tf-chip live' };
+  if (sparkMode === 'UNVERIFIED' && options?.proxyConfigured) return { label: 'Live AI (Ready)', className: 'tf-chip live' };
+  if (sparkMode === 'UNVERIFIED') return { label: 'Live AI (Unverified)', className: 'tf-chip unverified' };
+  if (sparkMode === 'UNAVAILABLE') return { label: 'AI Service Unavailable', className: 'tf-chip unavailable' };
+  return { label: 'Virtual Lab', className: 'tf-chip sim' };
+}
+
+/**
+ * Technical execution-source string for the Technology drawer. Exact labels:
+ * 'AI Service Unavailable' | 'Live Muse Spark 1.3' |
+ * 'Recorded Live Investigation' | 'Static Reference Fixture' |
+ * 'Deterministic Virtual Lab'.
+ */
+export function executionSourceLabel(
+  mode: OperationalMode | 'RECORDED_LIVE_REPLAY',
+  options?: { liveModeError?: string | null },
+): string {
+  if (options?.liveModeError || mode === 'UNAVAILABLE') return 'AI Service Unavailable';
+  if (mode === 'LIVE_API') return 'Live Muse Spark 1.3';
+  if (mode === 'RECORDED_LIVE_REPLAY') return 'Recorded Live Investigation';
+  if (mode === 'STATIC_FIXTURE') return 'Static Reference Fixture';
+  return 'Deterministic Virtual Lab';
 }
 
 /** Progressive investigation lifecycle (Phase 3): one visible stage at a time. */

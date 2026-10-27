@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   aiModeBadge,
+  executionSourceLabel,
   extractProbeTargetFromStepSummary,
   formatActivitySummary,
   formatLifecycleStatus,
@@ -106,11 +107,11 @@ describe('plain-language activity summary', () => {
 
 describe('AI mode badge', () => {
   it('labels every operational mode truthfully with the matching chip class', () => {
-    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'AI Mode: Live API', className: 'tf-chip live' });
-    expect(aiModeBadge('SIMULATED')).toEqual({ label: 'AI Mode: Simulated', className: 'tf-chip sim' });
-    expect(aiModeBadge('STATIC_FIXTURE')).toEqual({ label: 'AI Mode: Simulated', className: 'tf-chip sim' });
-    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'AI Mode: Unverified', className: 'tf-chip unverified' });
-    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Mode: Unavailable', className: 'tf-chip unavailable' });
+    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'Live AI', className: 'tf-chip live' });
+    expect(aiModeBadge('SIMULATED')).toEqual({ label: 'Virtual Lab', className: 'tf-chip sim' });
+    expect(aiModeBadge('STATIC_FIXTURE')).toEqual({ label: 'Virtual Lab', className: 'tf-chip sim' });
+    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'Live AI (Unverified)', className: 'tf-chip unverified' });
+    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Service Unavailable', className: 'tf-chip unavailable' });
   });
 
   it('never exposes model branding in the header badge label', () => {
@@ -120,39 +121,51 @@ describe('AI mode badge', () => {
     }
   });
 
-  it('keeps every legacy return value unchanged when options are omitted', () => {
-    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'AI Mode: Live API', className: 'tf-chip live' });
-    expect(aiModeBadge('SIMULATED')).toEqual({ label: 'AI Mode: Simulated', className: 'tf-chip sim' });
-    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'AI Mode: Unverified', className: 'tf-chip unverified' });
-    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Mode: Unavailable', className: 'tf-chip unavailable' });
+  it('keeps every return value unchanged when options are omitted', () => {
+    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'Live AI', className: 'tf-chip live' });
+    expect(aiModeBadge('SIMULATED')).toEqual({ label: 'Virtual Lab', className: 'tf-chip sim' });
+    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'Live AI (Unverified)', className: 'tf-chip unverified' });
+    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Service Unavailable', className: 'tf-chip unavailable' });
     expect(aiModeBadge('RECORDED_LIVE_REPLAY')).toEqual({
-      label: 'Recorded Live Replay (Muse Spark 1.3)',
+      label: 'Recorded Investigation',
       className: 'tf-chip sim',
     });
   });
 
   it('reports Live AI (Ready) when UNVERIFIED with a configured proxy', () => {
     expect(aiModeBadge('UNVERIFIED', { proxyConfigured: true })).toEqual({
-      label: 'AI Mode: Live AI (Ready)',
+      label: 'Live AI (Ready)',
       className: 'tf-chip live',
     });
-    // Explicit false (or omitted) keeps the legacy Unverified badge.
+    // Explicit false (or omitted) keeps the Unverified badge.
     expect(aiModeBadge('UNVERIFIED', { proxyConfigured: false })).toEqual({
-      label: 'AI Mode: Unverified',
+      label: 'Live AI (Unverified)',
       className: 'tf-chip unverified',
     });
   });
 
-  it('reports Live Unavailable whenever a liveModeError is present (mode never silently reverts)', () => {
+  it('reports AI Service Unavailable whenever a liveModeError is present (mode never silently reverts)', () => {
     const err = 'proxy unavailable';
     for (const mode of ['LIVE_API', 'UNVERIFIED', 'UNAVAILABLE', 'SIMULATED'] as const) {
       expect(aiModeBadge(mode, { proxyConfigured: true, liveModeError: err })).toEqual({
-        label: 'AI Mode: Live Unavailable',
+        label: 'AI Service Unavailable',
         className: 'tf-chip unavailable',
       });
     }
     // Null/empty errors behave exactly like omitted options.
     expect(aiModeBadge('UNVERIFIED', { liveModeError: null })).toEqual(aiModeBadge('UNVERIFIED'));
+  });
+});
+
+describe('executionSourceLabel', () => {
+  it('returns the five exact technical execution source strings', () => {
+    expect(executionSourceLabel('UNAVAILABLE')).toBe('AI Service Unavailable');
+    expect(executionSourceLabel('SIMULATED', { liveModeError: 'proxy down' })).toBe('AI Service Unavailable');
+    expect(executionSourceLabel('LIVE_API')).toBe('Live Muse Spark 1.3');
+    expect(executionSourceLabel('RECORDED_LIVE_REPLAY')).toBe('Recorded Live Investigation');
+    expect(executionSourceLabel('STATIC_FIXTURE')).toBe('Static Reference Fixture');
+    expect(executionSourceLabel('SIMULATED')).toBe('Deterministic Virtual Lab');
+    expect(executionSourceLabel('UNVERIFIED')).toBe('Deterministic Virtual Lab');
   });
 });
 

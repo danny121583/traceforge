@@ -25,7 +25,7 @@ import {
   type ProbeMeasurement,
 } from './lib/diagnostic-parser';
 import { SAMPLE_BOARDS, getBoard } from './data/samples';
-import type { ClientMode, UsageTelemetry } from './lib/meta-client';
+import type { ClientMode, OperationalMode, UsageTelemetry } from './lib/meta-client';
 import {
   createVirtualSession,
   getReferenceBoard,
@@ -42,6 +42,7 @@ import {
 } from './lib/circuit-simulator';
 import {
   aiModeBadge,
+  executionSourceLabel,
   extractProbeTargetFromStepSummary,
   formatActivitySummary,
   formatLifecycleStatus,
@@ -67,7 +68,7 @@ interface StreamLine {
 
 /** Phase 2: shown when live mode stays selected but the proxy has no key. Mode is never reset. */
 const LIVE_MODE_UNAVAILABLE_MESSAGE =
-  'Live Meta API proxy is unavailable or META_API_KEY is not configured on the server. Live AI mode remains selected — configure META_API_KEY or switch back to Simulated mode.';
+  'Live Meta API proxy is unavailable or META_API_KEY is not configured on the server. Live AI mode remains selected — configure META_API_KEY or switch back to Virtual Lab.';
 
 const FAULT_TYPE_OPTIONS: FaultType[] = [
   'solder_bridge',
@@ -351,7 +352,7 @@ export function App() {
     setActiveProbeTarget(probeA);
     try {
       const rd = session.measureVoltage(probeA);
-      pushLine('k-rule-ok', `▸ [Simulated measurement (MNA)] ${probeA} = ${rd.formatted} (powered, vs GND)`);
+      pushLine('k-rule-ok', `▸ [Virtual Measurements] ${probeA} = ${rd.formatted} (powered, vs GND)`);
     } catch (err) {
       pushLine('k-rule-bad', `⏚ Probe blocked: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -365,7 +366,7 @@ export function App() {
       const rd = session.measureContinuity(probeA, probeB);
       pushLine(
         rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
-        `▸ [Simulated measurement (MNA)] ${probeA} ↔ ${probeB} = ${rd.formatted} ${rd.continuous ? '(SHORT — continuity beep)' : '(open)'}`,
+        `▸ [Virtual Measurements] ${probeA} ↔ ${probeB} = ${rd.formatted} ${rd.continuous ? '(SHORT — continuity beep)' : '(open)'}`,
       );
     } catch (err) {
       pushLine('k-rule-bad', `⏚ Probe blocked: ${err instanceof Error ? err.message : String(err)}`);
@@ -397,7 +398,7 @@ export function App() {
           const abnormal = Math.abs(rd.volts - spec.nominalVolts) > Math.abs(spec.nominalVolts) * spec.toleranceFrac + 1e-9;
           pushLine(
             abnormal ? 'k-rule-bad' : 'k-rule-ok',
-            `▸ [Simulated measurement (MNA)] ${spec.node} = ${rd.formatted} (nominal ${spec.nominalVolts.toFixed(3)} V) — ${abnormal ? 'ABNORMAL' : 'nominal'}`,
+            `▸ [Virtual Measurements] ${spec.node} = ${rd.formatted} (nominal ${spec.nominalVolts.toFixed(3)} V) — ${abnormal ? 'ABNORMAL' : 'nominal'}`,
           );
         } catch (err) {
           pushLine('k-rule-bad', `⏚ Sweep stopped: ${err instanceof Error ? err.message : String(err)}`);
@@ -414,7 +415,7 @@ export function App() {
             syncSessionState();
             pushLine(
               rd.continuous ? 'k-rule-bad' : 'k-rule-ok',
-              `▸ [Simulated measurement (MNA)] ${abnormal.target} ↔ ${other} = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ''}`,
+              `▸ [Virtual Measurements] ${abnormal.target} ↔ ${other} = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ''}`,
             );
           } catch (err) {
             pushLine('k-rule-bad', `⏚ Sweep stopped: ${err instanceof Error ? err.message : String(err)}`);
@@ -454,7 +455,9 @@ export function App() {
     setLifecycleDetail('Inspecting circuit topology and reported symptom…');
     try {
       const view = session.getAgentView();
-      pushLine('k-reasoning', `▸ Autonomous investigation armed: ${view.boardName} · Muse Spark 1.3 (${client.mode}) · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`);
+      pushLine('k-reasoning', client.mode === 'live'
+        ? `▸ Live AI investigation armed: ${view.boardName} · Live Muse Spark 1.3 · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`
+        : `▸ Virtual Investigation armed: ${view.boardName} · Virtual Lab · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`);
       // Progressive lifecycle (Phase 3): simulated runs with demo pacing
       // buffer every step, then replay probes ONE BY ONE (initializing →
       // probing → updating_hypothesis → completed). Live / instant runs
@@ -540,7 +543,7 @@ export function App() {
       });
       const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
         point: p.target,
-        value: `[Simulated measurement (MNA)] ${p.detail ?? p.kind}`,
+        value: `[Virtual Measurements] ${p.detail ?? p.kind}`,
         status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
       }));
       const evidence: ClassifiedEvidence = {
@@ -552,7 +555,9 @@ export function App() {
         })),
         hypotheses: [
           {
-            claim: `Agentic diagnosis (Muse Spark 1.3, ${run.operationalMode}): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`,
+            claim: run.operationalMode === 'LIVE_API'
+              ? `Live Muse Spark 1.3 diagnosis (LIVE_API): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`
+              : `Virtual Investigation diagnosis (Deterministic Virtual Lab): ${run.proposedDiagnosis.componentRef} · ${run.proposedDiagnosis.faultType} — ${run.proposedDiagnosis.explanation}`,
             likelihood: run.proposedDiagnosis.verificationStatus === 'confirmed' ? 'high' : 'medium',
             falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
           },
@@ -666,7 +671,7 @@ export function App() {
       });
       const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
         point: p.target,
-        value: `[Simulated measurement (MNA)] ${p.detail ?? p.kind}`,
+        value: `[Virtual Measurements] ${p.detail ?? p.kind}`,
         status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
       }));
       setDiagnosis({
@@ -679,7 +684,7 @@ export function App() {
           })),
           hypotheses: [
             {
-              claim: `Recorded live replay (Muse Spark 1.3, RECORDED_LIVE_REPLAY): ${proposed.componentRef} · ${proposed.faultType} — ${proposed.explanation}`,
+              claim: `Recorded Live Investigation (RECORDED_LIVE_REPLAY): ${proposed.componentRef} · ${proposed.faultType} — ${proposed.explanation}`,
               likelihood: proposed.verificationStatus === 'confirmed' ? 'high' : 'medium',
               falsificationTest: 'A nominal MNA reading on every affected node falsifies this hypothesis.',
             },
@@ -747,27 +752,27 @@ export function App() {
     };
     attempt('VBUS_5V', () => {
       const rd = session.measureVoltage('VBUS_5V');
-      return `▸ [Simulated measurement (MNA)] VBUS_5V = ${rd.formatted} (powered, vs GND)`;
+      return `▸ [Virtual Measurements] VBUS_5V = ${rd.formatted} (powered, vs GND)`;
     }, () => {
       const node = fallbackRails[0] ?? 'U1-14';
       const rd = session.measureVoltage(node);
-      return `▸ [Simulated measurement (MNA)] ${node} = ${rd.formatted} (powered, vs GND)`;
+      return `▸ [Virtual Measurements] ${node} = ${rd.formatted} (powered, vs GND)`;
     });
     attempt('V3V3', () => {
       const rd = session.measureVoltage('V3V3');
-      return `▸ [Simulated measurement (MNA)] V3V3 = ${rd.formatted} (powered, vs GND)`;
+      return `▸ [Virtual Measurements] V3V3 = ${rd.formatted} (powered, vs GND)`;
     }, () => {
       const node = fallbackRails[1] ?? fallbackRails[0] ?? 'U1-15';
       const rd = session.measureVoltage(node);
-      return `▸ [Simulated measurement (MNA)] ${node} = ${rd.formatted} (powered, vs GND)`;
+      return `▸ [Virtual Measurements] ${node} = ${rd.formatted} (powered, vs GND)`;
     });
     attempt('NRST↔GND', () => {
       const rd = session.measureContinuity('NRST', 'GND');
-      return `▸ [Simulated measurement (MNA)] NRST ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
+      return `▸ [Virtual Measurements] NRST ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
     }, () => {
       const node = fallbackRails[1] ?? fallbackRails[0] ?? 'U1-15';
       const rd = session.measureContinuity(node, 'GND');
-      return `▸ [Simulated measurement (MNA)] ${node} ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
+      return `▸ [Virtual Measurements] ${node} ↔ GND = ${rd.formatted}${rd.continuous ? ' (SHORT — continuity beep)' : ' (open)'}`;
     });
     syncSessionState();
     setActiveProbeTarget('NRST↔GND');
@@ -803,7 +808,7 @@ export function App() {
     );
     const measurements: ProbeMeasurement[] = session.getProbeLog().map((p) => ({
       point: p.target,
-      value: `[Simulated measurement (MNA)] ${p.detail ?? p.kind}`,
+      value: `[Virtual Measurements] ${p.detail ?? p.kind}`,
       status: p.abnormal ? 'abnormal' : p.kind === 'voltage' || p.kind === 'resistance' ? 'nominal' : 'inconclusive',
     }));
     const evidence: ClassifiedEvidence = {
@@ -1148,7 +1153,7 @@ export function App() {
             {!running && (
               <div className="tf-row">
                 <button onClick={() => void replayVerifiedLiveRun()}>
-                  Replay Verified Live Run (Zero Cost)
+                  Replay Recorded Investigation (Zero Cost)
                 </button>
               </div>
             )}
@@ -1204,7 +1209,7 @@ export function App() {
                               <td className={p.abnormal ? 'bad' : 'ok'}>
                                 {isElectrical ? (p.abnormal ? 'Abnormal' : 'Nominal') : '—'}
                               </td>
-                              <td className="mute">{isElectrical ? 'Simulated MNA' : 'Context'}</td>
+                              <td className="mute">{isElectrical ? 'Virtual Measurements' : 'Context'}</td>
                             </tr>
                           );
                         })}
@@ -1298,7 +1303,7 @@ export function App() {
               <div style={{ marginTop: 8 }}>
                 A: {pointA ? `${pointA.label} = ${meterVoltsA ?? '—'}` : '—'} · B:{' '}
                 {pointB ? `${pointB.label}` : '—'}
-                <span style={{ color: 'var(--ink-dim)' }}> · Simulated measurements (MNA)</span>
+                <span style={{ color: 'var(--ink-dim)' }}> · Virtual Measurements</span>
               </div>
               {meterContinuity && (
                 <div className={`reading ${meterContinuity.fault ? 'fault' : ''}`} style={{ marginTop: 4 }}>
@@ -1410,6 +1415,9 @@ export function App() {
           <span className="tf-chip">Context: <strong>1M Tokens</strong></span>
           <span className="tf-chip">Segmentation: <strong>Static Fixture (KiCad)</strong></span>
           <span className={modeBadge.className}><strong>{modeBadge.label}</strong></span>
+          <span className="tf-chip">Execution Source: <strong>{executionSourceLabel((agentVerdict?.operationalMode as OperationalMode | 'RECORDED_LIVE_REPLAY' | undefined) ?? sparkStatus.sparkMode, { liveModeError })}</strong></span>
+          <span className="tf-chip">Segmentation Source: Static Reference Fixture (STATIC_FIXTURE)</span>
+          <span className="tf-chip">Internal Mode: <strong>{agentVerdict?.operationalMode ?? sparkStatus.sparkMode}</strong></span>
           <span className="tf-chip">
             Tokens: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
             {' '}· Cost: <strong>${telemetry.incurredCostUsd.toFixed(2)} incurred (${telemetry.projectedLiveCostUsd.toFixed(4)} projected)</strong>
