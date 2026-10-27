@@ -59,6 +59,7 @@ export const WORKER_OPERATOR_TOKEN = 'tf_operator_live_token';
 /** Default OAuth scope string minted with PKCE access tokens. */
 export const WORKER_DEFAULT_SCOPE = [
   'traceforge:discovery:read',
+  'traceforge:circuits:read',
   'traceforge:scenarios:read',
   'traceforge:scenarios:write',
   'traceforge:measurements:read',
@@ -179,11 +180,16 @@ function corsHeaders(): Record<string, string> {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, MCP-Protocol-Version',
-    'Access-Control-Expose-Headers': 'X-Correlation-Id, MCP-Protocol-Version',
+    'Access-Control-Expose-Headers': 'X-Correlation-Id, MCP-Protocol-Version, WWW-Authenticate',
   };
 }
 
-function jsonResponse(status: number, payload: unknown, correlationId: string): Response {
+function jsonResponse(
+  status: number,
+  payload: unknown,
+  correlationId: string,
+  extraHeaders?: Record<string, string>,
+): Response {
   return new Response(JSON.stringify(payload), {
     status,
     headers: {
@@ -191,6 +197,7 @@ function jsonResponse(status: number, payload: unknown, correlationId: string): 
       'X-Correlation-Id': correlationId,
       'MCP-Protocol-Version': MCP_PROTOCOL_VERSION,
       ...corsHeaders(),
+      ...(extraHeaders ?? {}),
     },
   });
 }
@@ -265,6 +272,8 @@ const EDGE_CACHE_OAUTH_CODE_PREFIX = 'https://traceforge-internal.local/oauth/co
 const EDGE_CACHE_OAUTH_REFRESH_PREFIX = 'https://traceforge-internal.local/oauth/refresh/';
 /** Durable / Edge-cache key prefix for revoked OAuth 2.1 access/refresh tokens. */
 const EDGE_CACHE_OAUTH_REVOKED_PREFIX = 'https://traceforge-internal.local/oauth/revoked/';
+/** Durable / Edge-cache key prefix for dynamically registered OAuth 2.1 clients. */
+const EDGE_CACHE_OAUTH_CLIENT_PREFIX = 'https://traceforge-internal.local/oauth/client/';
 
 function b64urlEncodeText(text: string): string {
   const bytes = new TextEncoder().encode(text);
@@ -492,6 +501,53 @@ export async function markTokenRevokedInStorage(token: string): Promise<void> {
   }
 }
 
+/** Read a dynamically registered OAuth 2.1 client record (Durable Object first, Edge Cache second). */
+export async function getOAuthClientFromStorage(clientId: string): Promise<OAuthClientRecord | null> {
+  if (!clientId) return null;
+  const key = `${EDGE_CACHE_OAUTH_CLIENT_PREFIX}${await sha256Hex(clientId)}`;
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      const val = await hook.get(key);
+      if (val && typeof val === 'object') return val as OAuthClientRecord;
+    } catch {
+      // Fall through to caches.default.
+    }
+  }
+  try {
+    const cache = getEdgeCache();
+    if (cache) {
+      const hit = await cache.match(key);
+      if (hit) {
+        const parsed = await hit.json();
+        if (parsed && typeof parsed === 'object') return parsed as OAuthClientRecord;
+      }
+    }
+  } catch {
+    // Best-effort only.
+  }
+  return null;
+}
+
+/** Persist a dynamically registered OAuth 2.1 client record (Durable Object AND Edge Cache). */
+export async function saveOAuthClientToStorage(clientId: string, record: OAuthClientRecord): Promise<void> {
+  if (!clientId) return;
+  const key = `${EDGE_CACHE_OAUTH_CLIENT_PREFIX}${await sha256Hex(clientId)}`;
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      await hook.put(key, record);
+    } catch {
+      // Best-effort only.
+    }
+  }
+  try {
+    edgeCachePutJson(key, record);
+  } catch {
+    // Best-effort only.
+  }
+}
+
 /* ---------------------------------------------------------------------------
  * Worker factory: one isolated service + OAuth stores per instance
  * ------------------------------------------------------------------------- */
@@ -521,25 +577,35 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       || STATELESS_SIGNING_SECRET;
   }
 
-  /** Verify a self-contained access token in ANY isolate (HMAC-SHA-256 + expiry). */
-  async function verifyStatelessToken(token: string, signingSecret: string): Promise<IssuedToken | null> {
-    if (!token.startsWith(STATELESS_TOKEN_PREFIX)) return null;
+  /** Inspect a self-contained access token in ANY isolate (distinguishes valid vs. expired vs. invalid). */
+  async function inspectStatelessToken(
+    token: string,
+    signingSecret: string,
+  ): Promise<{ status: 'valid'; token: IssuedToken } | { status: 'expired'; expiresAtMs: number } | { status: 'invalid' }> {
+    if (!token.startsWith(STATELESS_TOKEN_PREFIX)) return { status: 'invalid' };
     const rest = token.slice(STATELESS_TOKEN_PREFIX.length);
     const dot = rest.lastIndexOf('.');
-    if (dot === -1) return null;
+    if (dot === -1) return { status: 'invalid' };
     const payloadB64 = rest.slice(0, dot);
     const sig = rest.slice(dot + 1);
-    if (!payloadB64 || !sig) return null;
-    if ((await statelessSign(payloadB64, signingSecret)) !== sig) return null;
+    if (!payloadB64 || !sig) return { status: 'invalid' };
+    if ((await statelessSign(payloadB64, signingSecret)) !== sig) return { status: 'invalid' };
     try {
       const payload = JSON.parse(b64urlDecodeText(payloadB64)) as {
         v?: number; scope?: string; cid?: string; exp?: number;
       };
-      if (payload.v !== 1 || typeof payload.scope !== 'string' || typeof payload.exp !== 'number') return null;
-      if (clock() > payload.exp) return null;
-      return { scope: payload.scope, clientId: typeof payload.cid === 'string' ? payload.cid : 'default', expiresAtMs: payload.exp };
+      if (payload.v !== 1 || typeof payload.scope !== 'string' || typeof payload.exp !== 'number') return { status: 'invalid' };
+      if (clock() > payload.exp) return { status: 'expired', expiresAtMs: payload.exp };
+      return {
+        status: 'valid',
+        token: {
+          scope: payload.scope,
+          clientId: typeof payload.cid === 'string' ? payload.cid : 'default',
+          expiresAtMs: payload.exp,
+        },
+      };
     } catch {
-      return null;
+      return { status: 'invalid' };
     }
   }
 
@@ -705,7 +771,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       if (service.getKillSwitch().isTokenRevoked(token) || (await isTokenRevokedInStorage(token))) {
         service.getKillSwitch().revokeToken(token);
         issuedTokens.delete(token);
-        return headers;
+        return { ...headers, 'x-traceforge-oauth-token-status': 'revoked' };
       }
       const issued = issuedTokens.get(token);
       if (issued && clock() <= issued.expiresAtMs) {
@@ -713,9 +779,12 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       }
       if (issued) issuedTokens.delete(token);
       // Cross-isolate path: self-contained token verified via HMAC-SHA-256.
-      const stateless = await verifyStatelessToken(token, resolveSigningSecret(env));
-      if (stateless) {
-        return { ...headers, ...registerOAuthToken(token, stateless.scope, stateless.clientId) };
+      const inspected = await inspectStatelessToken(token, resolveSigningSecret(env));
+      if (inspected.status === 'valid') {
+        return { ...headers, ...registerOAuthToken(token, inspected.token.scope, inspected.token.clientId) };
+      }
+      if (inspected.status === 'expired' || issued) {
+        return { ...headers, 'x-traceforge-oauth-token-status': 'expired' };
       }
     }
     return headers;
@@ -733,10 +802,26 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       for (const [key, value] of Object.entries(body)) {
         if (typeof value === 'string') params[key] = value;
       }
-      return params;
+    } else {
+      const text = await request.text();
+      for (const [key, value] of new URLSearchParams(text)) params[key] = value;
     }
-    const text = await request.text();
-    for (const [key, value] of new URLSearchParams(text)) params[key] = value;
+    // RFC 6749 §2.3.1: extract client_id from HTTP Basic auth if not supplied in the body.
+    if (!params['client_id']) {
+      const authHeader = request.headers.get('authorization') ?? '';
+      const basicMatch = authHeader.match(/^\s*Basic\s+([A-Za-z0-9+/=]+)\s*$/i);
+      if (basicMatch?.[1]) {
+        try {
+          const decoded = atob(basicMatch[1]);
+          const colonIdx = decoded.indexOf(':');
+          const rawClientId = colonIdx >= 0 ? decoded.slice(0, colonIdx) : decoded;
+          const decodedClientId = decodeURIComponent(rawClientId);
+          if (decodedClientId) params['client_id'] = decodedClientId;
+        } catch {
+          // Ignore malformed Basic headers.
+        }
+      }
+    }
     return params;
   }
 
@@ -779,15 +864,22 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     }
   }
 
-  function validateAuthorizeInput(input: Record<string, string>): { clientId: string; redirectUri: string; state: string; challenge: string; scope: string } | Response {
+  async function validateAuthorizeInput(input: Record<string, string>): Promise<{ clientId: string; redirectUri: string; state: string; challenge: string; scope: string } | Response> {
     const correlationId = createMaasCorrelationId();
     const fail = (description: string): Response => oauthError(400, 'invalid_request', description, correlationId);
     const clientId = input['client_id'] ?? '';
     const redirectUri = input['redirect_uri'] ?? '';
     const challenge = input['code_challenge'] ?? '';
     const method = input['code_challenge_method'] ?? '';
-    const client = oauthClients.get(clientId);
     if (!clientId) return fail(`Unknown client_id '(missing)': register first via POST /oauth/register.`);
+    let client = oauthClients.get(clientId);
+    if (!client) {
+      const storedClient = await getOAuthClientFromStorage(clientId);
+      if (storedClient) {
+        oauthClients.set(clientId, storedClient);
+        client = storedClient;
+      }
+    }
     if (client) {
       if (!redirectUri || !client.redirectUris.includes(redirectUri)) {
         return fail(`redirect_uri '${redirectUri || '(missing)'}' is not registered for this client.`);
@@ -813,7 +905,12 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     };
   }
 
-  async function handleMcpRpc(body: unknown, headers: Record<string, string | string[] | undefined>, correlationId: string): Promise<Response> {
+  async function handleMcpRpc(
+    body: unknown,
+    headers: Record<string, string | string[] | undefined>,
+    correlationId: string,
+    origin: string,
+  ): Promise<Response> {
     const rpc = asRecord(body);
     if (!rpc || rpc['jsonrpc'] !== JSON_RPC_VERSION || typeof rpc['method'] !== 'string') {
       return jsonResponse(400, {
@@ -824,7 +921,8 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     }
     const request = rpc as unknown as JsonRpcRequest;
     const params = asRecord(request.params) ?? {};
-    const ok = (result: unknown): Response => jsonResponse(200, { jsonrpc: JSON_RPC_VERSION, id: request.id, result }, correlationId);
+    const ok = (result: unknown, extraHeaders?: Record<string, string>): Response =>
+      jsonResponse(200, { jsonrpc: JSON_RPC_VERSION, id: request.id, result }, correlationId, extraHeaders);
     const fail = (code: number, message: string): Response => jsonResponse(200, {
       jsonrpc: JSON_RPC_VERSION,
       id: request.id,
@@ -835,7 +933,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       case 'initialize': {
         return ok({
           protocolVersion: MCP_PROTOCOL_VERSION,
-          capabilities: { tools: { listChanged: false }, resources: { listChanged: false }, prompts: { listChanged: false } },
+          capabilities: { tools: { listChanged: true }, resources: { listChanged: false }, prompts: { listChanged: false } },
           serverInfo: { name: WORKER_NAME, version: '0.1.0' },
         });
       }
@@ -884,11 +982,21 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
           const structured = err instanceof MaasToolError
             ? err.toStructuredError()
             : { code: 'MAAS_EXECUTION_FAILED' as const, message: err instanceof Error ? err.message : String(err), correlationId, capability: toolName };
+          const tokenStatus = headers['x-traceforge-oauth-token-status'];
+          if (structured.code === 'MAAS_AUTHENTICATION_REQUIRED' && tokenStatus === 'expired') {
+            structured.message = `${structured.message} (OAuth access token expired after ${ACCESS_TOKEN_TTL_SECONDS}s; renew automatically via POST /oauth/token with grant_type=refresh_token.)`;
+          }
+          const authExtraHeaders =
+            structured.code === 'MAAS_AUTHENTICATION_REQUIRED' || structured.code === 'MAAS_CREDENTIALS_REVOKED'
+              ? {
+                  'WWW-Authenticate': `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource", error="invalid_token", error_description="${tokenStatus === 'expired' ? 'Access token expired; exchange refresh_token at /oauth/token' : 'Valid Bearer token required'}"`,
+                }
+              : undefined;
           return ok({
             content: [{ type: 'text', text: JSON.stringify(structured) }],
             structuredContent: structured,
             isError: true,
-          });
+          }, authExtraHeaders);
         }
       }
       case 'resources/list': {
@@ -1075,12 +1183,14 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         ? (record['client_name'] as string).slice(0, 200)
         : undefined;
       const clientId = randomHex('tf_client', 12);
-      oauthClients.set(clientId, {
+      const clientRecord: OAuthClientRecord = {
         clientId,
         redirectUris: redirectUris as string[],
         createdAtMs: clock(),
         ...(clientName !== undefined ? { clientName } : {}),
-      });
+      };
+      oauthClients.set(clientId, clientRecord);
+      await saveOAuthClientToStorage(clientId, clientRecord);
       return jsonResponse(201, {
         client_id: clientId,
         ...(clientName !== undefined ? { client_name: clientName } : {}),
@@ -1095,7 +1205,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     if (method === 'GET' && path === '/oauth/authorize') {
       const input: Record<string, string> = {};
       for (const [key, value] of url.searchParams) input[key] = value;
-      const validated = validateAuthorizeInput(input);
+      const validated = await validateAuthorizeInput(input);
       if (validated instanceof Response) return validated;
       const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge, signingSecret);
       const target = new URL(validated.redirectUri);
@@ -1113,7 +1223,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     }
 
     if (method === 'POST' && path === '/oauth/authorize') {
-      const validated = validateAuthorizeInput(await readTokenParams(request));
+      const validated = await validateAuthorizeInput(await readTokenParams(request));
       if (validated instanceof Response) return validated;
       const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge, signingSecret);
       return jsonResponse(200, { code, state: validated.state, redirect_uri: validated.redirectUri }, correlationId);
@@ -1169,6 +1279,21 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
             }
           }
           effectiveScope = requestedScopes.join(' ');
+        } else if (
+          grantedSet.has('traceforge:discovery:read')
+          && grantedSet.has('traceforge:scenarios:read')
+          && grantedSet.has('traceforge:evaluation:score')
+        ) {
+          // Ensure default-scope refresh tokens minted prior to the 25-tool
+          // catalog upgrade automatically include the non-billable assistant
+          // and circuit-read scopes upon renewal without re-authentication.
+          for (const autoScope of ['traceforge:circuits:read', 'traceforge:assistant:chat']) {
+            if (!grantedSet.has(autoScope)) {
+              grantedSet.add(autoScope);
+              grantedList.push(autoScope);
+            }
+          }
+          effectiveScope = grantedList.join(' ');
         }
         // Issue new access token + rotated refresh token, and atomically mark
         // the old refresh token consumed so it cannot be replayed.
@@ -1272,7 +1397,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
           error: { code: JSON_RPC_PARSE_ERROR, message: 'Parse error: malformed JSON body.' },
         }, correlationId);
       }
-      return handleMcpRpc(body, await resolveServiceHeaders(request, env), correlationId);
+      return handleMcpRpc(body, await resolveServiceHeaders(request, env), correlationId, origin);
     }
 
     if (method === 'GET' && path === '/api/maas/status') {

@@ -69,7 +69,7 @@ async function fullPkceToken(params: {
   client: RegisteredClient;
   verifier?: string;
   asJson?: boolean;
-}): Promise<{ accessToken: string; scope: string }> {
+}): Promise<{ accessToken: string; refreshToken: string; scope: string }> {
   const verifier = params.verifier ?? 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk';
   const challenge = await pkceChallenge(verifier);
   const redirectUri = params.client.redirect_uris[0] as string;
@@ -96,8 +96,8 @@ async function fullPkceToken(params: {
     }),
   );
   expect(tokenRes.status).toBe(200);
-  const token = (await readJson(tokenRes)) as { access_token: string; token_type: string; expires_in: number; scope: string };
-  return { accessToken: token.access_token, scope: token.scope };
+  const token = (await readJson(tokenRes)) as { access_token: string; refresh_token: string; token_type: string; expires_in: number; scope: string };
+  return { accessToken: token.access_token, refreshToken: token.refresh_token, scope: token.scope };
 }
 
 async function mcpCall(
@@ -1635,7 +1635,7 @@ describe('assistant MCP parity over the Worker (25 tools)', () => {
     const answer = (asked.envelope['result'] as { structuredContent: { reply: string; liveInvoked: boolean; kbVersion: string } }).structuredContent;
     expect(answer.reply.length).toBeGreaterThan(0);
     expect(answer.liveInvoked).toBe(false);
-    expect(answer.kbVersion).toBe('2026.10.27-v3');
+    expect(answer.kbVersion).toBe('2026.10.27-v4');
 
     const history = await mcpCall(worker, 'tools/call', {
       name: 'traceforge.chat.history',
@@ -1656,8 +1656,81 @@ describe('assistant MCP parity over the Worker (25 tools)', () => {
     expect(report.failedCount).toBe(0);
     expect(report.allPassed).toBe(true);
     expect(report.totalCostUsd).toBe(0);
-    expect(report.kbVersion).toBe('2026.10.27-v3');
+    expect(report.kbVersion).toBe('2026.10.27-v4');
   }, 60000);
+
+  it('persists dynamically registered OAuth clients across Worker instances, supports Basic auth token refresh, upgrades default scopes, and returns WWW-Authenticate on expired/revoked tokens', async () => {
+    const workerA = createTraceForgeWorker();
+    const reg = await workerA.fetch(
+      new Request(workerUrl('/oauth/register'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_name: 'Persistent ChatGPT Connector',
+          redirect_uris: ['https://chatgpt.com/connector_platform_oauth_redirect'],
+        }),
+      }),
+    );
+    expect(reg.status).toBe(201);
+    const client = (await readJson(reg)) as RegisteredClient;
+
+    // Cold Worker B (simulating isolate rotation) can authorize and exchange using persisted client record
+    const workerB = createTraceForgeWorker();
+    const { accessToken, refreshToken, scope } = await fullPkceToken({ worker: workerB, client });
+    expect(scope).toContain('traceforge:circuits:read');
+    expect(scope).toContain('traceforge:assistant:chat');
+
+    // Refresh using HTTP Basic header (client_id in Basic auth, omitted from body)
+    const basicHeader = `Basic ${btoa(`${client.client_id}:`)}`;
+    const refreshRes = await workerB.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Authorization: basicHeader,
+        },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+        }).toString(),
+      }),
+    );
+    expect(refreshRes.status).toBe(200);
+    const refreshed = (await readJson(refreshRes)) as {
+      access_token: string;
+      refresh_token: string;
+      scope: string;
+    };
+    expect(refreshed.access_token.length).toBeGreaterThan(20);
+    expect(refreshed.refresh_token).not.toBe(refreshToken);
+    expect(refreshed.scope).toContain('traceforge:circuits:read');
+    expect(refreshed.scope).toContain('traceforge:assistant:chat');
+
+    // Revoke original accessToken and verify /mcp returns WWW-Authenticate header
+    await workerB.fetch(
+      new Request(workerUrl('/oauth/revoke'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: accessToken, token_type_hint: 'access_token' }),
+      }),
+    );
+    const revokedMcp = await workerB.fetch(
+      new Request(workerUrl('/mcp'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 99,
+          method: 'tools/call',
+          params: { name: 'traceforge.scenarios.create', arguments: { boardId: 'f405-flight-controller' } },
+        }),
+      }),
+    );
+    expect(revokedMcp.headers.get('WWW-Authenticate')).toContain('error="invalid_token"');
+  });
 
   it('answers generic-client interop methods and isolates conversations per actor', async () => {
     const worker = createTraceForgeWorker();

@@ -119,7 +119,7 @@
 ### Official GitHub identity
 - TraceForge GitHub owner: `danny121583`.
 - Official repository: `danny121583/traceforge`.
-- Default visibility: `PRIVATE`.
+- Default visibility: `PUBLIC` (Open Source under the MIT License for hackathon submission and judging).
 - Never push TraceForge to `aigraphix`.
 - Never automatically switch GitHub accounts.
 - Verify the authenticated account before remote operations (`gh auth status`).

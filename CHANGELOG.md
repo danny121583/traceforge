@@ -34,14 +34,14 @@ landed on the project branches.
   a measurement-history timeline, and recorded-investigation replay
   (`RECORDED_LIVE_REPLAY`, always labeled, never `LIVE_API`).
 
-## 18-tool MaaS/MCP server & Cloudflare Worker OAuth 2.1 PKCE
+## 18-tool MCP server & Cloudflare Worker OAuth 2.1 PKCE
 
-- Independent 18-tool MaaS/MCP service (`traceforge.*`) with
+- Independent 18-tool MCP service (`traceforge.*`) with
   authentication, per-scope authorization, sliding-window rate limiting,
   hierarchical kill switch, sanitized audit log, and SHA-256 verification
   receipts.
 - Cloudflare Worker staging package (`traceforge-mcp-staging`) serving
-  MCP JSON-RPC, MaaS REST, OAuth 2.1 PKCE (S256), and RFC 9728 / RFC 8414
+  MCP JSON-RPC, REST endpoints, OAuth 2.1 PKCE (S256), and RFC 9728 / RFC 8414
   discovery metadata.
 - Cross-isolate stateless scenario/investigation hydration, session
   expiry, billing checkpoint constants, and per-colocation Edge Cache
@@ -53,7 +53,7 @@ landed on the project branches.
   touch icon) and Virtual Lab terminology across the workbench so
   simulated execution is never presented as live inference.
 
-## Session hardening, explicit spend control & Vercel Hobby deployment
+## Session hardening, explicit spend control & Vercel deployment
 
 - AES-256-GCM + HMAC-SHA-256 authenticated session tokens
   (`scn_…` / `inv_…`) replacing XOR/FNV-1a; per-client OAuth actor
@@ -61,15 +61,13 @@ landed on the project branches.
   signing with secret rotation; cross-isolate auth-code replay
   protection via Edge Cache.
 - Explicit live-AI spending control: omitted `mode` always defaults to
-  simulated (`$0.00`); only explicit `mode: "live"` triggers paid
-  `muse-spark-1.3` inference; read-only tools never invoke paid calls;
-  `$95.00` safety stop enforced against verified + runtime spend.
+  simulated; only explicit `mode: "live"` triggers
+  `muse-spark-1.3` inference; read-only tools never invoke live calls;
+  runtime safety stop enforced against verified + runtime spend.
 - Production browser backend on the Cloudflare Worker
   (`/api/meta/status`, `/api/meta/chat`, `/api/meta/segment`) with
-  Vercel Hobby (`$0/month`) frontend rewrites (`vercel.json`) deployed at
+  Vercel frontend rewrites (`vercel.json`) deployed at
   `https://traceforge-ten.vercel.app`.
-- Verified billing checkpoint: `$122.78` balance / `$24.48` consumed as
-  of `2026-10-26T20:08:24-05:00`.
 
 ## MCP session consistency, UI polish & release verification
 
@@ -116,7 +114,7 @@ landed on the project branches.
   `traceforge-canonical-v1` singleton (falling back to the shared
   in-process worker with no binding, preserving unit-test
   compatibility), whose transactional storage backs
-  `PersistedScenarioState` on `*.workers.dev` at `$0.00/month`.
+  `PersistedScenarioState` on `*.workers.dev`.
 - Durable-first reads/writes: `edgeCacheGet`/`edgeCachePut`
   (`src/maas/tools.ts`) and the OAuth one-time-code consumption
   helpers (`isCodeConsumedInEdgeCache` /
@@ -202,9 +200,8 @@ landed on the project branches.
   `src/App.tsx` (with unused helpers/imports) and the
   `.tf-tech-drawer` rules from `src/index.css`; technical diagnostics
   stay behind server-authorized access only.
-- **Billing checkpoint:** `LAST_VERIFIED_BALANCE_USD = 113.63`,
-  `LAST_VERIFIED_CONSUMED_USD = 33.63`,
-  `LAST_VERIFIED_TIMESTAMP = '2026-10-27T00:40:47-05:00'`.
+- **Billing checkpoint:** updated runtime ledger snapshot constants for
+  `2026-10-27T00:40:47-05:00`.
 - **`vercel.json`:** added the `/api/assistant/:path*` rewrite to the
   staging Worker plus `Cache-Control: no-cache, no-store,
   must-revalidate` for `/` and `/index.html`.
@@ -215,10 +212,10 @@ landed on the project branches.
   + synonym + BM25 retrieval with `high`/`medium`/`low` coverage,
   prompt-injection refusal, greeting handling, session-grounded
   answers with pre-evaluation ground-truth isolation, and truthful
-  knowledge-only fallbacks at `$0.00`.
+  knowledge-only fallbacks.
 - **Assistant budget & endpoints (`src/maas/tools.ts`,
   `src/lib/assistant-server.ts`, `worker/index.ts`,
-  `src/server/maas-mcp-server.ts`):** `$2.00` shared chat allowance
+  `src/server/maas-mcp-server.ts`):** shared chat allowance
   (`ASSISTANT_LIVE_ALLOWANCE_USD`), ≤10 calls/session, ≤2
   concurrent, 1000-char input / 8-message history caps, 350-token
   output cap; usage tracked in the shared runtime ledger (persisted
@@ -233,8 +230,8 @@ landed on the project branches.
   `src/App.tsx`):** launcher + card panel with the 6 suggested
   questions, source pills, Clear/Close/Escape controls, auto-scroll,
   duplicate-send prevention, and stale-response protection.
-- **Regression coverage (`tests/assistant-rag.test.ts`, 47 tests):**
-  KB topics + version, suggested questions at `$0.00`, greetings,
+- **Regression coverage (`tests/assistant-rag.test.ts`):**
+  KB topics + version, suggested questions, greetings,
   session grounding with ground-truth isolation, prompt-injection
   refusal, full server gating matrix, and the authorized single-call
   live path with ledger recording.
@@ -244,9 +241,9 @@ landed on the project branches.
 - **7 new assistant & knowledge base MCP tools
   (`src/maas/tools.ts`, `TRACEFORGE_MAAS_TOOL_DESCRIPTORS` 18 → 25,
   `WORKER_TOOL_COUNT = 25`):** `traceforge.kb.search` (public,
-  versioned BM25 + synonym retrieval at `$0.00`),
+  versioned BM25 + synonym retrieval),
   `traceforge.chat.status` (public status, `kbVersion`, topic count,
-  `$2.00` live-chat ledger, limits, caller conversation count),
+  live-chat ledger, limits, caller conversation count),
   `traceforge.chat.start` (actor-isolated `conv_…` conversation with
   signed session ticket, optional owned-`scenarioId` binding),
   `traceforge.chat.ask` (single RAG-first answers plus deterministic
@@ -263,8 +260,8 @@ landed on the project branches.
 - **Deterministic 20-question QA benchmark
   (`STANDARD_20_QA_BENCHMARK` in `src/lib/assistant-server.ts`):**
   all 18 knowledge topics plus session troubleshooting and one
-  prompt-injection refusal probe; every item passes knowledge-only at
-  `$0.00` with grounding, expected-topic, accuracy-term, and
+  prompt-injection refusal probe; every item passes knowledge-only
+  with grounding, expected-topic, accuracy-term, and
   no-leakage verification.
 - **Multi-client MCP interop (`worker/index.ts`,
   `src/server/maas-mcp-server.ts`):** `server/discover` alias and
@@ -286,3 +283,44 @@ landed on the project branches.
   with a 4-stage safe roadmap. Governance docs rewritten in neutral
   engineering language (no coordinator attributions; model
   disclosures retained).
+
+## Conversational intelligence, persistent MCP OAuth refresh, Welcome Bubble, Light/Dark Mode & Open Source License
+
+- **Context-aware conversational intelligence (`src/lib/rag-engine.ts`,
+  `src/lib/assistant-server.ts`, `src/data/knowledge-base.ts` @
+  `KB_VERSION = '2026.10.27-v4'`, `docs/knowledge/traceforge-knowledge-base.md`):**
+  `queryTraceForgeRAG` now accepts multi-turn conversation `history`
+  and resolves natural capability questions (`"what else can i do?"`,
+  `"What can you help me with?"`), post-diagnosis inquiries (`"What
+  happens after the diagnosis?"`), next-step guidance (`"What should I
+  try next?"`), guided walkthroughs (`"Can you walk me through this?"`),
+  other-board comparisons (`"How about the other board?"`), and
+  anaphoric follow-ups (`"Tell me more."`, `"How does that work?"`,
+  `"Can you explain that?"`, `"Why?"`, plus pronouns `that`, `it`,
+  `those`, `this`, `the previous result`) deterministically without
+  missing-documentation disclaimers.
+- **Persistent MCP OAuth 2.1 connections (`worker/index.ts`,
+  `src/server/maas-mcp-server.ts`):** dynamically registered OAuth
+  clients (`POST /oauth/register`) persist in `TraceForgeStateDO` and
+  Edge Cache (`saveOAuthClientToStorage` / `getOAuthClientFromStorage`)
+  across Worker redeployments and isolate rotations; `POST /oauth/token`
+  extracts `client_id` from HTTP Basic auth when omitted from the form
+  body; default-scope refresh tokens automatically include
+  `traceforge:circuits:read` and `traceforge:assistant:chat` upon
+  renewal; expired or revoked Bearer tokens on `/mcp` return standard
+  `WWW-Authenticate` challenge headers and actionable refresh guidance;
+  MCP `initialize` advertises `capabilities.tools.listChanged: true`.
+- **Assistant Welcome Bubble & pacing (`src/components/TraceForgeAssistant.tsx`,
+  `src/index.css`):** once-per-session floating welcome greeting bubble
+  (`"Hi! I'm your TraceForge Assistant. Need a hand?"`) with typing
+  animation, `prefers-reduced-motion` support, 7-second auto-dismiss,
+  and immediate dismissal on click or close without auto-opening the
+  full panel; assistant responses maintain a consistent 3-second
+  `"Thinking…"` state (`ASSISTANT_THINKING_MIN_MS = 3000`).
+- **Light/Dark Mode & 3-zone header layout (`src/components/Header.tsx`,
+  `src/App.tsx`, `src/index.css`):** balanced Left/Center/Right header
+  grid with a persistent Dark/Light theme toggle (`localStorage` key
+  `tf_theme`, default `'dark'`) and complete Light Mode CSS token
+  coverage across cards, PCB canvas, controls, and chat widget.
+- **Open Source License (`LICENSE`, `README.md`):** released under the
+  MIT License on the public `danny121583/traceforge` repository.

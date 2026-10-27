@@ -154,7 +154,7 @@ async function handleMcpRpc(
     case 'initialize': {
       ok({
         protocolVersion: MCP_PROTOCOL_VERSION,
-        capabilities: { tools: { listChanged: false }, resources: { listChanged: false }, prompts: { listChanged: false } },
+        capabilities: { tools: { listChanged: true }, resources: { listChanged: false }, prompts: { listChanged: false } },
         serverInfo: { name: 'traceforge-maas', version: '0.1.0' },
       });
       return;

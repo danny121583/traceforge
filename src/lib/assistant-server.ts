@@ -330,10 +330,12 @@ export async function handleAssistantChat(deps: HandleAssistantChatDeps): Promis
       if (!rec || typeof rec['role'] !== 'string' || typeof rec['content'] !== 'string') {
         return { status: 400, payload: { error: 'history must be an array of { role, content } messages.' } };
       }
-      if ((rec['content'] as string).length > ASSISTANT_MAX_INPUT_CHARS) {
+      const role = rec['role'] as string;
+      const content = rec['content'] as string;
+      if (role === 'user' && content.length > ASSISTANT_MAX_INPUT_CHARS) {
         return { status: 400, payload: { error: `history message exceeds ${ASSISTANT_MAX_INPUT_CHARS} characters.` } };
       }
-      history.push({ role: rec['role'] as string, content: rec['content'] as string });
+      history.push({ role, content: content.slice(0, ASSISTANT_MAX_INPUT_CHARS) });
     }
   }
   const allowLiveInference = bodyRecord['allowLiveInference'] === true;
@@ -341,7 +343,7 @@ export async function handleAssistantChat(deps: HandleAssistantChatDeps): Promis
   const sessionContext = sanitizeAssistantSessionContext(sessionContextRaw);
 
   // RAG runs FIRST on the server — knowledge answers never touch the Meta API.
-  const rag = queryTraceForgeRAG(message, sessionContext);
+  const rag = queryTraceForgeRAG(message, sessionContext, history);
   if (rag.blockedByPolicy || !rag.needsLiveInference) {
     return {
       status: 200,

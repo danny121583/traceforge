@@ -18,7 +18,7 @@ The MCP surface is 25 tools (`TRACEFORGE_MAAS_TOOL_DESCRIPTORS` in
 `traceforge.chat.feedback`). Both surfaces share the same engines: the
 deterministic Linear DC MNA solver, the RAG-first assistant
 (`src/lib/assistant-server.ts`, `src/lib/rag-engine.ts`), and the
-`$95.00` project safety stop.
+runtime safety controls.
 
 ## Capability audit
 
@@ -52,7 +52,7 @@ Manual multimeter and probe sweep on the website;
 `traceforge.measurements.history` on MCP. Every probe consumes the
 shared 8-probe budget (`MAX_TOOL_CALLS = 8`).
 
-### 4. Autonomous diagnostic investigations (Virtual Lab `$0.00` & explicit Live AI `muse-spark-1.3`)
+### 4. Autonomous diagnostic investigations (Virtual Lab & explicit Live AI `muse-spark-1.3`)
 
 Status: `Available through website and MCP`
 
@@ -60,8 +60,8 @@ Step 2 Investigate on the website; `traceforge.investigations.start`,
 `traceforge.investigations.status`,
 `traceforge.investigations.history`, and
 `traceforge.investigations.result` on MCP. Omitted modes always run
-deterministic Virtual Lab simulation (`$0.00`); only explicit live
-opt-in with scope, key, and budget headroom runs paid
+deterministic Virtual Lab simulation; only explicit live
+opt-in with scope, key, and budget headroom runs
 `muse-spark-1.3` inference, labeled `LIVE_API`.
 
 ### 5. Ground-truth evaluation & 0–100 diagnostic scoring
@@ -98,11 +98,11 @@ website; `traceforge.chat.start`, `traceforge.chat.ask`,
 `traceforge.chat.history`, `traceforge.chat.clear`,
 `traceforge.chat.feedback`, and `traceforge.chat.status` on MCP. Both
 surfaces run the same RAG-first engine: deterministic local retrieval
-over the versioned knowledge base (`KB_VERSION`) at `$0.00` first,
+over the versioned knowledge base (`KB_VERSION`) first,
 session grounding in a sanitized context (`HiddenFault` strictly
-withheld), and at most one paid `muse-spark-1.3` call only when live
-inference is explicitly authorized and budget headroom exists
-(`$2.00` shared chat allowance, `traceforge:live_inference:execute`
+withheld), and at most one `muse-spark-1.3` call only when live
+inference is explicitly authorized and runtime quota headroom exists
+(`traceforge:live_inference:execute`
 scope). Conversations are actor-isolated on both surfaces.
 
 ### 9. Direct knowledge base search & 20-question deterministic QA benchmark
@@ -111,12 +111,12 @@ Status: `Available through website and MCP` (search);
 `MCP-only` (scripted 20-question batch benchmark)
 
 RAG search powers website chat directly; `traceforge.kb.search`
-exposes the same BM25 + synonym retrieval over MCP at `$0.00` with
+exposes the same BM25 + synonym retrieval over MCP with
 ranked sources, coverage level, and `kbVersion`. The deterministic
 20-question QA benchmark (`STANDARD_20_QA_BENCHMARK`, all 18 knowledge
 topics plus session troubleshooting and one prompt-injection refusal
 probe) runs via `traceforge.chat.ask` with
-`runStandard20QuestionQa: true` — knowledge-only, `$0.00`, zero live
+`runStandard20QuestionQa: true` — knowledge-only, zero live
 calls — and is exposed as a batch operation on MCP only.
 
 ### 10. Interactive SVG PCB pan/zoom & zero-cost recorded replay animation

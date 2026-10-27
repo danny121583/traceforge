@@ -83,7 +83,7 @@ async function ticketFor(secret = CHAT_SECRET): Promise<string> {
 
 describe('knowledge base versioning and topic coverage', () => {
   it('pins KB_VERSION and covers all 18 required topics', () => {
-    expect(KB_VERSION).toBe('2026.10.27-v3');
+    expect(KB_VERSION).toBe('2026.10.27-v4');
     expect(KNOWLEDGE_BASE_ENTRIES).toHaveLength(18);
     const titles = KNOWLEDGE_BASE_ENTRIES.map((e) => e.title);
     for (const required of [
@@ -709,7 +709,7 @@ describe('MCP 20-question QA benchmark end to end', () => {
       })),
     }).toEqual({
       qaMode: true,
-      kbVersion: '2026.10.27-v3',
+      kbVersion: '2026.10.27-v4',
       total: 20,
       passed: 20,
       failed: 0,
@@ -730,4 +730,134 @@ describe('MCP 20-question QA benchmark end to end', () => {
       expect(text).not.toContain('targetComponentRef');
     }
   }, 60000);
+});
+
+describe('multi-turn conversational intelligence and UI polish constants', () => {
+  it('answers "what else can i do?" and capability questions naturally without missing-docs disclaimers', async () => {
+    const service = new TraceForgeMaasService();
+    const ticket = await ticketFor();
+    for (const prompt of [
+      'what else can i do?',
+      'What can you help me with?',
+      'What can I do here?',
+      'What happens after the diagnosis?',
+      'What should I try next?',
+      'Can you walk me through this?',
+      'How about the other board?',
+    ]) {
+      const res = await handleAssistantChat({
+        service,
+        body: {
+          message: prompt,
+          sessionTicket: ticket,
+          sessionContext: ACTIVE_SESSION,
+        },
+        headers: {},
+        signingSecret: CHAT_SECRET,
+      });
+      expect(res.status).toBe(200);
+      const payload = res.payload as {
+        liveInvoked: boolean;
+        mode: string;
+        reply: string;
+        sources: unknown[];
+      };
+      expect(payload.liveInvoked).toBe(false);
+      expect(payload.mode).toBe('knowledge_base');
+      expect(payload.reply.toLowerCase()).not.toContain("don't have verified traceforge documentation");
+      expect(payload.reply.length).toBeGreaterThan(40);
+      expect(payload.sources.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('resolves multi-turn follow-up questions ("Tell me more.", "How does that work?", "Can you explain that?", "Why?") using conversation history', async () => {
+    const service = new TraceForgeMaasService();
+    const ticket = await ticketFor();
+    const first = await handleAssistantChat({
+      service,
+      body: {
+        message: 'How does the 8-probe budget work?',
+        sessionTicket: ticket,
+      },
+      headers: {},
+      signingSecret: CHAT_SECRET,
+    });
+    const firstPayload = first.payload as { liveInvoked: boolean; reply: string };
+    expect(firstPayload.liveInvoked).toBe(false);
+
+    const history = [
+      { role: 'user' as const, content: 'How does the 8-probe budget work?' },
+      { role: 'assistant' as const, content: firstPayload.reply },
+    ];
+
+    for (const followUp of [
+      'Tell me more.',
+      'How does that work?',
+      'Can you explain that?',
+      'Why?',
+      'What about those continuity probes?',
+    ]) {
+      const next = await handleAssistantChat({
+        service,
+        body: {
+          message: followUp,
+          history,
+          sessionTicket: ticket,
+          sessionContext: ACTIVE_SESSION,
+        },
+        headers: {},
+        signingSecret: CHAT_SECRET,
+      });
+      expect(next.status).toBe(200);
+      const nextPayload = next.payload as {
+        liveInvoked: boolean;
+        mode: string;
+        reply: string;
+      };
+      expect(nextPayload.liveInvoked).toBe(false);
+      expect(nextPayload.mode).toBe('knowledge_base');
+      expect(nextPayload.reply.toLowerCase()).not.toContain("don't have verified traceforge documentation");
+      expect(nextPayload.reply.length).toBeGreaterThan(40);
+    }
+  });
+
+  it('maintains multi-turn conversation continuity over MCP traceforge.chat.ask', async () => {
+    const service = new TraceForgeMaasService();
+    const auth = { authorization: 'Bearer tf_agent_local_token' };
+    const started = (await service.executeTool(
+      'traceforge.chat.start',
+      { title: 'multi-turn capability test' },
+      auth,
+    )) as { conversationId: string };
+
+    const turns = [
+      'How does TraceForge work?',
+      'what else can i do?',
+      'Tell me more.',
+      'How does that work?',
+      'How about the other board?',
+      'What happens after the diagnosis?',
+    ];
+
+    for (const message of turns) {
+      const res = (await service.executeTool(
+        'traceforge.chat.ask',
+        { conversationId: started.conversationId, message },
+        auth,
+      )) as { reply: string; liveInvoked: boolean; incurredCostUsd: number; kbVersion: string };
+      expect(res.liveInvoked).toBe(false);
+      expect(res.incurredCostUsd).toBe(0);
+      expect(res.kbVersion).toBe('2026.10.27-v4');
+      expect(res.reply.toLowerCase()).not.toContain("don't have verified traceforge documentation");
+    }
+  });
+
+  it('exports welcome bubble, 3-second thinking hold, and theme persistence constants', async () => {
+    const assistantMod = await import('../src/components/TraceForgeAssistant');
+    const headerMod = await import('../src/components/Header');
+    expect(assistantMod.ASSISTANT_THINKING_MIN_MS).toBe(3000);
+    expect(assistantMod.WELCOME_BUBBLE_TEXT).toBe("Hi! I'm your TraceForge Assistant. Need a hand?");
+    expect(assistantMod.WELCOME_SESSION_STORAGE_KEY).toBe('tf_assistant_welcome_shown');
+    expect(headerMod.THEME_STORAGE_KEY).toBe('tf_theme');
+  });
 });

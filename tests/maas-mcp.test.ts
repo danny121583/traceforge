@@ -1738,7 +1738,7 @@ describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
     const kb = (await service.executeTool('traceforge.kb.search', { query: 'What does NRST mean?' }, {})) as {
       kbVersion: string; coverage: string; answer: string; sources: unknown[]; liveInvoked: boolean; incurredCostUsd: number;
     };
-    expect(kb.kbVersion).toBe('2026.10.27-v3');
+    expect(kb.kbVersion).toBe('2026.10.27-v4');
     expect(kb.answer.length).toBeGreaterThan(0);
     expect(kb.sources.length).toBeGreaterThan(0);
     expect(kb.liveInvoked).toBe(false);
@@ -1748,7 +1748,7 @@ describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
       kbVersion: string; topicCount: number; liveUsage: { allowanceUsd: number }; limits: Record<string, number>;
       activeConversationCount: number; feedbackCount: number; suggestedQuestions: string[];
     };
-    expect(status.kbVersion).toBe('2026.10.27-v3');
+    expect(status.kbVersion).toBe('2026.10.27-v4');
     expect(status.topicCount).toBe(18);
     expect(status.liveUsage.allowanceUsd).toBe(2);
     expect(status.limits['maxLiveCallsPerSession']).toBe(10);
@@ -1786,7 +1786,7 @@ describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
     expect(started.ownerActorId).toBe('actor_chatgpt_agent');
     expect(started.scenarioId).toBe(scenario.scenarioId);
     expect(started.sessionTicket.startsWith('tf_chat_')).toBe(true);
-    expect(started.kbVersion).toBe('2026.10.27-v3');
+    expect(started.kbVersion).toBe('2026.10.27-v4');
     expect(started.messageCount).toBe(0);
 
     const first = (await service.executeTool(
@@ -1823,7 +1823,7 @@ describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
     };
     expect(history.messageCount).toBe(4);
     expect(history.messages.map((m) => m.role)).toEqual(['user', 'assistant', 'user', 'assistant']);
-    expect(history.kbVersion).toBe('2026.10.27-v3');
+    expect(history.kbVersion).toBe('2026.10.27-v4');
 
     const feedback = (await service.executeTool(
       'traceforge.chat.feedback',
@@ -1931,7 +1931,7 @@ describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
       results: Array<{ answer: string; liveInvoked: boolean; costUsd: number; passed: boolean }>;
     };
     expect(report.qaMode).toBe(true);
-    expect(report.kbVersion).toBe('2026.10.27-v3');
+    expect(report.kbVersion).toBe('2026.10.27-v4');
     expect(report.totalQuestions).toBe(2);
     expect(report.liveCallsInvoked).toBe(0);
     expect(report.totalCostUsd).toBe(0);
@@ -1978,6 +1978,6 @@ describe('23. assistant & knowledge base tools (25-tool catalog)', () => {
     const structured = searched.result['structuredContent'] as { answer: string; liveInvoked: boolean; kbVersion: string };
     expect(structured.answer.length).toBeGreaterThan(0);
     expect(structured.liveInvoked).toBe(false);
-    expect(structured.kbVersion).toBe('2026.10.27-v3');
+    expect(structured.kbVersion).toBe('2026.10.27-v4');
   });
 });

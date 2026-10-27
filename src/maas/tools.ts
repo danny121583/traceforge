@@ -2733,7 +2733,7 @@ export class TraceForgeMaasService {
       : {};
     const history = record.messages
       .slice(-ASSISTANT_MAX_HISTORY_MESSAGES)
-      .map((m) => ({ role: m.role, content: m.content }));
+      .map((m) => ({ role: m.role, content: m.content.slice(0, ASSISTANT_MAX_INPUT_CHARS) }));
     // Live inference stays explicitly gated: the caller's token must carry
     // `traceforge:live_inference:execute`, exactly like `mode: "live"`
     // investigations. Anything else answers from knowledge at $0.00.

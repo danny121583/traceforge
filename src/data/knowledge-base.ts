@@ -8,10 +8,10 @@
  * `tests/assistant-rag.test.ts` alongside the code change.
  *
  * All 18 entries are static, reviewed documentation — answering from them
- * costs $0.00 and never invokes live model inference.
+ * runs locally at zero cost and never invokes live model inference.
  */
 
-export const KB_VERSION = '2026.10.27-v3';
+export const KB_VERSION = '2026.10.27-v4';
 
 export interface KnowledgeBaseEntry {
   /** Stable entry id (used in RAG source citations). */
@@ -39,12 +39,12 @@ export const KNOWLEDGE_BASE_ENTRIES: KnowledgeBaseEntry[] = [
   {
     id: 'getting-started',
     title: 'TraceForge Documentation — Getting Started',
-    topics: ['getting started', 'introduction', 'how traceforge works', 'overview', 'workflow'],
-    keywords: ['traceforge', 'workbench', 'virtual', 'laboratory', 'getting', 'started', 'workflow', 'step', 'diagnostic', 'hardware-free'],
+    topics: ['getting started', 'introduction', 'how traceforge works', 'overview', 'workflow', 'capabilities', 'features', 'what can i do', 'help'],
+    keywords: ['traceforge', 'workbench', 'virtual', 'laboratory', 'getting', 'started', 'workflow', 'step', 'diagnostic', 'hardware-free', 'capabilities', 'features', 'options', 'else', 'help', 'theme', 'light', 'dark'],
     content: [
       'TraceForge is a hardware-free virtual circuit diagnostic laboratory: an interactive workbench where you practice real diagnostic reasoning on three reference boards simulated by a deterministic Linear DC engine. No bench, no parts, no risk: every fault is reproducible, every measurement is explained, and every diagnosis is scored objectively against withheld ground truth.',
       'The complete workflow has three guided steps. Step 1, Choose Circuit: pick one of the three reference boards (FPV Drone Flight Controller F405, ESP32-S3 IoT Sensor Node, or USB-C Power Delivery Trigger); TraceForge secretly injects one hidden electrical fault into the virtual circuit. Step 2, Investigate: run an autonomous AI investigation or probe manually — the virtual multimeter measures node voltages, branch currents, and unpowered continuity, each probe consuming the 8-probe budget. Step 3, Review Results: compare the AI diagnosis against the hidden fault with an objective 0–100 score, then follow rework guidance for confirmed faults.',
-      'Everything runs free by default in Virtual Lab mode (deterministic simulation). Live Muse Spark 1.3 inference (Live AI) is a strictly explicit, paid opt-in. A zero-cost recorded-investigation replay is available for demonstration without spending anything.',
+      'Everything runs free by default in Virtual Lab mode (deterministic simulation). Live Muse Spark 1.3 inference (Live AI) is a strictly explicit, paid opt-in. A zero-cost recorded-investigation replay is available for demonstration without spending anything, and the workbench header includes a Light/Dark theme toggle with persistent theme preference.',
     ].join('\n\n'),
   },
   {
@@ -200,11 +200,11 @@ export const KNOWLEDGE_BASE_ENTRIES: KnowledgeBaseEntry[] = [
   {
     id: 'mcp-integration',
     title: 'TraceForge Documentation — MCP & OAuth 2.1 Integration',
-    topics: ['mcp', 'oauth', 'integration', 'api', 'pkce'],
-    keywords: ['mcp', 'oauth', 'pkce', 'token', 'scope', 'bearer', 'json-rpc', 'api', 'tools', 'register', 'authorize'],
+    topics: ['mcp', 'oauth', 'integration', 'api', 'pkce', 'refresh token', 'reconnect', 'renewal'],
+    keywords: ['mcp', 'oauth', 'pkce', 'token', 'scope', 'bearer', 'json-rpc', 'api', 'tools', 'register', 'authorize', 'refresh', 'reconnect', 'expire', 'renewal'],
     content: [
-      'The staging backend (traceforge-mcp-staging) serves the 25-tool MaaS/MCP surface over MCP 2025-06-18 streamable-HTTP JSON-RPC at /mcp, plus MaaS REST (/api/maas/*) and browser backend routes (/api/meta/*). Public tools (capabilities, status, models, budget, circuits) need no token (this includes kb.search and chat.status); the 7 assistant and knowledge base tools are traceforge.kb.search (public versioned knowledge search at zero cost), traceforge.chat.status (public assistant status and the shared $2.00 live-chat ledger), traceforge.chat.start (open a session-grounded conversation), traceforge.chat.ask (RAG-first answers plus the built-in 20-question QA benchmark via runStandard20QuestionQa), traceforge.chat.history, traceforge.chat.clear, and traceforge.chat.feedback; conversation tools accept traceforge:discovery:read, and traceforge:assistant:chat is also granted to agent and owner tokens. Every other tool needs a Bearer token carrying its listed scope.',
-      'OAuth 2.1 + PKCE S256 works for ChatGPT, Muse / Meta AI, and generic MCP clients via RFC 7591 dynamic registration (client_name optional): POST /oauth/register, then GET /oauth/authorize with a code_challenge, then POST /oauth/token with the code_verifier (grant_type authorization_code, refresh via grant_type refresh_token, revoke via POST /oauth/revoke). Each issued token binds to its own actor_oauth_<clientId> actor with only its granted scopes, and scenarios plus assistant conversations stay strictly per-actor. Discovery metadata lives at /.well-known/oauth-protected-resource (with resource_documentation pointing at GET /docs/mcp, which documents all 25 tools) and /.well-known/oauth-authorization-server.',
+      'The staging backend (traceforge-mcp-staging) serves the 25-tool MCP surface over MCP 2025-06-18 streamable-HTTP JSON-RPC at /mcp, plus MCP REST (/api/maas/*) and browser backend routes (/api/meta/*). Public tools (capabilities, status, models, budget, circuits) need no token (this includes kb.search and chat.status); the 7 assistant and knowledge base tools are traceforge.kb.search (public versioned knowledge search at zero cost), traceforge.chat.status (public assistant status and the shared live-chat allowance ledger), traceforge.chat.start (open a session-grounded conversation), traceforge.chat.ask (RAG-first answers plus the built-in 20-question QA benchmark via runStandard20QuestionQa), traceforge.chat.history, traceforge.chat.clear, and traceforge.chat.feedback; conversation tools accept traceforge:discovery:read, and traceforge:assistant:chat is also granted to agent and owner tokens. Every other tool needs a Bearer token carrying its listed scope.',
+      'OAuth 2.1 + PKCE S256 works for ChatGPT, Muse / Meta AI, and generic MCP clients via RFC 7591 dynamic registration (client_name optional): POST /oauth/register, then GET /oauth/authorize with a code_challenge, then POST /oauth/token with the code_verifier (grant_type authorization_code, refresh via grant_type refresh_token, revoke via POST /oauth/revoke). Access tokens are short-lived (60 minutes) and renew automatically via rotating 30-day refresh tokens persisted in TraceForgeStateDO durable storage, eliminating routine manual reconnections across Worker deployments. Each issued token binds to its own actor_oauth_<clientId> actor with only its granted scopes, and scenarios plus assistant conversations stay strictly per-actor. Discovery metadata lives at /.well-known/oauth-protected-resource (with resource_documentation pointing at GET /docs/mcp, which documents all 25 tools) and /.well-known/oauth-authorization-server.',
       'Session tokens (scn_… scenario ids, inv_… investigation ids) are self-contained AES-256-GCM authenticated tokens: any worker isolate holding the session secret can hydrate them, and committed probes, investigations, scorecards, conversations, and feedback synchronize through Edge Cache plus the TraceForgeStateDO Durable Object coordinator. Typical flows: scenarios.create, measurements.voltage/current/continuity, investigations.start, evaluation.score, evaluation.report — and chat.start, chat.ask (optionally grounded in an owned scenarioId with HiddenFault strictly withheld), chat.history, chat.feedback, chat.clear, kb.search, chat.status.',
     ].join('\n\n'),
   },

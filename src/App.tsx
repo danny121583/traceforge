@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Header } from './components/Header';
+import { Header, THEME_STORAGE_KEY, type ThemeMode } from './components/Header';
 import { PcbCanvas } from './components/PcbCanvas';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
 import { TraceForgeAssistant } from './components/TraceForgeAssistant';
@@ -78,6 +78,42 @@ function agentStepClass(step: AgentStep): string {
 }
 
 export function App() {
+  // Theme preference: dark mode by default, persisted in localStorage across refreshes.
+  const [theme, setTheme] = useState<ThemeMode>(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage.getItem(THEME_STORAGE_KEY) === 'light') {
+        return 'light';
+      }
+    } catch {
+      // Fall back to dark mode if storage is unavailable.
+    }
+    return 'dark';
+  });
+
+  useEffect(() => {
+    try {
+      if (typeof document !== 'undefined') {
+        document.documentElement.setAttribute('data-theme', theme);
+      }
+    } catch {
+      // Ignore DOM attribute errors in non-browser environments.
+    }
+  }, [theme]);
+
+  function handleToggleTheme() {
+    setTheme((prev) => {
+      const next: ThemeMode = prev === 'dark' ? 'light' : 'dark';
+      try {
+        if (typeof window !== 'undefined') {
+          window.localStorage.setItem(THEME_STORAGE_KEY, next);
+        }
+      } catch {
+        // Ignore storage write errors.
+      }
+      return next;
+    });
+  }
+
   // Phase 2: persist the selected AI mode across reloads (never silently
   // revert it). Guarded for SSR/Node where `window` is undefined.
   const [mode, setMode] = useState<ClientMode>(() => {
@@ -971,8 +1007,14 @@ export function App() {
   ];
 
   return (
-    <div className="tf-app">
-      <Header client={client} onToggleMode={handleToggleMode} badge={activeModeBadge} />
+    <div className="tf-app" data-theme={theme}>
+      <Header
+        client={client}
+        onToggleMode={handleToggleMode}
+        badge={activeModeBadge}
+        theme={theme}
+        onToggleTheme={handleToggleTheme}
+      />
       <ol className="tf-steps" aria-label="Guided diagnostic steps">
         {GUIDE_STEPS.map((s) => (
           <li
