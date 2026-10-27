@@ -405,7 +405,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       redirectUri,
       state: input['state'] ?? '',
       challenge,
-      scope: input['scope'] ?? WORKER_DEFAULT_SCOPE,
+      scope: input['scope']?.trim() ? input['scope'] : WORKER_DEFAULT_SCOPE,
     };
   }
 

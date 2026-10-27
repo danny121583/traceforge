@@ -630,6 +630,77 @@ describe('Phase 4: stateless multi-isolate OAuth/MCP hardening', () => {
   });
 });
 
+describe('Phase 5: cross-isolate scenario/investigation hydration', () => {
+  it('flows create -> voltage -> start -> result -> score -> report across 6 cold isolates; 7th rejects cross-tenant', async () => {
+    const w1 = createTraceForgeWorker();
+    const w2 = createTraceForgeWorker();
+    const w3 = createTraceForgeWorker();
+    const w4 = createTraceForgeWorker();
+    const w5 = createTraceForgeWorker();
+    const w6 = createTraceForgeWorker();
+    const w7 = createTraceForgeWorker();
+
+    const created = await mcpCall(w1, 'tools/call', {
+      name: 'traceforge.scenarios.create',
+      arguments: { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+    }, AGENT);
+    const createdContent = created.envelope['result'] as { structuredContent: { scenarioId: string }; isError: boolean };
+    expect(createdContent.isError ?? false).toBe(false);
+    const scenarioId = createdContent.structuredContent.scenarioId;
+    expect(scenarioId.startsWith('scn_')).toBe(true);
+
+    const measured = await mcpCall(w2, 'tools/call', {
+      name: 'traceforge.measurements.voltage',
+      arguments: { scenarioId, node: 'U1-14' },
+    }, AGENT);
+    const measuredContent = measured.envelope['result'] as { structuredContent: { probesUsed: number }; isError: boolean };
+    expect(measuredContent.isError ?? false).toBe(false);
+    expect(measuredContent.structuredContent.probesUsed).toBe(1);
+
+    const started = await mcpCall(w3, 'tools/call', {
+      name: 'traceforge.investigations.start',
+      arguments: { scenarioId },
+    }, AGENT);
+    const startedContent = started.envelope['result'] as { structuredContent: { investigationId: string; completed: boolean }; isError: boolean };
+    expect(startedContent.isError ?? false).toBe(false);
+    expect(startedContent.structuredContent.completed).toBe(true);
+    const investigationId = startedContent.structuredContent.investigationId;
+    expect(investigationId.startsWith('inv_')).toBe(true);
+
+    const result = await mcpCall(w4, 'tools/call', {
+      name: 'traceforge.investigations.result',
+      arguments: { investigationId },
+    }, AGENT);
+    const resultContent = result.envelope['result'] as { structuredContent: { proposedDiagnosis: unknown }; isError: boolean };
+    expect(resultContent.isError ?? false).toBe(false);
+    expect(resultContent.structuredContent.proposedDiagnosis).toBeTruthy();
+
+    const scored = await mcpCall(w5, 'tools/call', {
+      name: 'traceforge.evaluation.score',
+      arguments: { scenarioId },
+    }, AGENT);
+    const scoredContent = scored.envelope['result'] as { structuredContent: { score: { totalScore: number } | null }; isError: boolean };
+    expect(scoredContent.isError ?? false).toBe(false);
+    expect(scoredContent.structuredContent.score).toBeTruthy();
+
+    const reported = await mcpCall(w6, 'tools/call', {
+      name: 'traceforge.evaluation.report',
+      arguments: { scenarioId },
+    }, AGENT);
+    const reportedContent = reported.envelope['result'] as { structuredContent: { scorecard: unknown }; isError: boolean };
+    expect(reportedContent.isError ?? false).toBe(false);
+    expect(reportedContent.structuredContent.scorecard).toBeTruthy();
+
+    const crossed = await mcpCall(w7, 'tools/call', {
+      name: 'traceforge.measurements.voltage',
+      arguments: { scenarioId, node: 'U1-14' },
+    }, SECONDARY);
+    expect(
+      (crossed.envelope['result'] as { structuredContent: { code: string }; isError: boolean }).structuredContent.code,
+    ).toBe('MAAS_CROSS_TENANT_ACCESS_DENIED');
+  });
+});
+
 describe('worker package independence', () => {
   it('contains zero Node.js built-in imports', () => {
     const source: string = workerSource;

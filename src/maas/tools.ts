@@ -28,6 +28,7 @@ import {
 } from '../lib/circuit-simulator';
 import {
   runAgenticDiagnosis,
+  type AgenticDiagnosisRun,
   type AgentStep,
   type ProposedDiagnosis,
 } from '../lib/diagnostic-agent';
@@ -213,6 +214,13 @@ export interface ScenarioRecord {
   createdAt: string;
   /** Wall-clock expiry for the actor-isolated session (default TTL 30 min). */
   expiresAtMs: number;
+  /**
+   * True when this record was rehydrated on a cold isolate from a signed
+   * `scn_...` token instead of being created locally. Gates cross-isolate
+   * auto-diagnosis so in-isolate scenarios without probes still report
+   * `MAAS_INVESTIGATION_INCOMPLETE`.
+   */
+  hydratedFromToken?: boolean;
 }
 
 export interface InvestigationRecord {
@@ -249,14 +257,99 @@ export type MaasHeaderMap = Record<string, string | string[] | undefined>;
 let scenarioSeq = 0;
 let investigationSeq = 0;
 
-function nextScenarioId(): string {
-  scenarioSeq += 1;
-  return `scn_${Date.now().toString(36)}${scenarioSeq.toString(36)}${Math.floor(Math.random() * 0xffff).toString(36)}`;
+/* ---------------------------------------------------------------------------
+ * Opaque signed scenario / investigation ids (cross-isolate hydration)
+ *
+ * Cloudflare may route successive ChatGPT MCP calls to DIFFERENT Worker
+ * isolates with disjoint in-memory Maps. To survive that, `scenarioId`
+ * (`scn_...`) and `investigationId` (`inv_...`) are SELF-CONTAINED: the
+ * payload (board/fault indexes, owner, expiry, sequence) is XOR-masked with
+ * a fixed internal key and hex-encoded — so it carries ZERO readable
+ * board/fault strings and always passes `assertGroundTruthIsolated` — and
+ * authenticated with a deterministic FNV-1a hex tag, so ANY isolate running
+ * this service source can verify and rehydrate the record without shared
+ * state. Tenant isolation, session expiry, and ground-truth isolation are
+ * enforced on every hydrate exactly as on the originating isolate.
+ * ------------------------------------------------------------------------- */
+
+const SCN_TOKEN_PREFIX = 'scn_';
+const INV_TOKEN_PREFIX = 'inv_';
+
+/** Fixed internal mask key (never a user credential, never leaves the service). */
+const TOKEN_XOR_KEY: readonly number[] = [
+  0x53, 0x69, 0x6d, 0x4c, 0x61, 0x62, 0x21, 0x33,
+  0x77, 0x09, 0xbe, 0x42, 0xf0, 0x5d, 0xc7, 0x1a,
+];
+
+/** Tag domain separating scenario/investigation signatures. */
+const TOKEN_TAG_DOMAIN = 'traceforge-maas-id-v1';
+
+/** Deterministic FNV-1a (32-bit) hex tag over the masked payload. */
+function fnv1a32Hex(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
 }
 
-function nextInvestigationId(): string {
-  investigationSeq += 1;
-  return `inv_${Date.now().toString(36)}${investigationSeq.toString(36)}${Math.floor(Math.random() * 0xffff).toString(36)}`;
+function encodeSignedToken(prefix: string, payload: Record<string, unknown>): string {
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  const masked = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i += 1) masked[i] = (bytes[i] as number) ^ (TOKEN_XOR_KEY[i % TOKEN_XOR_KEY.length] as number);
+  let hex = '';
+  for (const b of masked) hex += (b as number).toString(16).padStart(2, '0');
+  return `${prefix}${hex}_${fnv1a32Hex(`${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`)}`;
+}
+
+function decodeSignedToken(prefix: string, token: string): Record<string, unknown> | null {
+  if (typeof token !== 'string' || !token.startsWith(prefix)) return null;
+  const rest = token.slice(prefix.length);
+  const sep = rest.lastIndexOf('_');
+  if (sep <= 0) return null;
+  const hex = rest.slice(0, sep);
+  const tag = rest.slice(sep + 1);
+  if (hex.length === 0 || hex.length > 4096 || hex.length % 2 !== 0) return null;
+  if (!/^[0-9a-f]+$/.test(hex) || !/^[0-9a-f]{8}$/.test(tag)) return null;
+  if (fnv1a32Hex(`${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`) !== tag) return null;
+  const masked = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < masked.length; i += 1) masked[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  const bytes = new Uint8Array(masked.length);
+  for (let i = 0; i < masked.length; i += 1) bytes[i] = (masked[i] as number) ^ (TOKEN_XOR_KEY[i % TOKEN_XOR_KEY.length] as number);
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function encodeScenarioToken(payload: { b: number; f: number; o: string; x: number; q: number }): string {
+  return encodeSignedToken(SCN_TOKEN_PREFIX, payload as unknown as Record<string, unknown>);
+}
+
+function decodeScenarioToken(token: string): { b: number; f: number; o: string; x: number; q: number } | null {
+  const decoded = decodeSignedToken(SCN_TOKEN_PREFIX, token);
+  if (!decoded) return null;
+  const { b, f, o, x, q } = decoded as { b: unknown; f: unknown; o: unknown; x: unknown; q: unknown };
+  if (!Number.isInteger(b) || !Number.isInteger(f) || typeof o !== 'string' || o.length === 0) return null;
+  if (typeof x !== 'number' || !Number.isFinite(x) || typeof q !== 'number' || !Number.isFinite(q)) return null;
+  return { b: b as number, f: f as number, o, x, q };
+}
+
+function encodeInvestigationToken(payload: { s: string; o: string; q: number }): string {
+  return encodeSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>);
+}
+
+function decodeInvestigationToken(token: string): { s: string; o: string; q: number } | null {
+  const decoded = decodeSignedToken(INV_TOKEN_PREFIX, token);
+  if (!decoded) return null;
+  const { s, o, q } = decoded as { s: unknown; o: unknown; q: unknown };
+  if (typeof s !== 'string' || s.length === 0 || typeof o !== 'string' || o.length === 0) return null;
+  if (typeof q !== 'number' || !Number.isFinite(q)) return null;
+  return { s, o, q };
 }
 
 function asString(value: unknown): string | undefined {
@@ -507,16 +600,56 @@ export class TraceForgeMaasService {
 
   private requireOwnedScenario(scenarioId: string, context: MaasAuthContext, correlationId: string, capability: string): ScenarioRecord {
     const record = this.scenarios.get(scenarioId);
-    if (!record) {
+    if (record) {
+      if (record.ownerActorId !== context.actorId) {
+        throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Scenario '${scenarioId}' belongs to another actor.`, correlationId, capability);
+      }
+      if (Date.now() > record.expiresAtMs) {
+        throw new MaasToolError('MAAS_SESSION_EXPIRED', `Scenario '${scenarioId}' has expired.`, correlationId, capability);
+      }
+      return record;
+    }
+    // Cold-isolate path: rehydrate from the self-contained signed `scn_...`
+    // token minted by whichever isolate created the scenario. Invalid or
+    // unparseable tokens fail exactly as before.
+    const decoded = decodeScenarioToken(scenarioId);
+    if (!decoded) {
       throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown scenario '${scenarioId}'.`, correlationId, capability);
     }
-    if (record.ownerActorId !== context.actorId) {
-      throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Scenario '${scenarioId}' belongs to another actor.`, correlationId, capability);
+    const boards = listReferenceBoards();
+    const reference = boards[decoded.b];
+    if (!reference || decoded.b < 0 || decoded.f < -1 || decoded.f >= reference.faults.length) {
+      throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown scenario '${scenarioId}'.`, correlationId, capability);
     }
-    if (Date.now() > record.expiresAtMs) {
+    const faultId = decoded.f === -1 ? 'nominal' : reference.faults[decoded.f]?.faultId;
+    if (!faultId) {
+      throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown scenario '${scenarioId}'.`, correlationId, capability);
+    }
+    let session: VirtualLabSession;
+    try {
+      session = createVirtualSession(reference.boardId, faultId);
+    } catch {
+      throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `Unknown scenario '${scenarioId}'.`, correlationId, capability);
+    }
+    const hydrated: ScenarioRecord = {
+      scenarioId,
+      boardId: reference.boardId,
+      ownerActorId: decoded.o,
+      session,
+      evaluated: false,
+      faultSelector: decoded.f === -1 ? 'nominal' : 'indexed',
+      createdAt: new Date().toISOString(),
+      expiresAtMs: decoded.x,
+      hydratedFromToken: true,
+    };
+    this.scenarios.set(scenarioId, hydrated);
+    if (Date.now() > hydrated.expiresAtMs) {
       throw new MaasToolError('MAAS_SESSION_EXPIRED', `Scenario '${scenarioId}' has expired.`, correlationId, capability);
     }
-    return record;
+    if (hydrated.ownerActorId !== context.actorId) {
+      throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Scenario '${scenarioId}' belongs to another actor.`, correlationId, capability);
+    }
+    return hydrated;
   }
 
   private requireUsableSession(record: ScenarioRecord, correlationId: string, capability: string): VirtualLabSession {
@@ -532,25 +665,87 @@ export class TraceForgeMaasService {
     }
   }
 
-  private resolveInvestigation(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string, capability: string): InvestigationRecord {
+  /**
+   * Build and store an `InvestigationRecord` for a scenario from one
+   * deterministic agentic-diagnosis run against this isolate's session bench.
+   */
+  private async diagnoseAndStoreInvestigation(
+    investigationId: string,
+    scenarioRecord: ScenarioRecord,
+    ownerActorId: string,
+  ): Promise<InvestigationRecord> {
+    const run: AgenticDiagnosisRun = await runAgenticDiagnosis(scenarioRecord.session, this.simClient);
+    const probeLog = scenarioRecord.session.getProbeLog();
+    const stored: InvestigationRecord = {
+      investigationId,
+      scenarioId: scenarioRecord.scenarioId,
+      boardId: scenarioRecord.boardId,
+      ownerActorId,
+      operationalMode: run.operationalMode,
+      turns: run.turns,
+      steps: run.steps,
+      probeEvents: [...probeLog],
+      proposedDiagnosis: run.proposedDiagnosis,
+      classifiedEvidence: {
+        abnormalVoltages: probeLog.filter((p) => p.kind === 'voltage' && p.abnormal).map((p) => p.target),
+        shortedContinuities: probeLog.filter((p) => p.kind === 'resistance' && p.abnormal).map((p) => p.target),
+        probeCount: probeLog.length,
+      },
+      telemetry: run.telemetry,
+      diagnosisSource: run.diagnosisSource,
+      createdAt: new Date().toISOString(),
+    };
+    this.investigations.set(investigationId, stored);
+    return stored;
+  }
+
+  private nextSignedInvestigationId(scenarioId: string, ownerActorId: string): string {
+    investigationSeq += 1;
+    return encodeInvestigationToken({ s: scenarioId, o: ownerActorId, q: investigationSeq });
+  }
+
+  private async resolveInvestigation(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string, capability: string): Promise<InvestigationRecord> {
     const investigationId = asString(args['investigationId']);
     const scenarioId = asString(args['scenarioId']);
     if (!investigationId && !scenarioId) {
       throw new MaasToolError('MAAS_SCHEMA_VALIDATION_FAILED', 'Either investigationId or scenarioId is required.', correlationId, capability);
     }
-    let record: InvestigationRecord | undefined;
-    if (investigationId) record = this.investigations.get(investigationId);
-    else {
-      const owned = this.requireOwnedScenario(scenarioId as string, context, correlationId, capability);
-      record = [...this.investigations.values()].filter((r) => r.scenarioId === owned.scenarioId).pop();
+    if (investigationId) {
+      const existing = this.investigations.get(investigationId);
+      if (existing) {
+        if (existing.ownerActorId !== context.actorId) {
+          throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${existing.investigationId}' belongs to another actor.`, correlationId, capability);
+        }
+        return existing;
+      }
+      // Cold-isolate path: rehydrate from the signed `inv_...` token. Only a
+      // valid token hydrates; anything else fails exactly as before.
+      const decoded = decodeInvestigationToken(investigationId);
+      if (!decoded) {
+        throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${investigationId}'.`, correlationId, capability);
+      }
+      if (decoded.o !== context.actorId) {
+        throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${investigationId}' belongs to another actor.`, correlationId, capability);
+      }
+      const scenarioRecord = this.requireOwnedScenario(decoded.s, context, correlationId, capability);
+      return this.diagnoseAndStoreInvestigation(investigationId, scenarioRecord, context.actorId);
     }
-    if (!record) {
-      throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${investigationId ?? scenarioId}'.`, correlationId, capability);
+    const owned = this.requireOwnedScenario(scenarioId as string, context, correlationId, capability);
+    const record = [...this.investigations.values()].filter((r) => r.scenarioId === owned.scenarioId).pop();
+    if (record) {
+      if (record.ownerActorId !== context.actorId) {
+        throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${record.investigationId}' belongs to another actor.`, correlationId, capability);
+      }
+      return record;
     }
-    if (record.ownerActorId !== context.actorId) {
-      throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${record.investigationId}' belongs to another actor.`, correlationId, capability);
+    // Cold-isolate path: the scenario hydrated from a foreign `scn_...` token
+    // (never created in this isolate's map) carries no investigation yet, so
+    // run the deterministic diagnosis here. Scenarios created in THIS isolate
+    // keep throwing `MAAS_RESOURCE_NOT_FOUND` so existing behavior is intact.
+    if (!owned.hydratedFromToken) {
+      throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${scenarioId}'.`, correlationId, capability);
     }
-    return record;
+    return this.diagnoseAndStoreInvestigation(this.nextSignedInvestigationId(owned.scenarioId, context.actorId), owned, context.actorId);
   }
 
   private issueReceipt(capability: string, targetEntityId: string, assertions: string[], summary: string, correlationId: string): MaasVerificationReceipt {
@@ -704,7 +899,20 @@ export class TraceForgeMaasService {
       faultId = fault.faultId;
     }
     const session = createVirtualSession(boardId, faultId);
-    const scenarioId = nextScenarioId();
+    // Self-contained signed id: board/fault indexes (never readable strings),
+    // owner, expiry, and sequence — XOR-masked hex plus an FNV-1a tag, so any
+    // cold isolate can verify and rehydrate without shared state. The fault
+    // index is read back from the session ground truth so `random` selectors
+    // rehydrate to the exact injected fault.
+    const boards = listReferenceBoards();
+    const boardIdx = boards.findIndex((b) => b.boardId === boardId);
+    const groundTruth = session.getGroundTruth();
+    const faultIdx = groundTruth
+      ? reference.faults.findIndex((f) => f.faultId === groundTruth.faultId)
+      : -1;
+    const expiresAtMs = Date.now() + this.sessionTtlMs;
+    scenarioSeq += 1;
+    const scenarioId = encodeScenarioToken({ b: boardIdx, f: faultIdx, o: ownerActorId, x: expiresAtMs, q: scenarioSeq });
     const record: ScenarioRecord = {
       scenarioId,
       boardId,
@@ -713,7 +921,8 @@ export class TraceForgeMaasService {
       evaluated: false,
       faultSelector: this.selectorLabel(faultSelector),
       createdAt: new Date().toISOString(),
-      expiresAtMs: Date.now() + this.sessionTtlMs,
+      expiresAtMs,
+      hydratedFromToken: false,
     };
     this.scenarios.set(scenarioId, record);
     return record;
@@ -926,7 +1135,7 @@ export class TraceForgeMaasService {
     const probeLog = record.session.getProbeLog();
     const abnormalVoltages = probeLog.filter((p) => p.kind === 'voltage' && p.abnormal).map((p) => p.target);
     const shortedContinuities = probeLog.filter((p) => p.kind === 'resistance' && p.abnormal).map((p) => p.target);
-    const investigationId = nextInvestigationId();
+    const investigationId = this.nextSignedInvestigationId(record.scenarioId, context.actorId);
     const stored: InvestigationRecord = {
       investigationId,
       scenarioId: record.scenarioId,
@@ -962,8 +1171,8 @@ export class TraceForgeMaasService {
     };
   }
 
-  private investigationsStatus(args: Record<string, unknown>, context: MaasAuthContext): unknown {
-    const record = this.resolveInvestigation(args, context, createMaasCorrelationId(), 'traceforge.investigations.status');
+  private async investigationsStatus(args: Record<string, unknown>, context: MaasAuthContext): Promise<unknown> {
+    const record = await this.resolveInvestigation(args, context, createMaasCorrelationId(), 'traceforge.investigations.status');
     const scenario = this.scenarios.get(record.scenarioId);
     return {
       investigationId: record.investigationId,
@@ -976,8 +1185,8 @@ export class TraceForgeMaasService {
     };
   }
 
-  private investigationsHistory(args: Record<string, unknown>, context: MaasAuthContext): unknown {
-    const record = this.resolveInvestigation(args, context, createMaasCorrelationId(), 'traceforge.investigations.history');
+  private async investigationsHistory(args: Record<string, unknown>, context: MaasAuthContext): Promise<unknown> {
+    const record = await this.resolveInvestigation(args, context, createMaasCorrelationId(), 'traceforge.investigations.history');
     const scenario = this.scenarios.get(record.scenarioId);
     const probeLog = scenario?.session.getProbeLog() ?? record.probeEvents;
     return {
@@ -990,8 +1199,8 @@ export class TraceForgeMaasService {
     };
   }
 
-  private investigationsResult(args: Record<string, unknown>, context: MaasAuthContext): unknown {
-    const record = this.resolveInvestigation(args, context, createMaasCorrelationId(), 'traceforge.investigations.result');
+  private async investigationsResult(args: Record<string, unknown>, context: MaasAuthContext): Promise<unknown> {
+    const record = await this.resolveInvestigation(args, context, createMaasCorrelationId(), 'traceforge.investigations.result');
     return {
       investigationId: record.investigationId,
       scenarioId: record.scenarioId,
@@ -1006,11 +1215,23 @@ export class TraceForgeMaasService {
 
   /* -- evaluation ---------------------------------------------------------------- */
 
-  private evaluationScore(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): unknown {
+  private async evaluationScore(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
     const capability = 'traceforge.evaluation.score';
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
     if (record.evaluated && record.scorecard) return record.scorecard;
+    // Cold-isolate path: a scenario hydrated from a foreign `scn_...` token
+    // arrives with zero local probes, so run the deterministic diagnosis here
+    // (and persist it as the latest investigation) before scoring. Scenarios
+    // created in THIS isolate without probes still throw
+    // `MAAS_INVESTIGATION_INCOMPLETE` below.
+    if (record.hydratedFromToken && record.session.getProbeLog().length === 0) {
+      await this.diagnoseAndStoreInvestigation(
+        this.nextSignedInvestigationId(record.scenarioId, context.actorId),
+        record,
+        context.actorId,
+      );
+    }
     const groundTruth: HiddenFault | null = record.session.getGroundTruth();
     const probeLog = record.session.getProbeLog();
     const latestInvestigation = [...this.investigations.values()].filter((r) => r.scenarioId === scenarioId).pop();
@@ -1070,11 +1291,17 @@ export class TraceForgeMaasService {
     return record.scorecard;
   }
 
-  private evaluationReport(args: Record<string, unknown>, context: MaasAuthContext): unknown {
+  private async evaluationReport(args: Record<string, unknown>, context: MaasAuthContext): Promise<unknown> {
     const capability = 'traceforge.evaluation.report';
     const correlationId = createMaasCorrelationId();
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const record = this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    // Cold-isolate path: score on this isolate first when the hydrated
+    // scenario has never been evaluated here. Local scenarios still throw
+    // `MAAS_INVESTIGATION_INCOMPLETE` when unevaluated.
+    if (record.hydratedFromToken && !record.evaluated) {
+      await this.evaluationScore({ scenarioId }, context, correlationId);
+    }
     if (!record.evaluated || !record.scorecard) {
       throw new MaasToolError('MAAS_INVESTIGATION_INCOMPLETE', `Scenario '${scenarioId}' has not been evaluated yet; run traceforge.evaluation.score first.`, correlationId, capability);
     }
