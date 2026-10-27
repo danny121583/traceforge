@@ -197,3 +197,56 @@ describe('MetaClient simulation mode', () => {
     expect(detectBoardId('unrelated toaster')).toBeUndefined();
   });
 });
+
+describe('Phase 2: proxyConfigured tracking (live mode never resets)', () => {
+  it('starts unconfigured and exposes proxyConfigured in status()', () => {
+    const client = new MetaClient({ mode: 'live', apiKey: 'k' });
+    expect(client.isProxyConfigured()).toBe(false);
+    expect(client.status()).toMatchObject({ proxyConfigured: false });
+    // Mode selection is sticky client-side: nothing here flips it.
+    expect(client.mode).toBe('live');
+  });
+
+  it('setProxyConfigured round-trips into status()', () => {
+    const client = new MetaClient({ mode: 'live', apiKey: 'k' });
+    client.setProxyConfigured(true);
+    expect(client.isProxyConfigured()).toBe(true);
+    expect(client.status()).toMatchObject({ proxyConfigured: true });
+    client.setProxyConfigured(false);
+    expect(client.isProxyConfigured()).toBe(false);
+  });
+
+  it('proxyStatus() latches proxyConfigured on configured:true, leaves mode untouched', async () => {
+    const client = new MetaClient({
+      mode: 'live',
+      apiKey: 'k',
+      proxyBaseUrl: '/api/meta',
+      fetchFn: async () => ({ ok: true, status: 200, json: async () => ({ configured: true }) }),
+    });
+    const res = await client.proxyStatus();
+    expect(res).toMatchObject({ configured: true });
+    expect(client.isProxyConfigured()).toBe(true);
+    expect(client.status()).toMatchObject({ proxyConfigured: true });
+    expect(client.mode).toBe('live');
+  });
+
+  it('proxyStatus() with configured:false never flips proxyConfigured or mode', async () => {
+    const client = new MetaClient({
+      mode: 'live',
+      apiKey: 'k',
+      proxyBaseUrl: '/api/meta',
+      fetchFn: async () => ({ ok: true, status: 200, json: async () => ({ configured: false }) }),
+    });
+    const res = await client.proxyStatus();
+    expect(res.configured).toBe(false);
+    expect(client.isProxyConfigured()).toBe(false);
+    // The caller surfaces an alert banner; the mode itself NEVER reverts.
+    expect(client.mode).toBe('live');
+  });
+
+  it('keeps sparkMode semantics: simulated, verified live, and unverified', () => {
+    expect(new MetaClient({ mode: 'simulated' }).status().sparkMode).toBe('SIMULATED');
+    // Live with a proxy route but no verified response stays UNVERIFIED (never LIVE_API by assumption).
+    expect(new MetaClient({ mode: 'live', proxyBaseUrl: '/api/meta' }).status().sparkMode).toBe('UNVERIFIED');
+  });
+});

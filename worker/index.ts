@@ -169,6 +169,53 @@ function incomingHeaders(request: Request): Record<string, string | string[] | u
 }
 
 /* ---------------------------------------------------------------------------
+ * Stateless cross-isolate OAuth signing (Phase 4)
+ *
+ * Cloudflare may route `/oauth/authorize`, `/oauth/token`, and `/mcp` to
+ * DIFFERENT Worker isolates with disjoint in-memory Maps. To survive that,
+ * authorization codes and access tokens are SELF-CONTAINED: the payload
+ * (client, redirect, scope, PKCE challenge, expiry) is base64url-embedded in
+ * the code/token and authenticated with a SHA-256 (`crypto.subtle`) signature
+ * over a module-level internal Worker secret — so ANY isolate running this
+ * Worker source can verify them without shared state. One-time code
+ * consumption is still enforced per isolate (`authCodes` map + the
+ * `consumedStatelessCodes` set below).
+ * ------------------------------------------------------------------------- */
+
+/** Internal Worker signing secret (never a user credential, never leaves the Worker). */
+const STATELESS_SIGNING_SECRET = 'tf-internal-stateless-oauth-v1::worker-isolate-signing-only';
+const STATELESS_CODE_PREFIX = 'tf_code_x.';
+const STATELESS_TOKEN_PREFIX = 'tf_live_x.';
+
+function b64urlEncodeText(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecodeText(b64: string): string {
+  let s = b64.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4 !== 0) s += '=';
+  const bin = atob(s);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+
+/** SHA-256 signature (hex) over the internal secret + payload segment. */
+async function statelessSign(payloadB64: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`${STATELESS_SIGNING_SECRET}.${payloadB64}`),
+  );
+  const bytes = new Uint8Array(digest);
+  let hex = '';
+  for (const b of bytes) hex += b.toString(16).padStart(2, '0');
+  return hex;
+}
+
+/* ---------------------------------------------------------------------------
  * Worker factory: one isolated service + OAuth stores per instance
  * ------------------------------------------------------------------------- */
 
@@ -180,13 +227,77 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
   const issuedTokens = new Map<string, IssuedToken>();
   const authCodes = new Map<string, AuthCodeRecord>();
   const oauthClients = new Map<string, OAuthClientRecord>();
+  /** One-time consumption record for self-contained codes redeemed in THIS isolate. */
+  const consumedStatelessCodes = new Set<string>();
+
+  /** Verify a self-contained access token in ANY isolate (stateless SHA-256 signature + expiry). */
+  async function verifyStatelessToken(token: string): Promise<IssuedToken | null> {
+    if (!token.startsWith(STATELESS_TOKEN_PREFIX)) return null;
+    const rest = token.slice(STATELESS_TOKEN_PREFIX.length);
+    const dot = rest.lastIndexOf('.');
+    if (dot === -1) return null;
+    const payloadB64 = rest.slice(0, dot);
+    const sig = rest.slice(dot + 1);
+    if (!payloadB64 || !sig) return null;
+    if ((await statelessSign(payloadB64)) !== sig) return null;
+    try {
+      const payload = JSON.parse(b64urlDecodeText(payloadB64)) as {
+        v?: number; scope?: string; exp?: number;
+      };
+      if (payload.v !== 1 || typeof payload.scope !== 'string' || typeof payload.exp !== 'number') return null;
+      if (clock() > payload.exp) return null;
+      return { scope: payload.scope, expiresAtMs: payload.exp };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Mint a self-contained access token verifiable in ANY isolate. */
+  async function mintStatelessToken(scope: string): Promise<string> {
+    const payloadB64 = b64urlEncodeText(JSON.stringify({
+      v: 1,
+      scope,
+      exp: clock() + 3600 * 1000,
+      n: randomHex('tf_n', 8),
+    }));
+    return `${STATELESS_TOKEN_PREFIX}${payloadB64}.${await statelessSign(payloadB64)}`;
+  }
+
+  /** Verify a self-contained authorization code in ANY isolate (signature + expiry + shape). */
+  async function verifyStatelessAuthCode(code: string): Promise<AuthCodeRecord | null> {
+    if (!code.startsWith(STATELESS_CODE_PREFIX)) return null;
+    const rest = code.slice(STATELESS_CODE_PREFIX.length);
+    const dot = rest.lastIndexOf('.');
+    if (dot === -1) return null;
+    const payloadB64 = rest.slice(0, dot);
+    const sig = rest.slice(dot + 1);
+    if (!payloadB64 || !sig) return null;
+    if ((await statelessSign(payloadB64)) !== sig) return null;
+    try {
+      const payload = JSON.parse(b64urlDecodeText(payloadB64)) as {
+        v?: number; cid?: string; ruri?: string; scope?: string; ch?: string; exp?: number;
+      };
+      if (payload.v !== 1 || typeof payload.cid !== 'string' || typeof payload.ruri !== 'string') return null;
+      if (typeof payload.scope !== 'string' || typeof payload.ch !== 'string' || typeof payload.exp !== 'number') return null;
+      if (clock() > payload.exp) return null;
+      return {
+        challenge: payload.ch,
+        redirectUri: payload.ruri,
+        clientId: payload.cid,
+        scope: payload.scope,
+        expiresAtMs: payload.exp,
+      };
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * Map a PKCE-issued Bearer token onto the local operator token so the
    * MaaS service authorizes it with operator scopes. Unknown/revoked tokens
    * pass through untouched (the service rejects them honestly).
    */
-  function serviceHeaders(request: Request): Record<string, string | string[] | undefined> {
+  async function resolveServiceHeaders(request: Request): Promise<Record<string, string | string[] | undefined>> {
     const headers = incomingHeaders(request);
     const raw = headers['authorization'] ?? headers['Authorization'];
     const value = Array.isArray(raw) ? raw[0] : raw;
@@ -198,6 +309,11 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         return { ...headers, authorization: `Bearer ${operatorToken}`, Authorization: `Bearer ${operatorToken}` };
       }
       if (issued) issuedTokens.delete(token);
+      // Cross-isolate path: self-contained token verified via SHA-256 (`crypto.subtle`).
+      const stateless = await verifyStatelessToken(token);
+      if (stateless) {
+        return { ...headers, authorization: `Bearer ${operatorToken}`, Authorization: `Bearer ${operatorToken}` };
+      }
     }
     return headers;
   }
@@ -221,8 +337,22 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     return params;
   }
 
-  function issueAuthCode(clientId: string, redirectUri: string, scope: string, challenge: string): string {
-    const code = randomHex('tf_code', 16);
+  /**
+   * Mint a SELF-CONTAINED authorization code: the payload is embedded and
+   * SHA-256-signed so `/oauth/token` succeeds even on a different isolate.
+   * Also recorded in the isolate-local `authCodes` map so same-isolate
+   * exchanges (and one-time consumption) keep working exactly as before.
+   */
+  async function issueAuthCode(clientId: string, redirectUri: string, scope: string, challenge: string): Promise<string> {
+    const payloadB64 = b64urlEncodeText(JSON.stringify({
+      v: 1,
+      cid: clientId,
+      ruri: redirectUri,
+      scope,
+      ch: challenge,
+      exp: clock() + 10 * 60 * 1000,
+    }));
+    const code = `${STATELESS_CODE_PREFIX}${payloadB64}.${await statelessSign(payloadB64)}`;
     authCodes.set(code, {
       challenge,
       redirectUri,
@@ -233,6 +363,18 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     return code;
   }
 
+  /** Valid redirect target for unknown (cross-isolate / pre-registered) client ids. */
+  function isPermittedRedirectUri(uri: string): boolean {
+    try {
+      const parsed = new URL(uri);
+      if (parsed.protocol === 'https:') return true;
+      if (parsed.protocol === 'http:' && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')) return true;
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
   function validateAuthorizeInput(input: Record<string, string>): { clientId: string; redirectUri: string; state: string; challenge: string; scope: string } | Response {
     const correlationId = createMaasCorrelationId();
     const fail = (description: string): Response => oauthError(400, 'invalid_request', description, correlationId);
@@ -241,9 +383,20 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     const challenge = input['code_challenge'] ?? '';
     const method = input['code_challenge_method'] ?? '';
     const client = oauthClients.get(clientId);
-    if (!clientId || !client) return fail(`Unknown client_id '${clientId || '(missing)'}': register first via POST /oauth/register.`);
-    if (!redirectUri || !client.redirectUris.includes(redirectUri)) {
-      return fail(`redirect_uri '${redirectUri || '(missing)'}' is not registered for this client.`);
+    if (!clientId) return fail(`Unknown client_id '(missing)': register first via POST /oauth/register.`);
+    if (client) {
+      if (!redirectUri || !client.redirectUris.includes(redirectUri)) {
+        return fail(`redirect_uri '${redirectUri || '(missing)'}' is not registered for this client.`);
+      }
+    } else {
+      // Stateless multi-isolate path: `/oauth/register` may have executed on
+      // a different isolate, or the connector uses a pre-registered
+      // client_id. Allow any non-empty client_id as long as the redirect
+      // target is a valid `https://` (or `http://localhost` /
+      // `http://127.0.0.1`) URL.
+      if (!isPermittedRedirectUri(redirectUri)) {
+        return fail(`redirect_uri '${redirectUri || '(missing)'}' must be a valid https:// (or http://localhost) URL.`);
+      }
     }
     if (!challenge) return fail('code_challenge is required (PKCE S256).');
     if (method !== 'S256') return fail(`code_challenge_method must be 'S256', got '${method || '(missing)'}'.`);
@@ -385,6 +538,32 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       return emptyResponse(204, correlationId);
     }
 
+    if (method === 'GET' && path === '/') {
+      return jsonResponse(200, {
+        worker: WORKER_NAME,
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        toolCount: WORKER_TOOL_COUNT,
+        project: 'TraceForge',
+        isolation: 'independent-from-health-erecords',
+        endpoints: {
+          mcp: `${origin}/mcp`,
+          health: `${origin}/health`,
+          oauthProtectedResource: `${origin}/.well-known/oauth-protected-resource`,
+          oauthAuthorizationServer: `${origin}/.well-known/oauth-authorization-server`,
+        },
+      }, correlationId);
+    }
+
+    if (method === 'GET' && (path === '/mcp' || path === '/api/mcp')) {
+      return jsonResponse(200, {
+        worker: WORKER_NAME,
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        transport: 'streamable-http',
+        endpoint: `${origin}/mcp`,
+        toolCount: WORKER_TOOL_COUNT,
+      }, correlationId);
+    }
+
     if (method === 'GET' && path === '/health') {
       return jsonResponse(200, {
         worker: WORKER_NAME,
@@ -455,7 +634,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       for (const [key, value] of url.searchParams) input[key] = value;
       const validated = validateAuthorizeInput(input);
       if (validated instanceof Response) return validated;
-      const code = issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge);
+      const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge);
       const target = new URL(validated.redirectUri);
       target.searchParams.set('code', code);
       if (validated.state) target.searchParams.set('state', validated.state);
@@ -473,7 +652,7 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     if (method === 'POST' && path === '/oauth/authorize') {
       const validated = validateAuthorizeInput(await readTokenParams(request));
       if (validated instanceof Response) return validated;
-      const code = issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge);
+      const code = await issueAuthCode(validated.clientId, validated.redirectUri, validated.scope, validated.challenge);
       return jsonResponse(200, { code, state: validated.state, redirect_uri: validated.redirectUri }, correlationId);
     }
 
@@ -482,9 +661,23 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       if (params['grant_type'] !== 'authorization_code') {
         return oauthError(400, 'unsupported_grant_type', 'Only grant_type=authorization_code is supported.', correlationId);
       }
-      const stored = authCodes.get(params['code'] ?? '');
-      if (!stored || clock() > stored.expiresAtMs) {
+      const codeParam = params['code'] ?? '';
+      let stored = authCodes.get(codeParam);
+      if (stored && clock() > stored.expiresAtMs) {
+        authCodes.delete(codeParam);
         return oauthError(400, 'invalid_grant', 'Authorization code is unknown or expired.', correlationId);
+      }
+      if (!stored) {
+        // Cross-isolate path: the code was minted by `/oauth/authorize` on a
+        // different isolate. Verify the self-contained SHA-256 signature.
+        const stateless = await verifyStatelessAuthCode(codeParam);
+        if (!stateless) {
+          return oauthError(400, 'invalid_grant', 'Authorization code is unknown or expired.', correlationId);
+        }
+        if (consumedStatelessCodes.has(codeParam)) {
+          return oauthError(400, 'invalid_grant', 'Authorization code has already been redeemed.', correlationId);
+        }
+        stored = stateless;
       }
       if (params['redirect_uri'] && params['redirect_uri'] !== stored.redirectUri) {
         return oauthError(400, 'invalid_grant', 'redirect_uri does not match the authorize request.', correlationId);
@@ -493,8 +686,10 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
       if (!verifier || !(await verifyPkceS256(verifier, stored.challenge))) {
         return oauthError(400, 'invalid_grant', 'PKCE S256 code_verifier verification failed.', correlationId);
       }
-      authCodes.delete(params['code'] as string);
-      const accessToken = randomHex('tf_live');
+      // One-time consumption within this isolate (both code generations).
+      authCodes.delete(codeParam);
+      consumedStatelessCodes.add(codeParam);
+      const accessToken = await mintStatelessToken(stored.scope);
       issuedTokens.set(accessToken, { scope: stored.scope, expiresAtMs: clock() + 3600 * 1000 });
       return jsonResponse(200, {
         access_token: accessToken,
@@ -515,22 +710,22 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
           error: { code: JSON_RPC_PARSE_ERROR, message: 'Parse error: malformed JSON body.' },
         }, correlationId);
       }
-      return handleMcpRpc(body, serviceHeaders(request), correlationId);
+      return handleMcpRpc(body, await resolveServiceHeaders(request), correlationId);
     }
 
     if (method === 'GET' && path === '/api/maas/status') {
-      const payload = await service.executeTool('traceforge.system.status', {}, serviceHeaders(request));
+      const payload = await service.executeTool('traceforge.system.status', {}, await resolveServiceHeaders(request));
       return jsonResponse(200, payload, correlationId);
     }
 
     if (method === 'GET' && path === '/api/maas/catalog') {
-      const payload = await service.executeTool('traceforge.capabilities.list', {}, serviceHeaders(request));
+      const payload = await service.executeTool('traceforge.capabilities.list', {}, await resolveServiceHeaders(request));
       return jsonResponse(200, payload, correlationId);
     }
 
     if (method === 'GET' && path === '/api/maas/audit') {
       try {
-        const headers = serviceHeaders(request);
+        const headers = await resolveServiceHeaders(request);
         const context = service.getAuthenticator().authenticate(headers);
         service.getAuthenticator().authorize(context, 'traceforge.audit', 'traceforge:audit:read');
         return jsonResponse(200, { events: service.getAuditLog().getEvents() }, correlationId);

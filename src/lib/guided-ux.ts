@@ -93,15 +93,43 @@ export function formatActivitySummary(probeLog: ProbeRecord[]): string[] {
  * `RECORDED_LIVE_REPLAY` marks a zero-cost replay of a previously verified
  * live run (never a fresh live call, so never `LIVE_API`).
  */
-export function aiModeBadge(sparkMode: OperationalMode | 'RECORDED_LIVE_REPLAY'): {
+export function aiModeBadge(
+  sparkMode: OperationalMode | 'RECORDED_LIVE_REPLAY',
+  options?: { proxyConfigured?: boolean; liveModeError?: string | null },
+): {
   label: string;
   className: string;
 } {
+  if (options?.liveModeError) return { label: 'AI Mode: Live Unavailable', className: 'tf-chip unavailable' };
   if (sparkMode === 'RECORDED_LIVE_REPLAY') return { label: 'Recorded Live Replay (Muse Spark 1.3)', className: 'tf-chip sim' };
   if (sparkMode === 'LIVE_API') return { label: 'AI Mode: Live API', className: 'tf-chip live' };
+  if (sparkMode === 'UNVERIFIED' && options?.proxyConfigured) return { label: 'AI Mode: Live AI (Ready)', className: 'tf-chip live' };
   if (sparkMode === 'UNVERIFIED') return { label: 'AI Mode: Unverified', className: 'tf-chip unverified' };
   if (sparkMode === 'UNAVAILABLE') return { label: 'AI Mode: Unavailable', className: 'tf-chip unavailable' };
   return { label: 'AI Mode: Simulated', className: 'tf-chip sim' };
+}
+
+/** Progressive investigation lifecycle (Phase 3): one visible stage at a time. */
+export type InvestigationLifecycleState =
+  | 'idle'
+  | 'initializing'
+  | 'probing'
+  | 'updating_hypothesis'
+  | 'completed'
+  | 'error';
+
+/** Human-readable status line for the current investigation lifecycle stage. */
+export function formatLifecycleStatus(state: InvestigationLifecycleState, detail?: string): string {
+  const base: Record<InvestigationLifecycleState, string> = {
+    idle: 'Idle — ready to start investigation',
+    initializing: 'Initializing — inspecting circuit layout and symptom…',
+    probing: 'Probing — measuring test points on the virtual PCB…',
+    updating_hypothesis: 'Updating Hypothesis — analyzing electrical measurements…',
+    completed: 'Completed — diagnosis and ground-truth evaluation ready',
+    error: 'Error — investigation stopped',
+  };
+  const label = base[state];
+  return detail ? `${label} (${detail})` : label;
 }
 
 /**

@@ -3,6 +3,7 @@ import {
   aiModeBadge,
   extractProbeTargetFromStepSummary,
   formatActivitySummary,
+  formatLifecycleStatus,
   getActiveStep,
   isInvestigationComplete,
   mapProbeRecordsToPcbHighlights,
@@ -117,6 +118,68 @@ describe('AI mode badge', () => {
       expect(aiModeBadge(mode).label).not.toContain('Muse');
       expect(aiModeBadge(mode).label).not.toContain('Spark');
     }
+  });
+
+  it('keeps every legacy return value unchanged when options are omitted', () => {
+    expect(aiModeBadge('LIVE_API')).toEqual({ label: 'AI Mode: Live API', className: 'tf-chip live' });
+    expect(aiModeBadge('SIMULATED')).toEqual({ label: 'AI Mode: Simulated', className: 'tf-chip sim' });
+    expect(aiModeBadge('UNVERIFIED')).toEqual({ label: 'AI Mode: Unverified', className: 'tf-chip unverified' });
+    expect(aiModeBadge('UNAVAILABLE')).toEqual({ label: 'AI Mode: Unavailable', className: 'tf-chip unavailable' });
+    expect(aiModeBadge('RECORDED_LIVE_REPLAY')).toEqual({
+      label: 'Recorded Live Replay (Muse Spark 1.3)',
+      className: 'tf-chip sim',
+    });
+  });
+
+  it('reports Live AI (Ready) when UNVERIFIED with a configured proxy', () => {
+    expect(aiModeBadge('UNVERIFIED', { proxyConfigured: true })).toEqual({
+      label: 'AI Mode: Live AI (Ready)',
+      className: 'tf-chip live',
+    });
+    // Explicit false (or omitted) keeps the legacy Unverified badge.
+    expect(aiModeBadge('UNVERIFIED', { proxyConfigured: false })).toEqual({
+      label: 'AI Mode: Unverified',
+      className: 'tf-chip unverified',
+    });
+  });
+
+  it('reports Live Unavailable whenever a liveModeError is present (mode never silently reverts)', () => {
+    const err = 'proxy unavailable';
+    for (const mode of ['LIVE_API', 'UNVERIFIED', 'UNAVAILABLE', 'SIMULATED'] as const) {
+      expect(aiModeBadge(mode, { proxyConfigured: true, liveModeError: err })).toEqual({
+        label: 'AI Mode: Live Unavailable',
+        className: 'tf-chip unavailable',
+      });
+    }
+    // Null/empty errors behave exactly like omitted options.
+    expect(aiModeBadge('UNVERIFIED', { liveModeError: null })).toEqual(aiModeBadge('UNVERIFIED'));
+  });
+});
+
+describe('Phase 3: progressive investigation lifecycle', () => {
+  it('formats a distinct human-readable status for every lifecycle stage', () => {
+    expect(formatLifecycleStatus('idle')).toContain('Idle');
+    expect(formatLifecycleStatus('initializing')).toContain('Initializing');
+    expect(formatLifecycleStatus('probing')).toContain('Probing');
+    expect(formatLifecycleStatus('updating_hypothesis')).toContain('Updating Hypothesis');
+    expect(formatLifecycleStatus('completed')).toContain('Completed');
+    expect(formatLifecycleStatus('error')).toContain('Error');
+  });
+
+  it('appends the detail string when provided, omits it otherwise', () => {
+    const withDetail = formatLifecycleStatus('probing', 'Probing U1-15…');
+    expect(withDetail).toContain('Probing');
+    expect(withDetail).toContain('Probing U1-15…');
+    expect(formatLifecycleStatus('idle')).not.toContain('(');
+  });
+
+  it('orders the full lifecycle idle -> initializing -> probing -> updating_hypothesis -> completed', () => {
+    const ordered = ['idle', 'initializing', 'probing', 'updating_hypothesis', 'completed'] as const;
+    const labels = ordered.map((s) => formatLifecycleStatus(s));
+    // Every stage has its own label (no silent instant-completion aliases).
+    expect(new Set(labels).size).toBe(ordered.length);
+    expect(labels[0]).toContain('ready to start');
+    expect(labels[4]).toContain('evaluation ready');
   });
 });
 

@@ -44,6 +44,7 @@ import {
   aiModeBadge,
   extractProbeTargetFromStepSummary,
   formatActivitySummary,
+  formatLifecycleStatus,
   getActiveStep,
   isInvestigationComplete,
   mapProbeRecordsToPcbHighlights,
@@ -51,6 +52,7 @@ import {
   primaryWorkflowAction,
   reworkWithheldReason,
   shouldShowRework,
+  type InvestigationLifecycleState,
 } from './lib/guided-ux';
 
 interface Diagnosis {
@@ -62,6 +64,10 @@ interface StreamLine {
   cls: string;
   text: string;
 }
+
+/** Phase 2: shown when live mode stays selected but the proxy has no key. Mode is never reset. */
+const LIVE_MODE_UNAVAILABLE_MESSAGE =
+  'Live Meta API proxy is unavailable or META_API_KEY is not configured on the server. Live AI mode remains selected — configure META_API_KEY or switch back to Simulated mode.';
 
 const FAULT_TYPE_OPTIONS: FaultType[] = [
   'solder_bridge',
@@ -120,7 +126,18 @@ function agentStepClass(step: AgentStep): string {
 }
 
 export function App() {
-  const [mode, setMode] = useState<ClientMode>('simulated');
+  // Phase 2: persist the selected AI mode across reloads (never silently
+  // revert it). Guarded for SSR/Node where `window` is undefined.
+  const [mode, setMode] = useState<ClientMode>(() => {
+    try {
+      if (typeof window !== 'undefined' && window.sessionStorage.getItem('tf_client_mode') === 'live') {
+        return 'live';
+      }
+    } catch {
+      // Storage unavailable (private mode/SSR): fall through to simulated.
+    }
+    return 'simulated';
+  });
   // SAM 3.1 is deferred per AGENTS.md §8b: board overlays always run as a
   // STATIC_FIXTURE, so toggling 'Go live' for Muse Spark 1.3 reasoning must
   // never flip the segmentation badge to LIVE_API/UNVERIFIED.
@@ -130,6 +147,44 @@ export function App() {
   useEffect(() => {
     setTelemetry(client.getTelemetry());
   }, [client]);
+  // Phase 2: live-proxy availability signal. Race-safe: a stale check never
+  // overwrites a newer mode selection, and a missing/unreachable proxy NEVER
+  // resets `mode` back to `simulated` — live stays selected with an alert.
+  const [proxyConfigured, setProxyConfigured] = useState(false);
+  const [liveModeError, setLiveModeError] = useState<string | null>(null);
+  useEffect(() => {
+    if (mode === 'simulated') {
+      setLiveModeError(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await client.proxyStatus();
+        if (cancelled) return;
+        if (res.configured) {
+          client.setProxyConfigured(true);
+          setProxyConfigured(true);
+          setLiveModeError(null);
+        } else {
+          client.setProxyConfigured(false);
+          setProxyConfigured(false);
+          setLiveModeError(LIVE_MODE_UNAVAILABLE_MESSAGE);
+        }
+      } catch {
+        if (cancelled) return;
+        client.setProxyConfigured(false);
+        setProxyConfigured(false);
+        setLiveModeError(LIVE_MODE_UNAVAILABLE_MESSAGE);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, mode]);
+  // Phase 3: progressive investigation lifecycle shown in Step 2.
+  const [lifecycle, setLifecycle] = useState<InvestigationLifecycleState>('idle');
+  const [lifecycleDetail, setLifecycleDetail] = useState<string>('');
   const [boardId, setBoardId] = useState(SAMPLE_BOARDS[0]!.id);
   const board = getBoard(boardId) ?? SAMPLE_BOARDS[0]!;
   const [faultSel, setFaultSel] = useState<string>('random');
@@ -147,10 +202,11 @@ export function App() {
   const [customDoc, setCustomDoc] = useState('');
   const [lines, setLines] = useState<StreamLine[]>([]);
   const [running, setRunning] = useState(false);
-  // Video Demo Pacing: animate each probe with a 350ms beat during screen
-  // recordings (`?demo=1` enables it by default for one-click demo URLs).
+  // Progressive demo pacing (Phase 3): browser users ALWAYS see the
+  // step-by-step probing lifecycle by default; `?instant=1` opts into the
+  // zero-delay instant path. Node/SSR (Vitest) stays instant so tests are fast.
   const [demoPacing, setDemoPacing] = useState<boolean>(
-    () => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('demo') === '1',
+    () => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('instant') !== '1',
   );
   const [selectedRef, setSelectedRef] = useState<string | null>(null);
   const [probeA, setProbeA] = useState<string | null>(null);
@@ -194,6 +250,32 @@ export function App() {
     setScore(null);
     setDiagnosis(null);
     setAgentVerdict(null);
+    setLifecycle('idle');
+    setLifecycleDetail('');
+  }
+
+  /**
+   * Phase 2: toggle between Simulated and Live AI mode, persist the choice
+   * in `sessionStorage`, and prepare a fresh bench (Step 2) when the previous
+   * run had completed or logged activity — without auto-starting an
+   * investigation or spending credits. NEVER resets live back to simulated.
+   */
+  function handleToggleMode() {
+    const hadActivity = diagnosis !== null || score !== null || probeLog.length > 0 || lines.length > 0;
+    setMode((m) => {
+      const next: ClientMode = m === 'live' ? 'simulated' : 'live';
+      try {
+        if (typeof window !== 'undefined') window.sessionStorage.setItem('tf_client_mode', next);
+      } catch {
+        // Storage unavailable: mode still toggles for this session.
+      }
+      return next;
+    });
+    if (hadActivity) {
+      resetLabState();
+      setLines([]);
+      setRunId((n) => n + 1);
+    }
   }
 
   function switchBoard(id: string) {
@@ -355,43 +437,82 @@ export function App() {
    * each turn into the diagnostic stream, unlocks the withheld ground
    * truth, and populates the objective scoreboard + classified evidence.
    */
-  /** Play one buffered step into the stream with live PCB sync. */
-  function playStep(step: AgentStep) {
-    pushLine(agentStepClass(step), step.summary);
-    // Live PCB sync: highlight the real pad(s) as each tool call
-    // executes and refresh the probe log on every step.
-    if (step.kind === 'tool_call' || step.kind === 'tool_result') {
-      const target = extractProbeTargetFromStepSummary(step.summary);
-      if (target) setActiveProbeTarget(target);
-      syncSessionState();
-    }
-  }
-
   async function runAgentInvestigation() {
+    // Fresh run: clear stale results first so a re-investigation never
+    // flashes the previous diagnosis/score as instantly complete.
+    if (session.getToolCallsUsed() > 0 || diagnosis !== null || score !== null) {
+      setDiagnosis(null);
+      setScore(null);
+      setAgentVerdict(null);
+      setRevealed(false);
+      setProbeLog([]);
+      setActiveProbeTarget(null);
+    }
     setRunning(true);
     setLines([]);
+    setLifecycle('initializing');
+    setLifecycleDetail('Inspecting circuit topology and reported symptom…');
     try {
       const view = session.getAgentView();
       pushLine('k-reasoning', `▸ Autonomous investigation armed: ${view.boardName} · Muse Spark 1.3 (${client.mode}) · tool budget ${session.getToolCallsUsed()}/${view.maxToolCalls}.`);
-      // Video Demo Pacing: buffer steps during the run, then play them back
-      // with a 350ms beat between steps so each probe visibly lights up in
-      // sequence during screen recordings. Pacing off (unit tests) streams
-      // every step immediately with zero delay.
+      // Progressive lifecycle (Phase 3): simulated runs with demo pacing
+      // buffer every step, then replay probes ONE BY ONE (initializing →
+      // probing → updating_hypothesis → completed). Live / instant runs
+      // stream each step immediately with zero delay.
+      const slowPath = client.mode === 'simulated' && demoPacing;
+      if (slowPath) {
+        // Hold `initializing` visible in Step 2 before the first probe.
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
       const buffered: AgentStep[] = [];
       const run = await runAgenticDiagnosis(session, client, {
         onStep: (step) => {
-          if (demoPacing) {
+          if (slowPath) {
             buffered.push(step);
             return;
           }
-          playStep(step);
+          pushLine(agentStepClass(step), step.summary);
+          if (step.kind === 'tool_call' || step.kind === 'tool_result') {
+            const target = extractProbeTargetFromStepSummary(step.summary);
+            if (target) setActiveProbeTarget(target);
+            setLifecycle('probing');
+            setLifecycleDetail(step.summary);
+            syncSessionState();
+          }
         },
       });
-      if (demoPacing) {
+      if (slowPath) {
+        // Snapshot the full evidence, then reveal it sequentially: the PCB
+        // readout pill, continuity line, Activity Summary, and Measurement
+        // History Timeline appear ONE BY ONE instead of all at once.
+        const allProbes = session.getProbeLog();
+        setProbeLog([]);
+        let revealedProbes = 0;
         for (const step of buffered) {
-          playStep(step);
-          await new Promise((resolve) => setTimeout(resolve, 350));
+          setLifecycle('probing');
+          if (step.kind === 'tool_call') {
+            const target = extractProbeTargetFromStepSummary(step.summary);
+            setActiveProbeTarget(target);
+            setLifecycleDetail(`Probing ${target ?? 'test point'}…`);
+            pushLine(agentStepClass(step), step.summary);
+            await new Promise((resolve) => setTimeout(resolve, 350));
+          } else if (step.kind === 'tool_result') {
+            revealedProbes += 1;
+            const justMeasured = allProbes[revealedProbes - 1];
+            setProbeLog(allProbes.slice(0, revealedProbes));
+            setToolsUsed(revealedProbes);
+            setLifecycleDetail(justMeasured?.detail ?? step.summary);
+            pushLine(agentStepClass(step), step.summary);
+            await new Promise((resolve) => setTimeout(resolve, 450));
+          } else {
+            pushLine(agentStepClass(step), step.summary);
+            setLifecycleDetail(step.summary);
+            await new Promise((resolve) => setTimeout(resolve, 300));
+          }
         }
+        setLifecycle('updating_hypothesis');
+        setLifecycleDetail('Confirming fault hypothesis against datasheet limits…');
+        await new Promise((resolve) => setTimeout(resolve, 350));
       }
       syncSessionState();
       setTelemetry(client.getTelemetry());
@@ -448,8 +569,13 @@ export function App() {
           hypotheses: evidence.hypotheses,
         }),
       });
+      setLifecycle('completed');
+      setLifecycleDetail('');
     } catch (err) {
-      pushLine('k-rule-bad', `⏚ Investigation failed: ${err instanceof Error ? err.message : String(err)}`);
+      const message = err instanceof Error ? err.message : String(err);
+      pushLine('k-rule-bad', `⏚ Investigation failed: ${message}`);
+      setLifecycle('error');
+      setLifecycleDetail(message);
       setTelemetry(client.getTelemetry());
     } finally {
       syncSessionState();
@@ -846,7 +972,9 @@ export function App() {
   const activeStep = getActiveStep({ running, complete, hasActivity });
   const primaryAction = primaryWorkflowAction({ running, complete });
   const sparkStatus = client.status();
-  const modeBadge = aiModeBadge(sparkStatus.sparkMode);
+  const modeBadge = aiModeBadge(sparkStatus.sparkMode, { proxyConfigured, liveModeError });
+  const lifecycleChipClass =
+    lifecycle === 'completed' ? 'tf-chip live' : lifecycle === 'error' ? 'tf-chip unavailable' : 'tf-chip sim';
   // Zero-cost replay transparency: the recorded-live chip replaces the live
   // badge whenever the verdict came from the verified-run replay.
   const replayBadge = agentVerdict?.operationalMode === 'RECORDED_LIVE_REPLAY'
@@ -875,7 +1003,7 @@ export function App() {
 
   return (
     <div className="tf-app">
-      <Header client={client} onToggleMode={() => setMode((m) => (m === 'live' ? 'simulated' : 'live'))} />
+      <Header client={client} onToggleMode={handleToggleMode} />
       <ol className="tf-steps" aria-label="Guided diagnostic steps">
         {GUIDE_STEPS.map((s) => (
           <li
@@ -991,6 +1119,16 @@ export function App() {
         <div className="tf-right">
           <section className="tf-card tf-step" aria-label="Step 2: Investigate">
             <h3>STEP 2 · INVESTIGATE</h3>
+            {mode === 'live' && liveModeError && (
+              <div className="tf-chip unavailable" role="alert" style={{ marginBottom: 8 }}>
+                Live AI unavailable: {liveModeError}
+              </div>
+            )}
+            {(running || hasActivity) && (
+              <div className={lifecycleChipClass} role="status" style={{ marginBottom: 8 }}>
+                {formatLifecycleStatus(lifecycle, lifecycleDetail)}
+              </div>
+            )}
             {primaryAction && (
               <div className="tf-row">
                 <button className="primary" onClick={runAgentInvestigation} disabled={primaryAction.disabled || running}>

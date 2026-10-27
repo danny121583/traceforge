@@ -633,6 +633,22 @@ export class MetaClient {
   /** Set only after a verified real response arrives (gates `LIVE_API`). */
   private verifiedLiveApi = false;
   /**
+   * Set once `proxyStatus()` reports `configured: true` (server holds a
+   * `META_API_KEY`). Drives the "Live AI (Ready)" badge while `sparkMode`
+   * is still `UNVERIFIED`; never gates `LIVE_API` by itself.
+   */
+  private proxyConfigured = false;
+
+  /** Record the latest proxy key-configuration signal (Phase 2). */
+  setProxyConfigured(configured: boolean): void {
+    this.proxyConfigured = configured;
+  }
+
+  /** Whether the server proxy has reported a configured `META_API_KEY`. */
+  isProxyConfigured(): boolean {
+    return this.proxyConfigured;
+  }
+  /**
    * Set only when a live SAM 3.1 segmentation call actually succeeds.
    * Tracked separately from `verifiedLiveApi` so a live Muse Spark 1.3
    * session never flips the SAM badge to `LIVE_API` (SAM 3.1 is deferred
@@ -696,6 +712,8 @@ export class MetaClient {
     samMode: OperationalMode;
     /** True once a real remote response has been verified this session. */
     liveVerified: boolean;
+    /** Latest `proxyStatus()` configured signal (Phase 2 badge support). */
+    proxyConfigured: boolean;
   } {
     return {
       model: this.model,
@@ -706,6 +724,7 @@ export class MetaClient {
       sparkMode: this.sparkOperationalMode(),
       samMode: this.samOperationalMode(),
       liveVerified: this.verifiedLiveApi,
+      proxyConfigured: this.proxyConfigured,
     };
   }
 
@@ -778,6 +797,7 @@ export class MetaClient {
     });
     if (!res.ok) throw new Error(`Meta proxy status error: HTTP ${res.status}`);
     const data = (await res.json()) as { configured?: boolean; mode?: OperationalMode };
+    if (data.configured === true) this.proxyConfigured = true;
     return {
       configured: data.configured === true,
       mode: data.mode ?? (data.configured ? 'UNVERIFIED' : 'UNAVAILABLE'),

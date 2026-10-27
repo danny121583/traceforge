@@ -114,6 +114,54 @@
 
 ---
 
+## 4b. GitHub Identity & Repository Policy
+
+### Official GitHub identity
+- TraceForge GitHub owner: `danny121583`.
+- Official repository: `danny121583/traceforge`.
+- Default visibility: `PRIVATE`.
+- Never push TraceForge to `aigraphix`.
+- Never automatically switch GitHub accounts.
+- Verify the authenticated account before remote operations (`gh auth status`).
+- Never use personal access tokens embedded in remote URLs.
+
+### Agent responsibilities
+
+**Antigravity**
+- Coordinates repository management.
+- Reviews Git status and history.
+- Verifies authenticated account identity (`danny121583`).
+- Performs security audits.
+- Independently verifies pushes and branches.
+
+**Muse Code**
+- Configures local Git remotes.
+- Creates feature branches.
+- Commits implementation changes.
+- Performs authorized Git pushes.
+- Handles implementation-related Git operations.
+
+### Branching policy
+- Maintain `main` as the stable branch.
+- Preserve existing feature branches (`phase-1-stabilization`, `phase-1.5-virtual-lab`, `feat/guided-ux-cleanup`, `feat/ux-refinement-and-maas`).
+- Avoid direct unreviewed development on `main`.
+- Prefer feature branches for ongoing work.
+- Do not force-push or delete branches without approval.
+- Merge only after successful testing and review.
+
+### Remote operation requirements
+Before every push:
+1. Confirm repository owner is `danny121583`.
+2. Confirm correct remote URL (`https://github.com/danny121583/traceforge` or `https://github.com/danny121583/traceforge.git`).
+3. Confirm target branch.
+4. Confirm the working tree and commit range.
+5. Confirm no secrets are included.
+6. Push only the intended commits.
+
+This policy applies permanently to all Antigravity and Muse Code sessions.
+
+---
+
 ## 5. Testing Requirements
 
 Every implemented feature requires:

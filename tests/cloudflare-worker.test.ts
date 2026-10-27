@@ -383,6 +383,253 @@ describe('worker kill switch and cross-tenant isolation', () => {
   });
 });
 
+describe('Phase 4: root and MCP discovery endpoints', () => {
+  it('GET / returns the worker identity, protocol, tool count, and endpoints', async () => {
+    const worker = createTraceForgeWorker();
+    const res = await worker.fetch(new Request(workerUrl('/')));
+    expect(res.status).toBe(200);
+    const body = (await readJson(res)) as {
+      worker: string;
+      protocolVersion: string;
+      toolCount: number;
+      project: string;
+      isolation: string;
+      endpoints: Record<string, string>;
+    };
+    expect(body.worker).toBe('traceforge-mcp-staging');
+    expect(body.protocolVersion).toBe('2025-06-18');
+    expect(body.toolCount).toBe(18);
+    expect(body.project).toBe('TraceForge');
+    expect(body.isolation).toBe('independent-from-health-erecords');
+    expect(body.endpoints.mcp).toBe(`${ORIGIN}/mcp`);
+    expect(body.endpoints.health).toBe(`${ORIGIN}/health`);
+    expect(body.endpoints.oauthProtectedResource).toBe(`${ORIGIN}/.well-known/oauth-protected-resource`);
+    expect(body.endpoints.oauthAuthorizationServer).toBe(`${ORIGIN}/.well-known/oauth-authorization-server`);
+  });
+
+  it('GET /mcp and GET /api/mcp describe the streamable-http endpoint', async () => {
+    const worker = createTraceForgeWorker();
+    for (const path of ['/mcp', '/api/mcp']) {
+      const res = await worker.fetch(new Request(workerUrl(path)));
+      expect(res.status).toBe(200);
+      const body = (await readJson(res)) as Record<string, unknown>;
+      expect(body['worker']).toBe('traceforge-mcp-staging');
+      expect(body['protocolVersion']).toBe('2025-06-18');
+      expect(body['transport']).toBe('streamable-http');
+      expect(body['endpoint']).toBe(`${ORIGIN}/mcp`);
+      expect(body['toolCount']).toBe(18);
+    }
+  });
+});
+
+describe('Phase 4: stateless multi-isolate OAuth/MCP hardening', () => {
+  async function crossIsolateAuthorize(authorizeWorker: ReturnType<typeof createTraceForgeWorker>, clientId: string, redirectUri: string) {
+    const verifier = `cross-isolate-verifier-${Math.random().toString(36).slice(2)}-0000000000`;
+    const challenge = await pkceChallenge(verifier);
+    const url =
+      `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent(clientId)}` +
+      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+      `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`;
+    const authorized = await authorizeWorker.fetch(new Request(url, { method: 'GET' }));
+    return { authorized, verifier, redirectUri };
+  }
+
+  async function exchangeOn(
+    tokenWorker: ReturnType<typeof createTraceForgeWorker>,
+    location: string,
+    verifier: string,
+    redirectUri: string,
+  ) {
+    const code = new URL(location).searchParams.get('code') ?? '';
+    expect(code.length).toBeGreaterThan(0);
+    return tokenWorker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code,
+          redirect_uri: redirectUri,
+          code_verifier: verifier,
+        }).toString(),
+      }),
+    );
+  }
+
+  it('redeems an authorization code on a DIFFERENT isolate (stateless PKCE)', async () => {
+    const workerA = createTraceForgeWorker();
+    const workerB = createTraceForgeWorker();
+    const { authorized, verifier, redirectUri } = await crossIsolateAuthorize(workerA, 'pre-registered-connector-id', `${ORIGIN}/callback`);
+    expect(authorized.status).toBe(302);
+    const tokenRes = await exchangeOn(workerB, authorized.headers.get('Location') ?? '', verifier, redirectUri);
+    expect(tokenRes.status).toBe(200);
+    const token = (await readJson(tokenRes)) as { access_token: string; token_type: string; scope: string };
+    expect(token.token_type).toBe('Bearer');
+    expect(token.access_token.length).toBeGreaterThan(0);
+    expect(token.scope).toContain('traceforge:investigations:execute');
+  });
+
+  it('honors the access token on a THIRD isolate for protected MCP calls', async () => {
+    const workerA = createTraceForgeWorker();
+    const workerB = createTraceForgeWorker();
+    const workerC = createTraceForgeWorker();
+    const { authorized, verifier, redirectUri } = await crossIsolateAuthorize(workerA, 'another-connector-id', `${ORIGIN}/callback`);
+    const tokenRes = await exchangeOn(workerB, authorized.headers.get('Location') ?? '', verifier, redirectUri);
+    const { access_token: accessToken } = (await readJson(tokenRes)) as { access_token: string };
+    const created = await mcpCall(workerC, 'tools/call', {
+      name: 'traceforge.scenarios.create',
+      arguments: { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+    }, `Bearer ${accessToken}`);
+    const structured = created.envelope['result'] as { structuredContent: { scenarioId: string }; isError: boolean };
+    expect(structured.isError ?? false).toBe(false);
+    expect(structured.structuredContent.scenarioId.startsWith('scn_')).toBe(true);
+  });
+
+  it('allows unknown client_ids with valid https/localhost redirects, rejects bad ones', async () => {
+    const worker = createTraceForgeWorker();
+    const challenge = await pkceChallenge('stateless-verifier-00000000000000000001');
+    const good = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent('pre-registered-external')}` +
+          `&redirect_uri=${encodeURIComponent('https://app.example.com/cb')}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    expect(good.status).toBe(302);
+
+    const local = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent('localhost-tool')}` +
+          `&redirect_uri=${encodeURIComponent('http://localhost:8787/callback')}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    expect(local.status).toBe(302);
+
+    const plainHttp = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent('evil-client')}` +
+          `&redirect_uri=${encodeURIComponent('http://example.com/cb')}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    expect(plainHttp.status).toBe(400);
+
+    const missingClient = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?redirect_uri=${encodeURIComponent('https://app.example.com/cb')}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    expect(missingClient.status).toBe(400);
+
+    const missingChallenge = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent('x-client')}` +
+          `&redirect_uri=${encodeURIComponent('https://app.example.com/cb')}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    expect(missingChallenge.status).toBe(400);
+
+    const plainMethod = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent('x-client')}` +
+          `&redirect_uri=${encodeURIComponent('https://app.example.com/cb')}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=plain`,
+        { method: 'GET' },
+      ),
+    );
+    expect(plainMethod.status).toBe(400);
+  });
+
+  it('still rejects a mismatched redirect_uri for a REGISTERED client', async () => {
+    const { worker, client } = await registerClient();
+    const challenge = await pkceChallenge('registered-mismatch-verifier-00000001');
+    const res = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent(client.client_id)}` +
+          `&redirect_uri=${encodeURIComponent('https://attacker.example/x')}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    expect(res.status).toBe(400);
+  });
+
+  it('enforces one-time code consumption within an isolate', async () => {
+    const worker = createTraceForgeWorker();
+    const verifier = 'one-time-verifier-0000000000000000000001';
+    const challenge = await pkceChallenge(verifier);
+    const redirectUri = `${ORIGIN}/callback`;
+    const authorized = await worker.fetch(
+      new Request(
+        `${ORIGIN}/oauth/authorize?client_id=${encodeURIComponent('replay-client')}` +
+          `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&code_challenge=${encodeURIComponent(challenge)}&code_challenge_method=S256`,
+        { method: 'GET' },
+      ),
+    );
+    const code = new URL(authorized.headers.get('Location') ?? '').searchParams.get('code') ?? '';
+    const body = new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+      code_verifier: verifier,
+    }).toString();
+    const first = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      }),
+    );
+    expect(first.status).toBe(200);
+    const second = await worker.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      }),
+    );
+    expect(second.status).toBe(400);
+    expect(((await readJson(second)) as { error: string }).error).toBe('invalid_grant');
+  });
+
+  it('rejects tampered stateless codes and tokens', async () => {
+    const workerA = createTraceForgeWorker();
+    const { authorized, verifier, redirectUri } = await crossIsolateAuthorize(workerA, 'tamper-client', `${ORIGIN}/callback`);
+    const location = authorized.headers.get('Location') ?? '';
+    const code = new URL(location).searchParams.get('code') ?? '';
+    const tampered = `${code.slice(0, -2)}AA`;
+    const badExchange = await workerA.fetch(
+      new Request(workerUrl('/oauth/token'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          code: tampered,
+          redirect_uri: redirectUri,
+          code_verifier: verifier,
+        }).toString(),
+      }),
+    );
+    expect(badExchange.status).toBe(400);
+
+    const forged = await mcpCall(workerA, 'tools/call', {
+      name: 'traceforge.scenarios.create',
+      arguments: { boardId: 'f405-flight-controller' },
+    }, 'Bearer tf_live_x.forged-payload.deadbeef');
+    const structured = (forged.envelope['result'] as { structuredContent: { code: string }; isError: boolean });
+    expect(structured.isError).toBe(true);
+    expect(structured.structuredContent.code).toBe('MAAS_AUTHENTICATION_REQUIRED');
+  });
+});
+
 describe('worker package independence', () => {
   it('contains zero Node.js built-in imports', () => {
     const source: string = workerSource;
