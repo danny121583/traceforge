@@ -20,7 +20,9 @@ import { sanitizeForAuditText } from '../src/maas/security';
 import {
   MaasToolError,
   TraceForgeMaasService,
+  maasErrorStatus,
 } from '../src/maas/tools';
+import { MetaClient } from '../src/lib/meta-client';
 import { handleMaasMcpRequest, type MaasHttpResponse } from '../src/server/maas-mcp-server';
 import { createVirtualSession } from '../src/lib/circuit-simulator';
 
@@ -788,5 +790,187 @@ describe('14. simulated vs live model identity and HTTP middleware', () => {
     });
     expect(engine.verifyReceipt(receipt)).toBe(true);
     expect(engine.verifyReceipt({ ...receipt, summary: 'tampered' })).toBe(false);
+  });
+});
+
+/* --------------------------------------------------------------- area 15 -- */
+
+describe('15. session expiration', () => {
+  it('rejects expired sessions with MAAS_SESSION_EXPIRED (HTTP 410)', async () => {
+    const service = new TraceForgeMaasService();
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+      AGENT,
+    )) as { scenarioId: string };
+    service.expireScenarioForTesting(created.scenarioId);
+    await expectToolError(
+      service.executeTool('traceforge.measurements.voltage', { scenarioId: created.scenarioId, node: 'U1-14' }, AGENT),
+      'MAAS_SESSION_EXPIRED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.investigations.start', { scenarioId: created.scenarioId }, AGENT),
+      'MAAS_SESSION_EXPIRED',
+    );
+    await expectToolError(
+      service.executeTool('traceforge.evaluation.score', { scenarioId: created.scenarioId }, AGENT),
+      'MAAS_SESSION_EXPIRED',
+    );
+    expect(maasErrorStatus('MAAS_SESSION_EXPIRED')).toBe(410);
+  });
+
+  it('expires sessions past a short sessionTtlMs', async () => {
+    const service = new TraceForgeMaasService({ sessionTtlMs: 10 });
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'usbc-pd-trigger', faultSelector: 'nominal' },
+      AGENT,
+    )) as { scenarioId: string };
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await expectToolError(
+      service.executeTool('traceforge.measurements.voltage', { scenarioId: created.scenarioId, node: 'CC1' }, AGENT),
+      'MAAS_SESSION_EXPIRED',
+    );
+  });
+
+  it('keeps fresh sessions usable under the default 30-minute TTL', async () => {
+    const service = new TraceForgeMaasService();
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+      AGENT,
+    )) as { scenarioId: string };
+    const record = service.getScenarioRecord(created.scenarioId);
+    expect(record?.expiresAtMs).toBeGreaterThan(Date.now());
+    const voltage = (await service.executeTool(
+      'traceforge.measurements.voltage',
+      { scenarioId: created.scenarioId, node: 'U1-14' },
+      AGENT,
+    )) as { probesUsed: number };
+    expect(voltage.probesUsed).toBe(1);
+  });
+});
+
+/* --------------------------------------------------------------- area 16 -- */
+
+describe('16. concurrent investigations', () => {
+  it('runs two investigations simultaneously with zero state bleed and independent valid scores', async () => {
+    const service = new TraceForgeMaasService();
+    const [startedA, startedB] = (await Promise.all([
+      service.executeTool('traceforge.investigations.start', { boardId: 'f405-flight-controller' }, AGENT),
+      service.executeTool('traceforge.investigations.start', { boardId: 'usbc-pd-trigger' }, AGENT),
+    ])) as Array<{
+      investigationId: string;
+      scenarioId: string;
+      boardId: string;
+      operationalMode: string;
+      completed: boolean;
+    }>;
+    expect(startedA.investigationId).not.toBe(startedB.investigationId);
+    expect(startedA.scenarioId).not.toBe(startedB.scenarioId);
+    expect(startedA.boardId).toBe('f405-flight-controller');
+    expect(startedB.boardId).toBe('usbc-pd-trigger');
+    expect(startedA.completed).toBe(true);
+    expect(startedB.completed).toBe(true);
+
+    const [historyA, historyB] = (await Promise.all([
+      service.executeTool('traceforge.investigations.history', { scenarioId: startedA.scenarioId }, AGENT),
+      service.executeTool('traceforge.investigations.history', { scenarioId: startedB.scenarioId }, AGENT),
+    ])) as Array<{ probeLog: Array<{ target: string }> }>;
+    expect(historyA.probeLog.length).toBeGreaterThan(0);
+    expect(historyB.probeLog.length).toBeGreaterThan(0);
+    const targetsA = historyA.probeLog.map((p) => p.target).join('|');
+    const targetsB = historyB.probeLog.map((p) => p.target).join('|');
+    expect(targetsA).not.toContain('CC1');
+    expect(targetsA).not.toContain('CC2');
+    expect(targetsB).not.toContain('U1-14');
+    expect(targetsB).not.toContain('U1-15');
+
+    const [scoredA, scoredB] = (await Promise.all([
+      service.executeTool('traceforge.evaluation.score', { scenarioId: startedA.scenarioId }, AGENT),
+      service.executeTool('traceforge.evaluation.score', { scenarioId: startedB.scenarioId }, AGENT),
+    ])) as Array<{
+      score: { totalScore: number; componentMatch: boolean; probeCount: number };
+      groundTruth: { faultId: string };
+    }>;
+    for (const scored of [scoredA, scoredB]) {
+      expect(scored.score.totalScore).toBeGreaterThanOrEqual(0);
+      expect(scored.score.totalScore).toBeLessThanOrEqual(100);
+      expect(scored.score.probeCount).toBeGreaterThan(0);
+      expect(typeof scored.score.componentMatch).toBe('boolean');
+      expect(scored.groundTruth.faultId.length).toBeGreaterThan(0);
+    }
+    // Post-evaluation disclosure is by design (owning actor only), and the
+    // two boards draw from disjoint fault pools — independent ground truths.
+    expect(scoredA.groundTruth.faultId).not.toBe(scoredB.groundTruth.faultId);
+    expect(JSON.stringify(scoredB)).not.toContain('hiddenFault');
+  });
+});
+
+/* --------------------------------------------------------------- area 17 -- */
+
+describe('17. live mode with an injected liveClient', () => {
+  it('runs traceforge.investigations.start in live mode and records telemetry', async () => {
+    const liveClient = new MetaClient({ mode: 'simulated' });
+    const service = new TraceForgeMaasService({ liveClient });
+    const created = (await service.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'f405-flight-controller', faultSelector: 'f405-nrst-gnd-short' },
+      OPERATOR,
+    )) as { scenarioId: string };
+    const started = (await service.executeTool(
+      'traceforge.investigations.start',
+      { scenarioId: created.scenarioId, mode: 'live' },
+      OPERATOR,
+    )) as {
+      investigationId: string;
+      operationalMode: string;
+      completed: boolean;
+      verificationReceipt: { receiptHash: string };
+    };
+    expect(started.investigationId.startsWith('inv_')).toBe(true);
+    expect(started.completed).toBe(true);
+    expect(started.verificationReceipt.receiptHash).toMatch(/^[0-9a-f]{64}$/);
+    const result = (await service.executeTool(
+      'traceforge.investigations.result',
+      { scenarioId: created.scenarioId },
+      OPERATOR,
+    )) as {
+      proposedDiagnosis: { componentRef: string; faultType: string };
+      telemetry: { totalRequests: number; inputTokens: number };
+    };
+    expect(result.proposedDiagnosis.componentRef.length).toBeGreaterThan(0);
+    expect(result.telemetry.totalRequests).toBeGreaterThan(0);
+    expect(result.telemetry.inputTokens).toBeGreaterThan(0);
+    expect(leakedKeys(result)).toEqual([]);
+  });
+});
+
+/* --------------------------------------------------------------- area 18 -- */
+
+describe('18. verified billing checkpoint', () => {
+  it('budget.status surfaces the $147.26 baseline and the verified $132.38 checkpoint', async () => {
+    const service = new TraceForgeMaasService();
+    const budget = (await service.executeTool('traceforge.budget.status', {}, {})) as {
+      startingBalanceUsd: number;
+      authorizedCeilingUsd: number;
+      mandatoryReserveUsd: number;
+      safetyThresholdUsd: number;
+      lastVerifiedBalanceUsd: number;
+      lastVerifiedConsumedUsd: number;
+      lastVerifiedTimestamp: string;
+      verifiedRemainingBudgetUsd: number;
+      verifiedNote: string;
+    };
+    expect(budget.startingBalanceUsd).toBe(147.26);
+    expect(budget.authorizedCeilingUsd).toBe(100);
+    expect(budget.mandatoryReserveUsd).toBe(47.26);
+    expect(budget.safetyThresholdUsd).toBe(95);
+    expect(budget.lastVerifiedBalanceUsd).toBe(132.38);
+    expect(budget.lastVerifiedConsumedUsd).toBe(14.88);
+    expect(budget.lastVerifiedTimestamp).toBe('2026-10-26T18:49:40-05:00');
+    expect(budget.verifiedRemainingBudgetUsd).toBeCloseTo(85.12, 2);
+    expect(budget.verifiedNote).toContain('$132.38');
+    expect(budget.verifiedNote).toContain('$14.88');
   });
 });

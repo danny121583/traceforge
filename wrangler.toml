@@ -1,0 +1,8 @@
+name = "traceforge-mcp-staging"
+main = "worker/index.ts"
+compatibility_date = "2025-06-01"
+workers_dev = true
+
+[vars]
+TRACEFORGE_ENVIRONMENT = "staging"
+MCP_PROTOCOL_VERSION = "2025-06-18"

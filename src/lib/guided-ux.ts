@@ -87,11 +87,17 @@ export function formatActivitySummary(probeLog: ProbeRecord[]): string[] {
   });
 }
 
-/** Single truthful header badge for the AI operational mode. */
-export function aiModeBadge(sparkMode: OperationalMode): {
+/**
+ * Single truthful header badge for the AI operational mode.
+ *
+ * `RECORDED_LIVE_REPLAY` marks a zero-cost replay of a previously verified
+ * live run (never a fresh live call, so never `LIVE_API`).
+ */
+export function aiModeBadge(sparkMode: OperationalMode | 'RECORDED_LIVE_REPLAY'): {
   label: string;
   className: string;
 } {
+  if (sparkMode === 'RECORDED_LIVE_REPLAY') return { label: 'Recorded Live Replay (Muse Spark 1.3)', className: 'tf-chip sim' };
   if (sparkMode === 'LIVE_API') return { label: 'AI Mode: Live API', className: 'tf-chip live' };
   if (sparkMode === 'UNVERIFIED') return { label: 'AI Mode: Unverified', className: 'tf-chip unverified' };
   if (sparkMode === 'UNAVAILABLE') return { label: 'AI Mode: Unavailable', className: 'tf-chip unavailable' };

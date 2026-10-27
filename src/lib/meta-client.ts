@@ -48,6 +48,17 @@ export const RUNTIME_TESTING_BUDGET_USD = 20.0;
 export const INPUT_COST_USD_PER_MTOKEN = 2.0;
 export const OUTPUT_COST_USD_PER_MTOKEN = 6.0;
 
+/* ---------------------------------------------------------------------------
+ * Verified billing checkpoint (2026-10-26T18:49:40-05:00 provider snapshot)
+ * ------------------------------------------------------------------------- */
+
+/** Verified promotional-credit balance at the last provider checkpoint. */
+export const LAST_VERIFIED_BALANCE_USD = 132.38;
+/** Verified incremental consumption (Muse Code CLI + live API) at the checkpoint. */
+export const LAST_VERIFIED_CONSUMED_USD = 14.88;
+/** ISO timestamp of the last verified provider billing checkpoint. */
+export const LAST_VERIFIED_TIMESTAMP = '2026-10-26T18:49:40-05:00';
+
 /** Default / maximum `max_tokens` per chat request (runaway-request guard). */
 export const DEFAULT_MAX_TOKENS = 1024;
 export const MAX_TOKENS_CAP = 1024;
@@ -127,6 +138,12 @@ export interface CostLedgerSnapshot {
   projectedReserveUsd: number;
   safetyThresholdBreached: boolean;
   reserveBreached: boolean;
+  /** Verified promotional-credit balance at the last provider checkpoint. */
+  lastVerifiedBalanceUsd: number;
+  /** Verified incremental consumption (Muse Code CLI + live API) at the checkpoint. */
+  lastVerifiedConsumedUsd: number;
+  /** ISO timestamp of the last verified provider billing checkpoint. */
+  lastVerifiedTimestamp: string;
 }
 
 /** Derive the promotional-credit budget snapshot for the UI banner. */
@@ -144,6 +161,9 @@ export function buildCostLedger(telemetry: UsageTelemetry): CostLedgerSnapshot {
     projectedReserveUsd,
     safetyThresholdBreached: runtimeConsumptionUsd >= BUDGET_SAFETY_THRESHOLD_USD,
     reserveBreached: projectedReserveUsd < TARGET_RESERVE_USD,
+    lastVerifiedBalanceUsd: LAST_VERIFIED_BALANCE_USD,
+    lastVerifiedConsumedUsd: LAST_VERIFIED_CONSUMED_USD,
+    lastVerifiedTimestamp: LAST_VERIFIED_TIMESTAMP,
   };
 }
 

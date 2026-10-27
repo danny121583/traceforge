@@ -34,6 +34,9 @@ import {
 import {
   AUTHORIZED_ADDITIONAL_BUDGET_USD,
   BUDGET_SAFETY_THRESHOLD_USD,
+  LAST_VERIFIED_BALANCE_USD,
+  LAST_VERIFIED_CONSUMED_USD,
+  LAST_VERIFIED_TIMESTAMP,
   MetaClient,
   STARTING_PROMOTIONAL_BALANCE_USD,
   TARGET_RESERVE_USD,
@@ -105,6 +108,8 @@ export function maasErrorStatus(code: MaasErrorCode): number {
     case 'MAAS_INVALID_REQUEST':
     case 'MAAS_SCHEMA_VALIDATION_FAILED':
       return 400;
+    case 'MAAS_SESSION_EXPIRED':
+      return 410;
     default:
       return 200;
   }
@@ -206,6 +211,8 @@ export interface ScenarioRecord {
   scorecard?: Record<string, unknown>;
   faultSelector: string;
   createdAt: string;
+  /** Wall-clock expiry for the actor-isolated session (default TTL 30 min). */
+  expiresAtMs: number;
 }
 
 export interface InvestigationRecord {
@@ -231,6 +238,10 @@ export interface MaasServiceOptions {
   /** Test/config seam: prior live spend added to the budget ledger. */
   initialIncurredCostUsd?: number;
   verificationKey?: string;
+  /** Wall-clock session TTL in ms (default 30 * 60 * 1000). */
+  sessionTtlMs?: number;
+  /** Optional live Muse Spark 1.3 client for `mode: "live"` investigations. */
+  liveClient?: MetaClient;
 }
 
 export type MaasHeaderMap = Record<string, string | string[] | undefined>;
@@ -329,6 +340,8 @@ export class TraceForgeMaasService {
   private readonly investigations = new Map<string, InvestigationRecord>();
   private readonly maxSessionsPerActor: number;
   private injectedLiveSpendUsd: number;
+  private readonly sessionTtlMs: number;
+  private readonly liveClient?: MetaClient;
 
   constructor(options: MaasServiceOptions = {}) {
     for (const d of TRACEFORGE_MAAS_TOOL_DESCRIPTORS) this.descriptors.set(d.name, d);
@@ -337,6 +350,8 @@ export class TraceForgeMaasService {
     this.authenticator = new MaasAuthenticator(this.killSwitch);
     this.maxSessionsPerActor = options.maxSessionsPerActor ?? 25;
     this.injectedLiveSpendUsd = options.initialIncurredCostUsd ?? 0;
+    this.sessionTtlMs = options.sessionTtlMs ?? 30 * 60 * 1000;
+    if (options.liveClient) this.liveClient = options.liveClient;
   }
 
   /* -- accessors for middleware / tests ----------------------------------- */
@@ -376,6 +391,13 @@ export class TraceForgeMaasService {
   /** Test/config seam: simulate prior live spend against the safety threshold. */
   injectLiveSpendForTesting(usd: number): void {
     this.injectedLiveSpendUsd += usd;
+  }
+
+  /** Test seam: force one scenario past its TTL so expiry paths are exercisable. */
+  expireScenarioForTesting(scenarioId: string): void {
+    const record = this.scenarios.get(scenarioId);
+    if (!record) throw new Error(`Unknown scenario '${scenarioId}'.`);
+    record.expiresAtMs = Date.now() - 1;
   }
 
   private effectiveIncurredCostUsd(): number {
@@ -491,6 +513,9 @@ export class TraceForgeMaasService {
     if (record.ownerActorId !== context.actorId) {
       throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Scenario '${scenarioId}' belongs to another actor.`, correlationId, capability);
     }
+    if (Date.now() > record.expiresAtMs) {
+      throw new MaasToolError('MAAS_SESSION_EXPIRED', `Scenario '${scenarioId}' has expired.`, correlationId, capability);
+    }
     return record;
   }
 
@@ -577,6 +602,11 @@ export class TraceForgeMaasService {
       authorizedCeilingUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD,
       mandatoryReserveUsd: TARGET_RESERVE_USD,
       safetyThresholdUsd: BUDGET_SAFETY_THRESHOLD_USD,
+      lastVerifiedBalanceUsd: LAST_VERIFIED_BALANCE_USD,
+      lastVerifiedConsumedUsd: LAST_VERIFIED_CONSUMED_USD,
+      lastVerifiedTimestamp: LAST_VERIFIED_TIMESTAMP,
+      verifiedNote: 'Verified $132.38 balance ($14.88 consumed across Muse Code CLI + live API; $85.12 remaining of $100.00 authorized budget) as of 2026-10-26T18:49:40-05:00.',
+      verifiedRemainingBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD - LAST_VERIFIED_CONSUMED_USD,
       ledger: {
         incurredCostUsd: incurred,
         projectedLiveCostUsd: telemetry.projectedLiveCostUsd,
@@ -683,6 +713,7 @@ export class TraceForgeMaasService {
       evaluated: false,
       faultSelector: this.selectorLabel(faultSelector),
       createdAt: new Date().toISOString(),
+      expiresAtMs: Date.now() + this.sessionTtlMs,
     };
     this.scenarios.set(scenarioId, record);
     return record;
@@ -885,9 +916,13 @@ export class TraceForgeMaasService {
       if (this.effectiveIncurredCostUsd() >= BUDGET_SAFETY_THRESHOLD_USD) {
         throw new MaasToolError('MAAS_BUDGET_THRESHOLD_EXCEEDED', `Live inference blocked: incurred cost $${this.effectiveIncurredCostUsd().toFixed(2)} reached the $${BUDGET_SAFETY_THRESHOLD_USD.toFixed(2)} safety threshold.`, correlationId, capability);
       }
-      throw new MaasToolError('MAAS_UPSTREAM_UNAVAILABLE', 'Live Muse Spark 1.3 upstream is not configured on this server (zero-cost simulated mode). No live call was attempted and no cost was incurred.', correlationId, capability);
+      if (!this.liveClient) {
+        throw new MaasToolError('MAAS_UPSTREAM_UNAVAILABLE', 'Live Muse Spark 1.3 upstream is not configured on this server (zero-cost simulated mode). No live call was attempted and no cost was incurred.', correlationId, capability);
+      }
     }
-    const run = await runAgenticDiagnosis(record.session, this.simClient);
+    const run = mode === 'live' && this.liveClient
+      ? await runAgenticDiagnosis(record.session, this.liveClient)
+      : await runAgenticDiagnosis(record.session, this.simClient);
     const probeLog = record.session.getProbeLog();
     const abnormalVoltages = probeLog.filter((p) => p.kind === 'voltage' && p.abnormal).map((p) => p.target);
     const shortedContinuities = probeLog.filter((p) => p.kind === 'resistance' && p.abnormal).map((p) => p.target);

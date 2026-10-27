@@ -52,6 +52,7 @@ export type MaasErrorCode =
   | 'MAAS_RESOURCE_NOT_FOUND'
   | 'MAAS_UPSTREAM_UNAVAILABLE'
   | 'MAAS_EXECUTION_FAILED'
+  | 'MAAS_SESSION_EXPIRED'
   | 'MAAS_POSTCONDITION_VERIFICATION_FAILED';
 
 /** Structured error payload returned inside tool results and audit events. */
