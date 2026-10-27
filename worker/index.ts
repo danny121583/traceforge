@@ -83,7 +83,32 @@ export const WORKER_SCOPES = [
 export interface TraceForgeWorkerEnv {
   TRACEFORGE_ENVIRONMENT?: string;
   MCP_PROTOCOL_VERSION?: string;
-  [key: string]: string | undefined;
+  TRACEFORGE_SESSION_SECRET?: string;
+  META_API_KEY?: string;
+  TRACEFORGE_STATE_DO?: DurableObjectNamespaceLike | string | undefined;
+  [key: string]: unknown;
+}
+
+/** Minimal structural view of a Cloudflare Durable Object's storage. */
+export interface DurableObjectStorageLike {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown): Promise<void>;
+}
+
+/** Minimal structural view of a Cloudflare Durable Object's state. */
+export interface DurableObjectStateLike {
+  storage: DurableObjectStorageLike;
+}
+
+/** Minimal structural view of a Cloudflare Durable Object stub. */
+export interface DurableObjectStubLike {
+  fetch(request: Request): Promise<Response>;
+}
+
+/** Minimal structural view of a Cloudflare Durable Object namespace binding. */
+export interface DurableObjectNamespaceLike {
+  idFromName(name: string): unknown;
+  get(id: unknown): DurableObjectStubLike;
 }
 
 export interface TraceForgeWorkerOptions {
@@ -277,6 +302,72 @@ function edgeCachePutJson(key: string, value: unknown): void {
     const ResponseCtor = (globalThis as { Response?: new (body: string, init: { headers: Record<string, string> }) => unknown }).Response;
     if (!ResponseCtor) return;
     void cache.put(key, new ResponseCtor(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })).catch(() => {});
+  } catch {
+    // Best-effort only.
+  }
+}
+
+/**
+ * Optional global durable storage adapter (installed by the Free-tier
+ * SQLite Durable Object `TraceForgeStateDO`). On `*.workers.dev`,
+ * `caches.default` is a no-op and OAuth authorize/token calls may land on
+ * different isolates — so consumed one-time codes are checked/recorded in
+ * durable storage FIRST, then in `caches.default` as before.
+ */
+interface DurableStorageHook {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown): Promise<void>;
+}
+
+/** Read the installed durable storage hook, if any (null otherwise). */
+export function getDurableStorageHook(): DurableStorageHook | null {
+  const hook = (globalThis as { __traceforgeDurableStorage?: DurableStorageHook }).__traceforgeDurableStorage;
+  return hook && typeof hook.get === 'function' && typeof hook.put === 'function' ? hook : null;
+}
+
+/** Install the durable storage hook (used by `TraceForgeStateDO`). */
+export function installDurableStorageHook(storage: DurableStorageHook): void {
+  (globalThis as { __traceforgeDurableStorage?: DurableStorageHook }).__traceforgeDurableStorage = storage;
+}
+
+/** Cross-isolate one-time auth-code consumption check (durable first, edge second). */
+export async function isCodeConsumedInEdgeCache(codeParam: string): Promise<boolean> {
+  const key = `${EDGE_CACHE_OAUTH_CODE_PREFIX}${await sha256Hex(codeParam)}`;
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      const val = await hook.get(key);
+      if (val !== undefined && val !== null) return true;
+    } catch {
+      // Fall through to caches.default on durable-read failure.
+    }
+  }
+  try {
+    const cache = getEdgeCache();
+    if (cache) {
+      const hit = await cache.match(key);
+      if (hit) return true;
+    }
+  } catch {
+    // Best-effort only: edge persistence must never fail token exchange.
+  }
+  return false;
+}
+
+/** Cross-isolate one-time auth-code consumption record (durable AND edge). */
+export async function markCodeConsumedInEdgeCache(codeParam: string): Promise<void> {
+  const key = `${EDGE_CACHE_OAUTH_CODE_PREFIX}${await sha256Hex(codeParam)}`;
+  const payload = { consumed: true, at: new Date().toISOString() };
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      await hook.put(key, payload);
+    } catch {
+      // Best-effort only.
+    }
+  }
+  try {
+    edgeCachePutJson(key, payload);
   } catch {
     // Best-effort only.
   }
@@ -787,18 +878,10 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         if (consumedStatelessCodes.has(codeParam)) {
           return oauthError(400, 'invalid_grant', 'Authorization code has already been redeemed.', correlationId);
         }
-        // Cross-isolate replay check: a code redeemed on another isolate in
-        // the same colocation is recorded in Cloudflare Edge Cache.
-        try {
-          const cache = (globalThis as { caches?: { default?: EdgeCacheLike } }).caches?.default;
-          if (cache) {
-            const hit = await cache.match(`${EDGE_CACHE_OAUTH_CODE_PREFIX}${await sha256Hex(codeParam)}`);
-            if (hit) {
-              return oauthError(400, 'invalid_grant', 'Authorization code has already been redeemed.', correlationId);
-            }
-          }
-        } catch {
-          // Best-effort only: edge persistence must never fail token exchange.
+        // Cross-isolate replay check: a code redeemed on another isolate
+        // is recorded in durable storage (or Cloudflare Edge Cache).
+        if (await isCodeConsumedInEdgeCache(codeParam)) {
+          return oauthError(400, 'invalid_grant', 'Authorization code has already been redeemed.', correlationId);
         }
         stored = stateless;
       }
@@ -810,15 +893,11 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         return oauthError(400, 'invalid_grant', 'PKCE S256 code_verifier verification failed.', correlationId);
       }
       // One-time consumption: isolate-local (both code generations) AND
-      // Cloudflare Edge Cache, so codes cannot be replayed across isolates
-      // in the same colocation.
+      // durable storage + Cloudflare Edge Cache, so codes cannot be
+      // replayed across isolates, PoPs, or Worker restarts.
       authCodes.delete(codeParam);
       consumedStatelessCodes.add(codeParam);
-      try {
-        edgeCachePutJson(`${EDGE_CACHE_OAUTH_CODE_PREFIX}${await sha256Hex(codeParam)}`, { consumed: true, at: new Date().toISOString() });
-      } catch {
-        // Best-effort only.
-      }
+      await markCodeConsumedInEdgeCache(codeParam);
       const accessToken = await mintStatelessToken(stored.scope, stored.clientId, signingSecret);
       issuedTokens.set(accessToken, { scope: stored.scope, clientId: stored.clientId, expiresAtMs: clock() + 3600 * 1000 });
       return jsonResponse(200, {
@@ -851,6 +930,24 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
     if (method === 'GET' && path === '/api/maas/catalog') {
       const payload = await service.executeTool('traceforge.capabilities.list', {}, await resolveServiceHeaders(request, env));
       return jsonResponse(200, payload, correlationId);
+    }
+
+    // Server-authorized diagnostic telemetry: technical access (model,
+    // budget, and system status) requires a Bearer [REDACTED] with the `traceforge:audit:read`
+    // scope — enforced here on the server, never via a frontend toggle.
+    // Returns 401 when unauthenticated and 403 when unauthorized.
+    if (method === 'GET' && path === '/api/maas/telemetry') {
+      try {
+        const headers = await resolveServiceHeaders(request, env);
+        const context = service.getAuthenticator().authenticate(headers);
+        service.getAuthenticator().authorize(context, 'traceforge.telemetry', 'traceforge:audit:read');
+        return jsonResponse(200, await service.getTelemetrySnapshot(), correlationId);
+      } catch (err) {
+        const code = err instanceof MaasSecurityError ? err.code : 'MAAS_EXECUTION_FAILED';
+        return jsonResponse(maasErrorStatus(code), {
+          error: { code, message: err instanceof Error ? err.message : String(err), correlationId },
+        }, correlationId);
+      }
     }
 
     if (method === 'GET' && path === '/api/maas/audit') {
@@ -1036,9 +1133,61 @@ function shared(): TraceForgeWorker {
   return sharedWorker;
 }
 
+/**
+ * Free-tier SQLite Durable Object coordinator (`TraceForgeStateDO`,
+ * `wrangler.toml` binding `TRACEFORGE_STATE_DO`).
+ *
+ * On `*.workers.dev`, `caches.default` is a no-op and MCP requests arrive
+ * from many egress IPs across edge PoPs/isolates — so every request is
+ * routed through this canonical singleton (`traceforge-canonical-v1`),
+ * whose transactional SQLite storage backs `PersistedScenarioState` at
+ * `$0.00/month` on the Workers Free plan. The constructor (and every
+ * `fetch`) installs the isolate-global durable storage hook so the MaaS
+ * service's `edgeCacheGet`/`edgeCachePut` and the OAuth one-time-code
+ * helpers read/write durable storage FIRST, then `caches.default`.
+ */
+export class TraceForgeStateDO {
+  private readonly state: DurableObjectStateLike;
+  private readonly env: TraceForgeWorkerEnv;
+  private readonly worker: TraceForgeWorker;
+
+  constructor(state: DurableObjectStateLike, env: TraceForgeWorkerEnv) {
+    this.state = state;
+    this.env = env;
+    installDurableStorageHook({
+      get: (k) => this.state.storage.get(k),
+      put: (k, v) => this.state.storage.put(k, v),
+    });
+    this.worker = createTraceForgeWorker();
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    installDurableStorageHook({
+      get: (k) => this.state.storage.get(k),
+      put: (k, v) => this.state.storage.put(k, v),
+    });
+    return this.worker.fetch(request, this.env);
+  }
+}
+
+/** Canonical singleton Durable Object name (one coordinator per Worker). */
+export const TRACEFORGE_STATE_DO_NAME = 'traceforge-canonical-v1';
+
 /** Default Cloudflare Worker entrypoint (`wrangler.toml` `main`). */
 export default {
   fetch(request: Request, env?: TraceForgeWorkerEnv): Promise<Response> {
+    const binding = env?.TRACEFORGE_STATE_DO;
+    if (
+      env
+      && typeof binding === 'object'
+      && binding !== null
+      && typeof (binding as DurableObjectNamespaceLike).idFromName === 'function'
+      && typeof (binding as DurableObjectNamespaceLike).get === 'function'
+    ) {
+      const ns = binding as DurableObjectNamespaceLike;
+      const stub = ns.get(ns.idFromName(TRACEFORGE_STATE_DO_NAME));
+      return stub.fetch(request);
+    }
     return shared().fetch(request, env);
   },
 };

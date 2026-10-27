@@ -150,7 +150,10 @@ CH224K PD trigger. Nodes: `GND`, `V5`, `CC1`, `CC2`. Probe aliases:
   (`src/maas/protocol.ts`), and verification receipts
   (`src/maas/verification.ts`).
 - **Cloudflare Worker:** staging backend with OAuth 2.1 PKCE,
-  AES-256-GCM tokens, and Edge Cache persistence
+  AES-256-GCM tokens, awaited Edge Cache scenario synchronization with
+  a Free-tier SQLite Durable Object coordinator (`TraceForgeStateDO`,
+  backing `PersistedScenarioState` on `*.workers.dev`), and
+  a server-authorized telemetry endpoint (`GET /api/maas/telemetry`)
   (`worker/index.ts`, `wrangler.toml`).
 - **Deployment:** Vercel Hobby frontend with edge rewrites to the
   Worker (`vercel.json`).
@@ -180,6 +183,15 @@ flowchart LR
 Explicit spend control: an omitted `mode` in
 `traceforge.investigations.start` **always** runs simulated, even with a
 live client attached. Read-only tools never invoke paid inference.
+
+The Step 2 header carries one compact mode badge — `Virtual Lab`,
+`Live AI` (ready/unverified), or `Recorded Investigation` — so the
+current execution mode is visible beside the investigation controls at
+all times. Developer telemetry (credit balances, token counts, cost
+math, mode codes) is removed from the ordinary UI; technical
+diagnostics stay available only through server-authorized access
+(`GET /api/maas/telemetry` with `traceforge:audit:read`, alongside
+`traceforge.budget.status` and the scoped `/api/maas/audit`).
 
 ## G. Installation & Local Development
 
@@ -254,7 +266,9 @@ OAuth clients use RFC 7591 dynamic registration plus PKCE S256
 ## I. Cloudflare Worker & Vercel Hobby ($0) Deployment
 
 - **Staging Worker** (`traceforge-mcp-staging`, `worker/index.ts`):
-  serves MCP, MaaS REST (`/api/maas/*`), browser backend
+  serves MCP, MaaS REST (`/api/maas/*`), server-authorized diagnostics
+  (`GET /api/maas/telemetry`: `Bearer` + `traceforge:audit:read`,
+  `401`/`403` otherwise), browser backend
   (`/api/meta/status`, `/api/meta/chat`, `/api/meta/segment`), health,
   and OAuth discovery. Provision the key once with
   `wrangler secret put META_API_KEY` (optionally
@@ -273,8 +287,26 @@ OAuth clients use RFC 7591 dynamic registration plus PKCE S256
   colocation — not a substitute for Durable Objects).
 - **Cross-request sessions:** `scn_…` / `inv_…` ids are
   self-contained AES-256-GCM tokens, so any isolate holding the
-  session secret can hydrate them; completed investigations and
-  scorecards are additionally cached at the edge per colocation.
+  session secret can hydrate them. Every read merges the canonical
+  `PersistedScenarioState` from Edge Cache (`probesUsed`, ordered
+  probe log, canonical investigation, immutable scorecard) and every
+  mutation awaits persistence first (`Cache-Control: max-age=1800`),
+  so consecutive MCP calls agree even when routed across isolates.
+  Investigation ids are deterministic per `(scenarioId, owner)`
+  (fixed sequence, SHA-256-derived IV); scenario tokens keep random
+  IVs. A per-actor Edge Cache index keeps `scenarios.list`
+  consistent across isolates without leaking sessions between actors.
+- **Strong global consistency on `*.workers.dev`
+  (`TraceForgeStateDO`, `$0.00/month`):** `caches.default` is a
+  no-op on `*.workers.dev` subdomains and MCP requests arrive from
+  many egress IPs across PoPs/isolates — so the Worker routes every
+  request through the canonical Free-tier SQLite Durable Object
+  singleton (`traceforge-canonical-v1`, `wrangler.toml`
+  `TRACEFORGE_STATE_DO` binding), whose transactional storage backs
+  `PersistedScenarioState`. The MaaS `edgeCacheGet`/`edgeCachePut`
+  helpers and the OAuth one-time-code checks read/write that durable
+  storage FIRST, then Edge Cache, giving 100% strong session
+  consistency across isolates, PoPs, and restarts.
 
 ## J. Security
 
@@ -296,6 +328,9 @@ OAuth clients use RFC 7591 dynamic registration plus PKCE S256
 - **Ground-truth isolation:** `assertGroundTruthIsolated` scans every
   pre-evaluation payload; truth reaches the owning actor only via
   `evaluation.score`.
+- **Server-authorized diagnostics only:** `GET /api/maas/telemetry`
+  requires `traceforge:audit:read`; the workbench UI shows a single
+  mode badge and never renders balances, token counts, or cost math.
 - **Budget safety stop:** live inference halts at `$95.00` of
   verified + runtime spend (see §K and `AGENTS.md` §8).
 
@@ -315,6 +350,11 @@ errors). Coverage by area:
 - **Spending control:** omitted-mode defaults to simulated, explicit
   live invokes the client, read-only status never calls inference,
   `$95.00` dual-measure safety stop, shared runtime ledger.
+- **Cross-isolate consistency:** multi-isolate probe accumulation
+  (`1→2→3` with ordered history), failed-probe budget preservation,
+  one stable `investigationId` warm and cold, one immutable
+  scorecard across `score`/`report`, per-actor `scenarios.list`
+  isolation, and `401`/`403`/`200` telemetry authorization.
 - **Cloudflare Worker:** health/CORS, discovery metadata, PKCE
   exchange, replay protection, `/api/meta/*` routing (503 without
   key, 429 on safety stop), zero-Node-import guard.
@@ -335,8 +375,9 @@ call) establishes live execution.
 - **SAM 3.1 live segmentation deferred:** overlays are
   `STATIC_FIXTURE` KiCad geometry by design (see §F, §M).
 - **Edge Cache is per-colocation and best-effort:** cold isolates in
-  other colos rehydrate from self-contained tokens; Durable Objects
-  would be needed for strongly consistent global state.
+  other colos rehydrate from self-contained tokens; on
+  `*.workers.dev` the `TraceForgeStateDO` SQLite Durable Object
+  provides the strongly consistent global state instead (see §I).
 
 ## M. Project Status & Roadmap
 

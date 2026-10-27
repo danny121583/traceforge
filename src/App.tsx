@@ -25,7 +25,7 @@ import {
   type ProbeMeasurement,
 } from './lib/diagnostic-parser';
 import { SAMPLE_BOARDS, getBoard } from './data/samples';
-import type { ClientMode, OperationalMode, UsageTelemetry } from './lib/meta-client';
+import type { ClientMode, UsageTelemetry } from './lib/meta-client';
 import {
   createVirtualSession,
   getReferenceBoard,
@@ -42,7 +42,6 @@ import {
 } from './lib/circuit-simulator';
 import {
   aiModeBadge,
-  executionSourceLabel,
   extractProbeTargetFromStepSummary,
   formatActivitySummary,
   formatLifecycleStatus,
@@ -143,7 +142,11 @@ export function App() {
   // STATIC_FIXTURE, so toggling 'Go live' for Muse Spark 1.3 reasoning must
   // never flip the segmentation badge to LIVE_API/UNVERIFIED.
   const client = useMemo(() => new MetaClient({ mode, segmentationMode: 'static_fixture' }), [mode]);
-  const [telemetry, setTelemetry] = useState<UsageTelemetry>(() => client.getTelemetry());
+  // The telemetry VALUE is intentionally not rendered in the ordinary UI
+  // (developer drawer removed; server-authorized `/api/maas/telemetry`
+  // remains the diagnostic path). Ledger updates below keep every budget
+  // and safety control live.
+  const [, setTelemetry] = useState<UsageTelemetry>(() => client.getTelemetry());
   // A mode toggle builds a fresh client with a fresh ledger — re-sync.
   useEffect(() => {
     setTelemetry(client.getTelemetry());
@@ -1043,7 +1046,7 @@ export function App() {
                 </button>
               ))}
             </div>
-            <div className="tf-row">
+            <div className="tf-row tf-fault-row">
               <label className="sr-only" style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
                 Select circuit:{' '}
                 <select aria-label="Select circuit" className="sr-only" value={boardId} onChange={(e) => switchBoard(e.target.value)} disabled={running}>
@@ -1052,7 +1055,7 @@ export function App() {
                   ))}
                 </select>
               </label>
-              <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+              <label className="tf-fault-label">
                 Fault scenario:{' '}
                 <select value={faultSel} onChange={(e) => switchFault(e.target.value)} disabled={running}>
                   {faultOptions.map((o) => (
@@ -1069,8 +1072,8 @@ export function App() {
             <p className="tf-note">
               TraceForge secretly introduces a hidden electrical fault into the virtual circuit.
               The AI must find it using measurements alone.
+              Reported symptom: <strong>{symptom}</strong>
             </p>
-            <p className="tf-note">Reported symptom: {symptom}</p>
             <details>
               <summary>How it works</summary>
               <p className="tf-note">
@@ -1123,7 +1126,10 @@ export function App() {
 
         <div className="tf-right">
           <section className="tf-card tf-step" aria-label="Step 2: Investigate">
-            <h3>STEP 2 · INVESTIGATE</h3>
+            <div className="tf-investigate-head">
+              <h3>STEP 2 · INVESTIGATE</h3>
+              <span className={(replayBadge ?? modeBadge).className}>{(replayBadge ?? modeBadge).label}</span>
+            </div>
             {mode === 'live' && liveModeError && (
               <div className="tf-chip unavailable" role="alert" style={{ marginBottom: 8 }}>
                 Live AI unavailable: {liveModeError}
@@ -1134,28 +1140,30 @@ export function App() {
                 {formatLifecycleStatus(lifecycle, lifecycleDetail)}
               </div>
             )}
-            {primaryAction && (
-              <div className="tf-row">
-                <button className="primary" onClick={runAgentInvestigation} disabled={primaryAction.disabled || running}>
-                  {primaryAction.label}
-                </button>
-                <label style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
-                  <input
-                    type="checkbox"
-                    checked={demoPacing}
-                    onChange={(e) => setDemoPacing(e.target.checked)}
-                    disabled={running}
-                  />{' '}
-                  Video Demo Pacing (animate each probe)
-                </label>
+            {(primaryAction || !running) && (
+              <div className="tf-row tf-investigate-actions">
+                {primaryAction && (
+                  <button className="primary" onClick={runAgentInvestigation} disabled={primaryAction.disabled || running}>
+                    {primaryAction.label}
+                  </button>
+                )}
+                {!running && (
+                  <button onClick={() => void replayVerifiedLiveRun()}>
+                    Replay Recorded Investigation (Zero Cost)
+                  </button>
+                )}
               </div>
             )}
-            {!running && (
-              <div className="tf-row">
-                <button onClick={() => void replayVerifiedLiveRun()}>
-                  Replay Recorded Investigation (Zero Cost)
-                </button>
-              </div>
+            {primaryAction && (
+              <label className="tf-demo-pacing">
+                <input
+                  type="checkbox"
+                  checked={demoPacing}
+                  onChange={(e) => setDemoPacing(e.target.checked)}
+                  disabled={running}
+                />{' '}
+                Video Demo Pacing (animate each probe)
+              </label>
             )}
             {!complete && !hasActivity && !running && (
               <ol className="tf-checklist">
@@ -1275,11 +1283,10 @@ export function App() {
                 ) : (
                   <p className="tf-note">Nominal session — no fault was injected (healthy board).</p>
                 )}
-                <h4>Session Telemetry Summary</h4>
+                <h4>Investigation Summary</h4>
                 <p className="tf-note">
-                  Virtual probes used: {probeLog.length}/{MAX_TOOL_CALLS} ·{' '}
-                  <span className={(replayBadge ?? modeBadge).className}>{(replayBadge ?? modeBadge).label}</span> ·{' '}
-                  Est. AI cost: {fmtUsd(telemetry.projectedLiveCostUsd)} (incurred {fmtUsd(telemetry.incurredCostUsd)})
+                  Probes used: <strong>{probeLog.length}/{MAX_TOOL_CALLS}</strong> · Mode:{' '}
+                  <span className={(replayBadge ?? modeBadge).className}>{(replayBadge ?? modeBadge).label}</span>
                 </p>
                 <div className="tf-row">
                   <button className="primary" onClick={tryAnotherFault} disabled={running}>
@@ -1408,30 +1415,6 @@ export function App() {
           )}
         </div>
       </div>
-      <details className="tf-card tf-tech-drawer">
-        <summary>Technology, Telemetry &amp; Budget Details (Development / Hackathon Verification)</summary>
-        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontFamily: 'var(--mono)', fontSize: 11 }}>
-          <span className="tf-chip">Model: <strong>Muse Spark 1.3 ({sparkStatus.model})</strong></span>
-          <span className="tf-chip">Context: <strong>1M Tokens</strong></span>
-          <span className="tf-chip">Segmentation: <strong>Static Fixture (KiCad)</strong></span>
-          <span className={modeBadge.className}><strong>{modeBadge.label}</strong></span>
-          <span className="tf-chip">Execution Source: <strong>{executionSourceLabel((agentVerdict?.operationalMode as OperationalMode | 'RECORDED_LIVE_REPLAY' | undefined) ?? sparkStatus.sparkMode, { liveModeError })}</strong></span>
-          <span className="tf-chip">Segmentation Source: Static Reference Fixture (STATIC_FIXTURE)</span>
-          <span className="tf-chip">Internal Mode: <strong>{agentVerdict?.operationalMode ?? sparkStatus.sparkMode}</strong></span>
-          <span className="tf-chip">
-            Tokens: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
-            {' '}· Cost: <strong>${telemetry.incurredCostUsd.toFixed(2)} incurred (${telemetry.projectedLiveCostUsd.toFixed(4)} projected)</strong>
-            {' '}· Req: <strong>{telemetry.totalRequests}</strong>
-            {' '}· Retry: <strong>{telemetry.retriedRequests}</strong>
-            {' '}· Failed: <strong>{telemetry.failedRequests}</strong>
-          </span>
-        </div>
-        <p className="tf-note">
-          Board overlays run as STATIC_FIXTURE (KiCad reference geometry) — live SAM 3.1 calls are deferred,
-          so 100% of the live runtime budget is reserved for Muse Spark 1.3 circuit reasoning.
-        </p>
-        <BudgetMonitor telemetry={telemetry} />
-      </details>
     </div>
   );
 }

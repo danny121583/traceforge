@@ -222,6 +222,43 @@ export interface ScenarioRecord {
    * `MAAS_INVESTIGATION_INCOMPLETE`.
    */
   hydratedFromToken?: boolean;
+  /**
+   * Monotonically increasing state version for cross-isolate merge ordering.
+   * Bumped on every committed probe, investigation, and evaluation, then
+   * persisted to Edge Cache alongside the probe log.
+   */
+  version: number;
+  /** Canonical completed investigation for this scenario, if any. */
+  latestInvestigation?: InvestigationRecord;
+}
+
+/**
+ * Canonical serializable scenario state synchronized across Worker isolates
+ * through `caches.default` (Edge Cache, same colocation) under
+ * `edgeScenarioKey(scenarioId)`. Every read (`requireOwnedScenario`) merges
+ * the newer side into the isolate-local `ScenarioRecord`; every mutation
+ * (probe, investigation, evaluation) bumps `version` and awaits persistence
+ * before the HTTP response leaves the Worker. `evaluated` + `scorecard` are
+ * immutable once set: they are never overwritten or re-scored.
+ */
+export interface PersistedScenarioState {
+  scenarioId: string;
+  boardId: string;
+  ownerActorId: string;
+  faultSelector: string;
+  createdAt: string;
+  expiresAtMs: number;
+  /** Monotonically increasing state version for concurrent/sequential merge. */
+  version: number;
+  /** Ordered committed probe records (multiset-merged across isolates). */
+  probeLog: ProbeRecord[];
+  toolCallsUsed: number;
+  /** Canonical completed investigation for this scenario, if any. */
+  investigation?: InvestigationRecord;
+  /** Immutable evaluation state once evaluation.score has completed. */
+  evaluated: boolean;
+  evaluatedAt?: string;
+  scorecard?: Record<string, unknown>;
 }
 
 export interface InvestigationRecord {
@@ -256,7 +293,6 @@ export interface MaasServiceOptions {
 export type MaasHeaderMap = Record<string, string | string[] | undefined>;
 
 let scenarioSeq = 0;
-let investigationSeq = 0;
 
 /* ---------------------------------------------------------------------------
  * Authenticated scenario / investigation ids (cross-isolate hydration)
@@ -333,9 +369,9 @@ function constantTimeHexEqual(a: string, b: string): boolean {
  * HMAC-SHA-256 tag so the format stays `${prefix}${hex}_${tag8}` matching
  * `/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/`.
  */
-export async function encryptSignedToken(prefix: string, payload: Record<string, unknown>, secret: string): Promise<string> {
+export async function encryptSignedToken(prefix: string, payload: Record<string, unknown>, secret: string, ivOverride?: Uint8Array): Promise<string> {
   const aesKey = await aeadKeyForSecret(secret);
-  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const iv = ivOverride && ivOverride.length === 12 ? ivOverride.slice() : crypto.getRandomValues(new Uint8Array(12));
   const plaintext = new TextEncoder().encode(JSON.stringify(payload));
   const sealed = new Uint8Array(
     await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix) }, aesKey, plaintext as unknown as BufferSource),
@@ -410,8 +446,28 @@ export interface InvestigationTokenExtras {
   u?: UsageTelemetry;
 }
 
-async function encodeInvestigationToken(payload: { s: string; o: string; q: number } & InvestigationTokenExtras, secret: string): Promise<string> {
-  return encryptSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>, secret);
+async function encodeInvestigationToken(payload: { s: string; o: string; q: number } & InvestigationTokenExtras, secret: string, ivOverride?: Uint8Array): Promise<string> {
+  return encryptSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>, secret, ivOverride);
+}
+
+/**
+ * Deterministic 96-bit IV for the canonical investigation token of one
+ * `(scenarioId, ownerActorId)` pair: the first 12 bytes of
+ * `SHA-256("traceforge-inv-iv-v2::" + secret + "::" + scenarioId + "::" +
+ * ownerActorId)`. Combined with the fixed sequence `q: 1`, every isolate
+ * holding the session secret mints the byte-identical `inv_...` token for
+ * the same deterministic diagnosis — so `investigations.status`, `.history`,
+ * `.result`, `evaluation.score`, and `evaluation.report` always agree on one
+ * stable `investigationId` per scenario, even on a cold isolate with no
+ * Edge Cache entry. `encodeScenarioToken` / `encryptSignedToken` keep using
+ * random 96-bit IVs by default.
+ */
+export async function deterministicIvForInvestigation(scenarioId: string, ownerActorId: string, secret: string): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`traceforge-inv-iv-v2::${secret}::${scenarioId}::${ownerActorId}`),
+  );
+  return new Uint8Array(digest).slice(0, 12);
 }
 
 async function decodeInvestigationToken(token: string, secret: string): Promise<({ s: string; o: string; q: number } & InvestigationTokenExtras) | null> {
@@ -461,7 +517,34 @@ function getEdgeCache(): EdgeCacheLike | null {
   }
 }
 
+/**
+ * Optional global durable storage adapter (Cloudflare Free-tier SQLite
+ * Durable Object `TraceForgeStateDO`, which installs itself here). On
+ * `*.workers.dev`, `caches.default` is a no-op (`match()` always resolves
+ * to `undefined`) and MCP requests arrive from many egress IPs across edge
+ * PoPs/isolates — so the durable hook is checked FIRST for strong global
+ * session consistency across all isolates, PoPs, and Worker restarts.
+ */
+export interface DurableStorageHook {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown): Promise<void>;
+}
+
+export function getDurableStorageHook(): DurableStorageHook | null {
+  const hook = (globalThis as { __traceforgeDurableStorage?: DurableStorageHook }).__traceforgeDurableStorage;
+  return hook && typeof hook.get === 'function' && typeof hook.put === 'function' ? hook : null;
+}
+
 async function edgeCacheGet<T>(key: string): Promise<T | null> {
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      const val = await hook.get(key);
+      if (val !== undefined && val !== null) return val as T;
+    } catch {
+      // Fall through to caches.default on durable-read failure.
+    }
+  }
   const cache = getEdgeCache();
   if (!cache) return null;
   try {
@@ -473,13 +556,32 @@ async function edgeCacheGet<T>(key: string): Promise<T | null> {
   }
 }
 
-function edgeCachePut(key: string, value: unknown): void {
+/**
+ * Best-effort Edge Cache write, AWAITED before the tool response leaves the
+ * isolate so a successive request routed to another isolate in the same
+ * colocation observes the committed state. Never throws: edge persistence
+ * must never fail a tool call.
+ */
+async function edgeCachePut(key: string, value: unknown): Promise<void> {
+  const hook = getDurableStorageHook();
+  if (hook) {
+    try {
+      await hook.put(key, value);
+    } catch {
+      // Best-effort only: durable persistence must never fail a tool call.
+    }
+  }
   const cache = getEdgeCache();
   if (!cache) return;
   try {
     const ResponseCtor = (globalThis as { Response?: new (body: string, init: { headers: Record<string, string> }) => unknown }).Response;
     if (!ResponseCtor) return;
-    void cache.put(key, new ResponseCtor(JSON.stringify(value), { headers: { 'Content-Type': 'application/json' } })).catch(() => {});
+    await cache.put(
+      key,
+      new ResponseCtor(JSON.stringify(value), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'max-age=1800' },
+      }),
+    );
   } catch {
     // Best-effort only: edge persistence must never fail a tool call.
   }
@@ -487,6 +589,72 @@ function edgeCachePut(key: string, value: unknown): void {
 
 function edgeScenarioKey(scenarioId: string): string {
   return `${EDGE_CACHE_SCENARIO_PREFIX}${scenarioId}`;
+}
+
+/** Per-actor scenario index for cross-isolate `traceforge.scenarios.list`. */
+function edgeActorKey(actorId: string): string {
+  return `https://traceforge-internal.local/actor-scenarios/${encodeURIComponent(actorId)}`;
+}
+
+export interface ActorScenarioEntry {
+  scenarioId: string;
+  boardId: string;
+  evaluated: boolean;
+  faultSelector: string;
+  createdAt: string;
+}
+
+/** Deterministic content signature for one committed probe record. */
+function probeSignature(p: ProbeRecord): string {
+  return JSON.stringify([p.kind, p.target, p.abnormal, p.detail ?? null]);
+}
+
+/**
+ * Multiset union of two probe logs: start from the longer log and append
+ * copies present in the shorter log beyond the longer log's multiplicity.
+ * Sequential isolates always hold prefix logs, so the longer side wins
+ * verbatim (order preserved); concurrent isolates converge on the same
+ * count. Duplicate identical probes are preserved by multiplicity, never
+ * collapsed.
+ */
+function mergeProbeLogs(a: ProbeRecord[], b: ProbeRecord[]): ProbeRecord[] {
+  if (a.length === 0) return [...b];
+  if (b.length === 0) return [...a];
+  const base = a.length >= b.length ? [...a] : [...b];
+  const other = a.length >= b.length ? b : a;
+  const countInto = (log: ProbeRecord[]): Map<string, number> => {
+    const m = new Map<string, number>();
+    for (const p of log) {
+      const sig = probeSignature(p);
+      m.set(sig, (m.get(sig) ?? 0) + 1);
+    }
+    return m;
+  };
+  const baseCounts = countInto(base);
+  const otherCounts = countInto(other);
+  for (const [sig, n] of otherCounts) {
+    const have = baseCounts.get(sig) ?? 0;
+    if (n > have) {
+      base.push(...other.filter((p) => probeSignature(p) === sig).slice(0, n - have));
+    }
+  }
+  return base;
+}
+
+function isProbeRecordArray(value: unknown): value is ProbeRecord[] {
+  return Array.isArray(value) && value.every((p) => p !== null && typeof p === 'object' && typeof (p as { kind: unknown }).kind === 'string' && typeof (p as { target: unknown }).target === 'string');
+}
+
+function isPersistedScenarioState(value: unknown): value is PersistedScenarioState {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  return typeof r['scenarioId'] === 'string'
+    && typeof r['boardId'] === 'string'
+    && typeof r['ownerActorId'] === 'string'
+    && typeof r['version'] === 'number'
+    && typeof r['toolCallsUsed'] === 'number'
+    && typeof r['evaluated'] === 'boolean'
+    && isProbeRecordArray(r['probeLog']);
 }
 
 /* ---------------------------------------------------------------------------
@@ -762,7 +930,7 @@ export class TraceForgeMaasService {
         previousSpend,
         this.externalLiveSpendUsd + this.edgeCachedLiveSpendUsd + (this.liveClient?.getTelemetry().incurredCostUsd ?? 0),
       );
-      edgeCachePut(EDGE_CACHE_RUNTIME_TELEMETRY_KEY, {
+      await edgeCachePut(EDGE_CACHE_RUNTIME_TELEMETRY_KEY, {
         incurredCostUsd: cumulative,
         inputTokens: this.externalInputTokens + (this.liveClient?.getTelemetry().inputTokens ?? 0),
         outputTokens: this.externalOutputTokens + (this.liveClient?.getTelemetry().outputTokens ?? 0),
@@ -803,6 +971,20 @@ export class TraceForgeMaasService {
 
   private effectiveIncurredCostUsd(): number {
     return this.combinedTelemetry().incurredCostUsd + this.injectedLiveSpendUsd + this.edgeCachedLiveSpendUsd;
+  }
+
+  /**
+   * Server-authorized technical diagnostic snapshot: system, model, and
+   * budget status together. Served only behind `traceforge:audit:read`
+   * authorization (`GET /api/maas/telemetry`, `traceforge.budget.status`
+   * tool paths); never exposed through a frontend toggle.
+   */
+  async getTelemetrySnapshot(): Promise<{ systemStatus: unknown; modelsStatus: unknown; budgetStatus: unknown }> {
+    return {
+      systemStatus: this.systemStatus(),
+      modelsStatus: await this.modelsStatus(),
+      budgetStatus: await this.budgetStatus(),
+    };
   }
 
   /* -- central execution gate --------------------------------------------- */
@@ -906,9 +1088,112 @@ export class TraceForgeMaasService {
 
   /* -- scenario / investigation helpers ------------------------------------ */
 
+  /**
+   * Merge a canonical `PersistedScenarioState` from Edge Cache into the
+   * isolate-local record. Probe logs merge by multiset union (the longer
+   * prefix wins verbatim; the session bench is restored when the merged log
+   * grows), investigations attach by version ordering, and
+   * `evaluated`/`scorecard` are immutable once set anywhere. Records owned
+   * by another actor are never merged.
+   */
+  private mergePersistedScenarioState(record: ScenarioRecord, edge: PersistedScenarioState): void {
+    if (edge.scenarioId !== record.scenarioId || edge.ownerActorId !== record.ownerActorId) return;
+    // Never extend a locally expired session (preserves the test seam and
+    // token expiry semantics); only adopt an earlier edge expiry.
+    record.expiresAtMs = Math.min(record.expiresAtMs, edge.expiresAtMs);
+    const localLog = record.session.getProbeLog();
+    const merged = mergeProbeLogs(localLog, edge.probeLog);
+    const mergedUsed = Math.max(record.session.getToolCallsUsed(), edge.toolCallsUsed, merged.length);
+    if (merged.length > localLog.length || mergedUsed > record.session.getToolCallsUsed()) {
+      record.session.restoreProbeLog(merged, mergedUsed);
+    }
+    if (edge.version > record.version) record.version = edge.version;
+    const localInv = record.latestInvestigation
+      ?? [...this.investigations.values()].filter((r) => r.scenarioId === record.scenarioId).pop();
+    if (edge.investigation
+      && edge.investigation.scenarioId === record.scenarioId
+      && edge.investigation.ownerActorId === record.ownerActorId
+      && (!localInv || edge.version >= record.version)) {
+      this.investigations.set(edge.investigation.investigationId, edge.investigation);
+      record.latestInvestigation = edge.investigation;
+    } else if (localInv) {
+      record.latestInvestigation = localInv;
+    }
+    // Immutability of evaluation: once evaluated anywhere, the scorecard
+    // can never be overwritten or re-scored.
+    if (edge.evaluated === true) {
+      record.evaluated = true;
+      if (typeof edge.evaluatedAt === 'string') record.evaluatedAt = edge.evaluatedAt;
+      if (edge.scorecard !== undefined) record.scorecard = edge.scorecard;
+    }
+    if (record.latestInvestigation) {
+      this.investigations.set(record.latestInvestigation.investigationId, record.latestInvestigation);
+    }
+  }
+
+  /** Fetch the canonical scenario state from Edge Cache and merge it in. */
+  private async syncScenarioFromEdge(record: ScenarioRecord): Promise<void> {
+    const edge = await edgeCacheGet<unknown>(edgeScenarioKey(record.scenarioId));
+    if (isPersistedScenarioState(edge)) {
+      this.mergePersistedScenarioState(record, edge);
+      return;
+    }
+    // Backwards compatibility: pre-version entries stored only
+    // `{ investigation }` under the scenario key.
+    if (isEdgeCachedScenario(edge) && isInvestigationRecord(edge.investigation)
+      && edge.investigation.scenarioId === record.scenarioId
+      && edge.investigation.ownerActorId === record.ownerActorId
+      && !record.latestInvestigation) {
+      this.investigations.set(edge.investigation.investigationId, edge.investigation);
+      record.latestInvestigation = edge.investigation;
+    }
+  }
+
+  /** Canonical persisted snapshot of one isolate-local record. */
+  private persistedStateFor(record: ScenarioRecord): PersistedScenarioState {
+    const latest = record.latestInvestigation
+      ?? [...this.investigations.values()].filter((r) => r.scenarioId === record.scenarioId).pop();
+    if (latest) record.latestInvestigation = latest;
+    return {
+      scenarioId: record.scenarioId,
+      boardId: record.boardId,
+      ownerActorId: record.ownerActorId,
+      faultSelector: record.faultSelector,
+      createdAt: record.createdAt,
+      expiresAtMs: record.expiresAtMs,
+      version: record.version,
+      probeLog: record.session.getProbeLog(),
+      toolCallsUsed: record.session.getToolCallsUsed(),
+      ...(latest ? { investigation: latest } : {}),
+      evaluated: record.evaluated,
+      ...(record.evaluatedAt ? { evaluatedAt: record.evaluatedAt } : {}),
+      ...(record.scorecard ? { scorecard: record.scorecard } : {}),
+    };
+  }
+
+  /** Awaited persist of the canonical scenario state to Edge Cache. */
+  private async persistScenarioState(record: ScenarioRecord): Promise<void> {
+    await edgeCachePut(edgeScenarioKey(record.scenarioId), this.persistedStateFor(record));
+  }
+
+  /** Canonical investigation token: deterministic per `(scenarioId, owner)`. */
+  private async mintCanonicalInvestigationId(
+    scenarioId: string,
+    ownerActorId: string,
+    extras: InvestigationTokenExtras = {},
+  ): Promise<string> {
+    const iv = await deterministicIvForInvestigation(scenarioId, ownerActorId, this.sessionSecret);
+    return encodeInvestigationToken({ s: scenarioId, o: ownerActorId, q: 1, ...extras }, this.sessionSecret, iv);
+  }
+
   private async requireOwnedScenario(scenarioId: string, context: MaasAuthContext, correlationId: string, capability: string): Promise<ScenarioRecord> {
     const record = this.scenarios.get(scenarioId);
     if (record) {
+      // Cross-isolate freshness: another isolate may have committed probes,
+      // an investigation, or an evaluation since this isolate cached the
+      // record — ALWAYS merge the canonical Edge Cache state, even on a
+      // local in-memory hit, before enforcing ownership and expiry.
+      await this.syncScenarioFromEdge(record);
       if (record.ownerActorId !== context.actorId) {
         throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Scenario '${scenarioId}' belongs to another actor.`, correlationId, capability);
       }
@@ -949,8 +1234,13 @@ export class TraceForgeMaasService {
       createdAt: new Date().toISOString(),
       expiresAtMs: decoded.x,
       hydratedFromToken: true,
+      version: 0,
     };
     this.scenarios.set(scenarioId, hydrated);
+    // A cold isolate starts from an empty probe log: adopt every committed
+    // probe, the canonical investigation, and any immutable evaluation from
+    // the Edge Cache before enforcing ownership and expiry.
+    await this.syncScenarioFromEdge(hydrated);
     if (Date.now() > hydrated.expiresAtMs) {
       throw new MaasToolError('MAAS_SESSION_EXPIRED', `Scenario '${scenarioId}' has expired.`, correlationId, capability);
     }
@@ -974,15 +1264,20 @@ export class TraceForgeMaasService {
   }
 
   /**
-   * Build and store an `InvestigationRecord` for a scenario from one
-   * deterministic agentic-diagnosis run against this isolate's session bench.
+   * Build, store, and persist an `InvestigationRecord` from one
+   * deterministic agentic-diagnosis run against this isolate's session
+   * bench. The record becomes the scenario's canonical `latestInvestigation`,
+   * the scenario version bumps, and BOTH the investigation key and the
+   * canonical scenario state are awaited to Edge Cache before returning — so
+   * `status`, `history`, `result`, `score`, and `report` agree on one stable
+   * `investigationId` across isolates.
    */
-  private async diagnoseAndStoreInvestigation(
+  private async storeInvestigationRun(
     investigationId: string,
     scenarioRecord: ScenarioRecord,
     ownerActorId: string,
+    run: AgenticDiagnosisRun,
   ): Promise<InvestigationRecord> {
-    const run: AgenticDiagnosisRun = await runAgenticDiagnosis(scenarioRecord.session, this.simClient);
     const probeLog = scenarioRecord.session.getProbeLog();
     const stored: InvestigationRecord = {
       investigationId,
@@ -1004,14 +1299,41 @@ export class TraceForgeMaasService {
       createdAt: new Date().toISOString(),
     };
     this.investigations.set(investigationId, stored);
-    edgeCachePut(edgeInvestigationKey(investigationId), stored);
-    edgeCachePut(edgeScenarioKey(scenarioRecord.scenarioId), { investigation: stored });
+    scenarioRecord.latestInvestigation = stored;
+    scenarioRecord.version = (scenarioRecord.version ?? 0) + 1;
+    await edgeCachePut(edgeInvestigationKey(investigationId), stored);
+    await this.persistScenarioState(scenarioRecord);
     return stored;
   }
 
-  private async nextSignedInvestigationId(scenarioId: string, ownerActorId: string, extras: InvestigationTokenExtras = {}): Promise<string> {
-    investigationSeq += 1;
-    return encodeInvestigationToken({ s: scenarioId, o: ownerActorId, q: investigationSeq, ...extras }, this.sessionSecret);
+  private async diagnoseAndStoreInvestigation(
+    investigationId: string,
+    scenarioRecord: ScenarioRecord,
+    ownerActorId: string,
+  ): Promise<InvestigationRecord> {
+    const run: AgenticDiagnosisRun = await runAgenticDiagnosis(scenarioRecord.session, this.simClient);
+    return this.storeInvestigationRun(investigationId, scenarioRecord, ownerActorId, run);
+  }
+
+  /**
+   * Cold-isolate canonical diagnosis: run the deterministic bench first, then
+   * mint the deterministic per-scenario investigation id from the run extras,
+   * so every isolate converges on the byte-identical `inv_...` token (fixed
+   * sequence `q: 1`, deterministic IV) even with no Edge Cache entry.
+   */
+  private async diagnoseAndStoreCanonicalInvestigation(
+    scenarioRecord: ScenarioRecord,
+    ownerActorId: string,
+  ): Promise<InvestigationRecord> {
+    const run: AgenticDiagnosisRun = await runAgenticDiagnosis(scenarioRecord.session, this.simClient);
+    const investigationId = await this.mintCanonicalInvestigationId(scenarioRecord.scenarioId, ownerActorId, {
+      m: run.operationalMode,
+      t: run.turns,
+      d: run.proposedDiagnosis,
+      src: run.diagnosisSource,
+      u: run.telemetry,
+    });
+    return this.storeInvestigationRun(investigationId, scenarioRecord, ownerActorId, run);
   }
 
   private async resolveInvestigation(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string, capability: string): Promise<InvestigationRecord> {
@@ -1026,6 +1348,10 @@ export class TraceForgeMaasService {
         if (existing.ownerActorId !== context.actorId) {
           throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${existing.investigationId}' belongs to another actor.`, correlationId, capability);
         }
+        // Hydrate + sync the owning scenario from durable/edge state so
+        // `this.scenarios.get(record.scenarioId)` is warm even on a cold
+        // isolate queried by `investigationId` alone.
+        await this.requireOwnedScenario(existing.scenarioId, context, correlationId, capability);
         return existing;
       }
       // Cold-isolate path: rehydrate from the AES-256-GCM `inv_...` token.
@@ -1042,6 +1368,9 @@ export class TraceForgeMaasService {
       const cached = await edgeCacheGet<unknown>(edgeInvestigationKey(investigationId));
       if (isInvestigationRecord(cached) && cached.ownerActorId === context.actorId && cached.investigationId === investigationId) {
         this.investigations.set(investigationId, cached);
+        // Same hydration as the in-memory hit: the owning scenario must be
+        // warm and synced from durable/edge state on this isolate too.
+        await this.requireOwnedScenario(cached.scenarioId, context, correlationId, capability);
         return cached;
       }
       const scenarioRecord = await this.requireOwnedScenario(decoded.s, context, correlationId, capability);
@@ -1059,7 +1388,11 @@ export class TraceForgeMaasService {
       return stored;
     }
     const owned = await this.requireOwnedScenario(scenarioId as string, context, correlationId, capability);
-    const record = [...this.investigations.values()].filter((r) => r.scenarioId === owned.scenarioId).pop();
+    // `requireOwnedScenario` already merged the canonical Edge Cache state,
+    // so the canonical investigation for this scenario — created on any
+    // isolate — is returned with its exact `investigationId` here.
+    const record = owned.latestInvestigation
+      ?? [...this.investigations.values()].filter((r) => r.scenarioId === owned.scenarioId).pop();
     if (record) {
       if (record.ownerActorId !== context.actorId) {
         throw new MaasToolError('MAAS_CROSS_TENANT_ACCESS_DENIED', `Investigation '${record.investigationId}' belongs to another actor.`, correlationId, capability);
@@ -1078,12 +1411,14 @@ export class TraceForgeMaasService {
     }
     // Cold-isolate path: the scenario hydrated from a foreign `scn_...` token
     // (never created in this isolate's map) carries no investigation yet, so
-    // run the deterministic diagnosis here. Scenarios created in THIS isolate
-    // keep throwing `MAAS_RESOURCE_NOT_FOUND` so existing behavior is intact.
+    // run the deterministic canonical diagnosis here — every cold isolate
+    // converges on the byte-identical `investigationId`. Scenarios created in
+    // THIS isolate keep throwing `MAAS_RESOURCE_NOT_FOUND` so existing
+    // behavior is intact.
     if (!owned.hydratedFromToken) {
       throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${scenarioId}'.`, correlationId, capability);
     }
-    return this.diagnoseAndStoreInvestigation(await this.nextSignedInvestigationId(owned.scenarioId, context.actorId), owned, context.actorId);
+    return this.diagnoseAndStoreCanonicalInvestigation(owned, context.actorId);
   }
 
   private issueReceipt(capability: string, targetEntityId: string, assertions: string[], summary: string, correlationId: string): MaasVerificationReceipt {
@@ -1213,7 +1548,7 @@ export class TraceForgeMaasService {
     return payload;
   }
 
-  private scenariosList(args: Record<string, unknown>, context: MaasAuthContext): unknown {
+  private async scenariosList(args: Record<string, unknown>, context: MaasAuthContext): Promise<unknown> {
     const boardId = asString(args['boardId']);
     const boards = boardId ? listReferenceBoards().filter((b) => b.boardId === boardId) : listReferenceBoards();
     return {
@@ -1222,9 +1557,10 @@ export class TraceForgeMaasService {
         available: ['random', 'nominal', ...b.faults.map((_, index) => `scenario-${index}`)],
         scenarioCount: b.faults.length,
       })),
-      mySessions: [...this.scenarios.values()]
-        .filter((r) => r.ownerActorId === context.actorId)
-        .map((r) => ({ scenarioId: r.scenarioId, boardId: r.boardId, evaluated: r.evaluated, faultSelector: r.faultSelector, createdAt: r.createdAt })),
+      // Cross-isolate consistency: merge the per-actor Edge Cache index so a
+      // cold isolate lists the actor's sessions from every isolate in the
+      // colocation, while actors stay strictly isolated from one another.
+      mySessions: await this.listActorScenarios(context.actorId),
     };
   }
 
@@ -1288,9 +1624,65 @@ export class TraceForgeMaasService {
       createdAt: new Date().toISOString(),
       expiresAtMs,
       hydratedFromToken: false,
+      version: 0,
     };
     this.scenarios.set(scenarioId, record);
+    // Commit the initial canonical state + actor index before returning, so
+    // a successive request on another isolate observes this scenario.
+    await this.persistScenarioState(record);
+    await this.updateActorScenarioIndex(record);
     return record;
+  }
+
+  /** Upsert one scenario entry in the per-actor Edge Cache index. */
+  private async updateActorScenarioIndex(record: ScenarioRecord): Promise<void> {
+    try {
+      const key = edgeActorKey(record.ownerActorId);
+      const existing = await edgeCacheGet<unknown>(key);
+      const entries: ActorScenarioEntry[] = Array.isArray(existing) ? (existing as ActorScenarioEntry[]) : [];
+      const entry: ActorScenarioEntry = {
+        scenarioId: record.scenarioId,
+        boardId: record.boardId,
+        evaluated: record.evaluated,
+        faultSelector: record.faultSelector,
+        createdAt: record.createdAt,
+      };
+      const at = entries.findIndex((e) => e && e.scenarioId === record.scenarioId);
+      if (at >= 0) entries[at] = entry;
+      else entries.push(entry);
+      await edgeCachePut(key, entries);
+    } catch {
+      // Best-effort only.
+    }
+  }
+
+  /** Merge the per-actor Edge Cache index with isolate-local sessions. */
+  private async listActorScenarios(ownerActorId: string): Promise<ActorScenarioEntry[]> {
+    const local = [...this.scenarios.values()]
+      .filter((r) => r.ownerActorId === ownerActorId)
+      .map((r): ActorScenarioEntry => ({ scenarioId: r.scenarioId, boardId: r.boardId, evaluated: r.evaluated, faultSelector: r.faultSelector, createdAt: r.createdAt }));
+    try {
+      const edge = await edgeCacheGet<unknown>(edgeActorKey(ownerActorId));
+      if (!Array.isArray(edge)) return local;
+      const merged = new Map<string, ActorScenarioEntry>();
+      for (const e of local) merged.set(e.scenarioId, e);
+      for (const e of edge) {
+        if (e === null || typeof e !== 'object' || Array.isArray(e)) continue;
+        const rec = e as Partial<ActorScenarioEntry>;
+        if (typeof rec.scenarioId !== 'string' || typeof rec.boardId !== 'string') continue;
+        const prev = merged.get(rec.scenarioId);
+        merged.set(rec.scenarioId, {
+          scenarioId: rec.scenarioId,
+          boardId: rec.boardId,
+          evaluated: rec.evaluated === true || prev?.evaluated === true,
+          faultSelector: typeof rec.faultSelector === 'string' ? rec.faultSelector : (prev?.faultSelector ?? 'indexed'),
+          createdAt: typeof rec.createdAt === 'string' ? rec.createdAt : (prev?.createdAt ?? new Date(0).toISOString()),
+        });
+      }
+      return [...merged.values()];
+    } catch {
+      return local;
+    }
   }
 
   private async scenariosCreate(args: Record<string, unknown>, context: MaasAuthContext, correlationId: string): Promise<unknown> {
@@ -1332,6 +1724,10 @@ export class TraceForgeMaasService {
     const resolved = session.resolveProbeNode(node);
     try {
       const reading = session.measureVoltage(node, refNode);
+      // Commit before responding: bump the version and await Edge Cache
+      // persistence so the next call — on ANY isolate — observes this probe.
+      record.version = (record.version ?? 0) + 1;
+      await this.persistScenarioState(record);
       const reference = getReferenceBoard(record.boardId);
       const spec = reference?.nominalSpecs.find((s) => s.node === resolved);
       const abnormal = spec !== undefined
@@ -1377,6 +1773,8 @@ export class TraceForgeMaasService {
     this.checkProbeBudget(session, scenarioId, correlationId, capability);
     try {
       const reading = session.measureCurrent(componentId);
+      record.version = (record.version ?? 0) + 1;
+      await this.persistScenarioState(record);
       const payload = {
         scenarioId,
         componentId,
@@ -1420,6 +1818,8 @@ export class TraceForgeMaasService {
     }
     try {
       const reading = session.measureContinuity(probeA, probeB);
+      record.version = (record.version ?? 0) + 1;
+      await this.persistScenarioState(record);
       const payload = {
         scenarioId,
         probeA,
@@ -1520,38 +1920,20 @@ export class TraceForgeMaasService {
     } else {
       run = await runAgenticDiagnosis(record.session, this.simClient);
     }
-    const probeLog = record.session.getProbeLog();
-    const abnormalVoltages = probeLog.filter((p) => p.kind === 'voltage' && p.abnormal).map((p) => p.target);
-    const shortedContinuities = probeLog.filter((p) => p.kind === 'resistance' && p.abnormal).map((p) => p.target);
     const executionSource = run.operationalMode === 'LIVE_API' ? 'Live Muse Spark 1.3' : 'Deterministic Virtual Lab';
-    const investigationId = await this.nextSignedInvestigationId(record.scenarioId, context.actorId, {
+    // Deterministic per-scenario identity: the canonical `inv_...` token
+    // (fixed sequence, deterministic IV) is stable for this
+    // `(scenarioId, ownerActorId)` across every isolate, and the completed
+    // record is awaited to Edge Cache so cold isolates hydrate the EXACT
+    // record (LIVE_API included) with no new API call.
+    const investigationId = await this.mintCanonicalInvestigationId(record.scenarioId, context.actorId, {
       m: run.operationalMode,
       t: run.turns,
       d: run.proposedDiagnosis,
       src: run.diagnosisSource,
       u: run.telemetry,
     });
-    const stored: InvestigationRecord = {
-      investigationId,
-      scenarioId: record.scenarioId,
-      boardId: record.boardId,
-      ownerActorId: context.actorId,
-      operationalMode: run.operationalMode,
-      turns: run.turns,
-      steps: run.steps,
-      probeEvents: [...probeLog],
-      proposedDiagnosis: run.proposedDiagnosis,
-      classifiedEvidence: { abnormalVoltages, shortedContinuities, probeCount: probeLog.length },
-      telemetry: run.telemetry,
-      diagnosisSource: run.diagnosisSource,
-      createdAt: new Date().toISOString(),
-    };
-    this.investigations.set(investigationId, stored);
-    // Best-effort edge persistence so a cold isolate in the same colocation
-    // hydrates this exact completed record (LIVE_API included) with no new
-    // API call, even for scenarioId-only lookups.
-    edgeCachePut(edgeInvestigationKey(investigationId), stored);
-    edgeCachePut(edgeScenarioKey(record.scenarioId), { investigation: stored });
+    await this.storeInvestigationRun(investigationId, record, context.actorId, run);
     // The response carries counts and telemetry only — never the withheld fault.
     const payload = {
       investigationId,
@@ -1624,35 +2006,19 @@ export class TraceForgeMaasService {
     const capability = 'traceforge.evaluation.score';
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
+    // Immutable evaluation: `requireOwnedScenario` already merged the
+    // canonical Edge Cache state, so an evaluation completed on ANY isolate
+    // is returned verbatim here — never re-scored with a different probe
+    // count.
     if (record.evaluated && record.scorecard) return record.scorecard;
-    // Same-colo edge fast path: a cold isolate restores the exact cached
-    // LIVE_API investigation + scorecard when the caller passes only a
-    // scenarioId — no second live API call, no re-probing.
-    if (record.hydratedFromToken) {
-      const cached = await edgeCacheGet<unknown>(edgeScenarioKey(scenarioId));
-      if (isEdgeCachedScenario(cached)) {
-        if (isInvestigationRecord(cached.investigation) && cached.investigation.ownerActorId === context.actorId && cached.investigation.scenarioId === scenarioId) {
-          this.investigations.set(cached.investigation.investigationId, cached.investigation);
-        }
-        if (cached.evaluated === true && cached.scorecard !== undefined) {
-          record.evaluated = true;
-          if (typeof cached.evaluatedAt === 'string') record.evaluatedAt = cached.evaluatedAt;
-          record.scorecard = cached.scorecard as Record<string, unknown>;
-          return record.scorecard;
-        }
-      }
-    }
     // Cold-isolate path: a scenario hydrated from a foreign `scn_...` token
-    // arrives with zero local probes, so run the deterministic diagnosis here
-    // (and persist it as the latest investigation) before scoring. Scenarios
-    // created in THIS isolate without probes still throw
+    // arrives with zero local probes (and no canonical investigation yet),
+    // so run the deterministic canonical diagnosis here — every cold isolate
+    // converges on the same probes and the same `investigationId` — before
+    // scoring. Scenarios created in THIS isolate without probes still throw
     // `MAAS_INVESTIGATION_INCOMPLETE` below.
     if (record.hydratedFromToken && record.session.getProbeLog().length === 0) {
-      await this.diagnoseAndStoreInvestigation(
-        await this.nextSignedInvestigationId(record.scenarioId, context.actorId),
-        record,
-        context.actorId,
-      );
+      await this.diagnoseAndStoreCanonicalInvestigation(record, context.actorId);
     }
     const groundTruth: HiddenFault | null = record.session.getGroundTruth();
     const probeLog = record.session.getProbeLog();
@@ -1685,7 +2051,10 @@ export class TraceForgeMaasService {
         ...payload,
         verificationReceipt: this.issueReceipt(capability, scenarioId, ['nominal session evaluated: no fault present', 'scenario locked against further probing'], `Scenario ${scenarioId} evaluated: healthy board.`, correlationId),
       };
-      edgeCachePut(edgeScenarioKey(scenarioId), { evaluated: true, evaluatedAt: record.evaluatedAt, scorecard: record.scorecard });
+      // Lock + publish the immutable scorecard before responding.
+      record.version = (record.version ?? 0) + 1;
+      await this.persistScenarioState(record);
+      await this.updateActorScenarioIndex(record);
       return record.scorecard;
     }
     const score = scoreDiagnosis({ componentRef, faultType, verificationStatus }, groundTruth, probeLog);
@@ -1711,12 +2080,11 @@ export class TraceForgeMaasService {
       },
       verificationReceipt: this.issueReceipt(capability, scenarioId, ['diagnosis scored against withheld HiddenFault', 'ground truth disclosed to owning actor only', 'scenario locked against further probing'], `Scenario ${scenarioId} scored ${score.totalScore}/100.`, correlationId),
     };
-    edgeCachePut(edgeScenarioKey(scenarioId), {
-      investigation: latestInvestigation,
-      evaluated: true,
-      evaluatedAt: record.evaluatedAt,
-      scorecard: record.scorecard,
-    });
+    // Lock + publish the immutable scorecard before responding: `evaluation
+    // .report` on ANY isolate returns this exact scorecard verbatim.
+    record.version = (record.version ?? 0) + 1;
+    await this.persistScenarioState(record);
+    await this.updateActorScenarioIndex(record);
     return record.scorecard;
   }
 
@@ -1725,9 +2093,12 @@ export class TraceForgeMaasService {
     const correlationId = createMaasCorrelationId();
     const scenarioId = requireString(args, 'scenarioId', correlationId, capability);
     const record = await this.requireOwnedScenario(scenarioId, context, correlationId, capability);
-    // Cold-isolate path: score on this isolate first when the hydrated
-    // scenario has never been evaluated here. Local scenarios still throw
-    // `MAAS_INVESTIGATION_INCOMPLETE` when unevaluated.
+    // Cold-isolate path: score on this isolate first when the scenario was
+    // never evaluated anywhere. When another isolate already evaluated it,
+    // `requireOwnedScenario` merged the immutable scorecard above, so the
+    // report below returns it verbatim — never re-running `scoreDiagnosis`
+    // with a different probe count. Local unevaluated scenarios still throw
+    // `MAAS_INVESTIGATION_INCOMPLETE`.
     if (record.hydratedFromToken && !record.evaluated) {
       await this.evaluationScore({ scenarioId }, context, correlationId);
     }
@@ -1735,7 +2106,8 @@ export class TraceForgeMaasService {
       throw new MaasToolError('MAAS_INVESTIGATION_INCOMPLETE', `Scenario '${scenarioId}' has not been evaluated yet; run traceforge.evaluation.score first.`, correlationId, capability);
     }
     const scorecard = record.scorecard as { score: { evidenceConfirmed: boolean; totalScore: number } | null; groundTruth: Record<string, unknown> };
-    const latestInvestigation = [...this.investigations.values()].filter((r) => r.scenarioId === scenarioId).pop();
+    const latestInvestigation = record.latestInvestigation
+      ?? [...this.investigations.values()].filter((r) => r.scenarioId === scenarioId).pop();
     const reference = getReferenceBoard(record.boardId);
     const confirmed = (scorecard.score?.evidenceConfirmed ?? false) && latestInvestigation?.proposedDiagnosis.verificationStatus === 'confirmed';
     return {

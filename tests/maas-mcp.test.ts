@@ -1301,3 +1301,321 @@ describe('21. all-3-board fault matrix end to end', () => {
     });
   }
 });
+
+/* --------------------------------------------------------------- area 22 -- */
+
+describe('22. cross-isolate MCP session consistency', () => {
+  /**
+   * Shared mock `caches.default`: every `TraceForgeMaasService` instance is
+   * an independent Worker isolate (own in-memory Maps); the mock Edge Cache
+   * plus the shared session secret is the ONLY shared state — exactly the
+   * production cross-isolate model.
+   */
+  const SHARED_ISOLATE_SECRET = 'tf-test-shared-isolate-secret-v1';
+
+  function installSharedEdgeCache(): { store: Map<string, string>; uninstall: () => void } {
+    const store = new Map<string, string>();
+    const holder = globalThis as unknown as { caches?: unknown };
+    const previous = holder.caches;
+    holder.caches = {
+      default: {
+        async match(key: string): Promise<{ json(): Promise<unknown> } | undefined> {
+          const raw = store.get(key);
+          if (raw === undefined) return undefined;
+          return { async json() { return JSON.parse(raw) as unknown; } };
+        },
+        async put(key: string, response: Response): Promise<void> {
+          store.set(key, await response.text());
+        },
+      },
+    };
+    return {
+      store,
+      uninstall: () => {
+        holder.caches = previous;
+      },
+    };
+  }
+
+  function freshIsolate(): TraceForgeMaasService {
+    const service = new TraceForgeMaasService();
+    service.configureSessionSecret(SHARED_ISOLATE_SECRET);
+    return service;
+  }
+
+  it('Defects A & B: probes accumulate across isolates with monotonic probesUsed and ordered history', async () => {
+    const { uninstall } = installSharedEdgeCache();
+    try {
+      const isoA = freshIsolate();
+      const isoB = freshIsolate();
+      const isoC = freshIsolate();
+      const created = (await isoA.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'usbc-pd-trigger', faultSelector: 'scenario-0' },
+        AGENT,
+      )) as { scenarioId: string };
+      const { scenarioId } = created;
+
+      const voltage = (await isoA.executeTool(
+        'traceforge.measurements.voltage',
+        { scenarioId, node: 'TP_CC1' },
+        AGENT,
+      )) as { probesUsed: number };
+      expect(voltage.probesUsed).toBe(1);
+
+      // Fresh isolate B must observe 1 committed probe and count 2, not 1.
+      const current = (await isoB.executeTool(
+        'traceforge.measurements.current',
+        { scenarioId, componentId: 'R_PU1' },
+        AGENT,
+      )) as { probesUsed: number };
+      expect(current.probesUsed).toBe(2);
+
+      const continuity = (await isoC.executeTool(
+        'traceforge.measurements.continuity',
+        { scenarioId, probeA: 'TP_CC1', probeB: 'GND' },
+        AGENT,
+      )) as { probesUsed: number };
+      expect(continuity.probesUsed).toBe(3);
+
+      // The ORIGINAL isolate A refreshes stale in-memory state from Edge Cache.
+      const history = (await isoA.executeTool(
+        'traceforge.measurements.history',
+        { scenarioId },
+        AGENT,
+      )) as { probesUsed: number; probeLog: Array<{ kind: string; target: string }> };
+      expect(history.probesUsed).toBe(3);
+      expect(history.probeLog.map((p) => p.kind)).toEqual(['voltage', 'current', 'resistance']);
+      expect(history.probeLog.map((p) => p.target)).toEqual(['TP_CC1', 'R_PU1', 'TP_CC1↔GND']);
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('failed probes never consume budget and never persist state', async () => {
+    const { uninstall } = installSharedEdgeCache();
+    try {
+      const isoA = freshIsolate();
+      const isoB = freshIsolate();
+      const created = (await isoA.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'usbc-pd-trigger', faultSelector: 'scenario-0' },
+        AGENT,
+      )) as { scenarioId: string };
+      const { scenarioId } = created;
+      await isoA.executeTool('traceforge.measurements.voltage', { scenarioId, node: 'TP_CC1' }, AGENT);
+
+      await expectToolError(
+        isoB.executeTool('traceforge.measurements.voltage', { scenarioId, node: 'NON_EXISTENT_NODE' }, AGENT),
+        'MAAS_RESOURCE_NOT_FOUND',
+      );
+      await expectToolError(
+        isoB.executeTool('traceforge.measurements.continuity', { scenarioId, probeA: 'TP_CC1', probeB: 'TP_CC1' }, AGENT),
+        'MAAS_INVALID_REQUEST',
+      );
+
+      const history = (await isoA.executeTool(
+        'traceforge.measurements.history',
+        { scenarioId },
+        AGENT,
+      )) as { probesUsed: number; probeLog: unknown[] };
+      expect(history.probesUsed).toBe(1);
+      expect(history.probeLog).toHaveLength(1);
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('Defect C: one stable investigationId across isolates for start/status/history/result', async () => {
+    const { uninstall } = installSharedEdgeCache();
+    try {
+      const isoA = freshIsolate();
+      const isoB = freshIsolate();
+      const isoC = freshIsolate();
+      const isoD = freshIsolate();
+      const created = (await isoA.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'usbc-pd-trigger', faultSelector: 'scenario-0' },
+        AGENT,
+      )) as { scenarioId: string };
+      const { scenarioId } = created;
+
+      const started = (await isoA.executeTool(
+        'traceforge.investigations.start',
+        { scenarioId },
+        AGENT,
+      )) as { investigationId: string; probesUsed: number; turns: number };
+      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+
+      const status = (await isoB.executeTool(
+        'traceforge.investigations.status',
+        { scenarioId },
+        AGENT,
+      )) as { investigationId: string; turns: number; probesUsed: number };
+      const history = (await isoC.executeTool(
+        'traceforge.investigations.history',
+        { scenarioId },
+        AGENT,
+      )) as { investigationId: string; probeLog: unknown[] };
+      const result = (await isoD.executeTool(
+        'traceforge.investigations.result',
+        { scenarioId },
+        AGENT,
+      )) as { investigationId: string; proposedDiagnosis: { componentRef: string; faultType: string } };
+
+      expect(status.investigationId).toBe(started.investigationId);
+      expect(history.investigationId).toBe(started.investigationId);
+      expect(result.investigationId).toBe(started.investigationId);
+      expect(status.turns).toBe(started.turns);
+      expect(status.probesUsed).toBe(started.probesUsed);
+      expect(result.proposedDiagnosis.componentRef.length).toBeGreaterThan(0);
+      expect(leakedKeys(result)).toEqual([]);
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('Defect C (cold edge): two cold isolates converge on one deterministic investigationId', async () => {
+    // Create with NO shared cache, then install an EMPTY one: both cold
+    // isolates reconstruct purely from the signed `scn_...` token.
+    const solo = freshIsolate();
+    const created = (await solo.executeTool(
+      'traceforge.scenarios.create',
+      { boardId: 'usbc-pd-trigger', faultSelector: 'scenario-0' },
+      AGENT,
+    )) as { scenarioId: string };
+    const { scenarioId } = created;
+
+    const { store, uninstall } = installSharedEdgeCache();
+    try {
+      const coldB = freshIsolate();
+      const status = (await coldB.executeTool(
+        'traceforge.investigations.status',
+        { scenarioId },
+        AGENT,
+      )) as { investigationId: string };
+      expect(status.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+
+      // Wipe everything B persisted: C must converge independently.
+      store.clear();
+      const coldC = freshIsolate();
+      const result = (await coldC.executeTool(
+        'traceforge.investigations.result',
+        { scenarioId },
+        AGENT,
+      )) as { investigationId: string; proposedDiagnosis: { componentRef: string } };
+      expect(result.investigationId).toBe(status.investigationId);
+      expect(result.proposedDiagnosis.componentRef.length).toBeGreaterThan(0);
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('Defect D: evaluation.score and evaluation.report agree on one immutable scorecard', async () => {
+    const { uninstall } = installSharedEdgeCache();
+    try {
+      const isoA = freshIsolate();
+      const isoB = freshIsolate();
+      const isoC = freshIsolate();
+      const isoD = freshIsolate();
+      const created = (await isoA.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'usbc-pd-trigger', faultSelector: 'scenario-0' },
+        AGENT,
+      )) as { scenarioId: string };
+      const { scenarioId } = created;
+
+      const manual = (await isoA.executeTool(
+        'traceforge.measurements.voltage',
+        { scenarioId, node: 'TP_CC1' },
+        AGENT,
+      )) as { probesUsed: number };
+      expect(manual.probesUsed).toBe(1);
+      const started = (await isoA.executeTool(
+        'traceforge.investigations.start',
+        { scenarioId },
+        AGENT,
+      )) as { probesUsed: number };
+
+      const scored = (await isoB.executeTool(
+        'traceforge.evaluation.score',
+        { scenarioId },
+        AGENT,
+      )) as {
+        score: { totalScore: number; probeCount: number; efficiencyScore: number; summary: string };
+        groundTruth: { faultId: string };
+      };
+      expect(scored.score.probeCount).toBe(started.probesUsed);
+      expect(scored.score.probeCount).toBeGreaterThan(1);
+
+      // Report on a DIFFERENT isolate returns the exact same scorecard.
+      const report = (await isoC.executeTool(
+        'traceforge.evaluation.report',
+        { scenarioId },
+        AGENT,
+      )) as {
+        scorecard: { score: { totalScore: number; probeCount: number; efficiencyScore: number; summary: string } };
+        measurementHistory: { probeLog: unknown[] };
+      };
+      expect(report.scorecard).toEqual({
+        scenarioId,
+        score: scored.score,
+        groundTruth: scored.groundTruth,
+        verificationReceipt: expect.anything(),
+      });
+      expect(report.scorecard.score.totalScore).toBe(scored.score.totalScore);
+      expect(report.measurementHistory.probeLog).toHaveLength(scored.score.probeCount);
+
+      // Re-scoring anywhere returns the identical immutable scorecard.
+      const rescored = (await isoD.executeTool(
+        'traceforge.evaluation.score',
+        { scenarioId },
+        AGENT,
+      )) as { score: { totalScore: number } };
+      expect(rescored.score.totalScore).toBe(scored.score.totalScore);
+      const rereported = (await isoD.executeTool(
+        'traceforge.evaluation.report',
+        { scenarioId },
+        AGENT,
+      )) as { scorecard: { score: { totalScore: number } } };
+      expect(rereported.scorecard.score.totalScore).toBe(scored.score.totalScore);
+
+      // The locked scenario rejects further probing on every isolate.
+      await expectToolError(
+        isoD.executeTool('traceforge.measurements.voltage', { scenarioId, node: 'TP_CC2' }, AGENT),
+        'MAAS_SESSION_ALREADY_EVALUATED',
+      );
+      await expectToolError(
+        isoA.executeTool('traceforge.measurements.current', { scenarioId, componentId: 'R_PU1' }, AGENT),
+        'MAAS_SESSION_ALREADY_EVALUATED',
+      );
+    } finally {
+      uninstall();
+    }
+  });
+
+  it('scenarios.list is consistent across isolates while isolating actors', async () => {
+    const { uninstall } = installSharedEdgeCache();
+    try {
+      const isoA = freshIsolate();
+      const isoB = freshIsolate();
+      const created = (await isoA.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'f405-flight-controller', faultSelector: 'nominal' },
+        AGENT,
+      )) as { scenarioId: string };
+
+      const listed = (await isoB.executeTool('traceforge.scenarios.list', {}, AGENT)) as {
+        mySessions: Array<{ scenarioId: string; evaluated: boolean }>;
+      };
+      expect(listed.mySessions.map((s) => s.scenarioId)).toContain(created.scenarioId);
+
+      const foreign = (await isoB.executeTool('traceforge.scenarios.list', {}, SECONDARY)) as {
+        mySessions: Array<{ scenarioId: string }>;
+      };
+      expect(foreign.mySessions.map((s) => s.scenarioId)).not.toContain(created.scenarioId);
+    } finally {
+      uninstall();
+    }
+  });
+});

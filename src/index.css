@@ -22,11 +22,13 @@ body {
   color: var(--ink);
   font-family: var(--sans);
   font-size: 14px;
+  overflow-x: hidden;
+  max-width: 100%;
 }
 
 #root { min-height: 100vh; }
 
-.tf-app { display: flex; flex-direction: column; min-height: 100vh; }
+.tf-app { display: flex; flex-direction: column; min-height: 100vh; overflow-x: hidden; max-width: 100%; }
 
 .tf-header {
   display: flex;
@@ -294,16 +296,22 @@ button:disabled { opacity: 0.45; cursor: default; }
 .tf-board-cards {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  align-items: stretch;
   gap: 8px;
   margin-bottom: 8px;
 }
 .tf-board-card {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  justify-content: space-between;
+  height: 100%;
+  min-height: 118px;
+  padding: 12px;
+  gap: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
   align-items: flex-start;
   text-align: left;
-  padding: 8px 10px;
   background: var(--panel-2);
   white-space: normal;
   min-width: 0;
@@ -316,10 +324,28 @@ button:disabled { opacity: 0.45; cursor: default; }
   overflow-wrap: anywhere;
   line-height: 1.3;
   text-align: left;
+  margin-top: auto;
+  align-self: flex-start;
 }
-.tf-board-card strong { font-family: var(--mono); font-size: 12px; }
-.tf-board-symptom { font-family: var(--sans); font-size: 12px; color: var(--ink-dim); }
-.tf-board-card.selected { border-color: var(--accent); }
+.tf-board-card strong { font-family: var(--mono); font-size: 12px; min-height: 32px; display: block; line-height: 1.3; }
+.tf-board-symptom { flex: 1; font-family: var(--sans); font-size: 12px; line-height: 1.4; color: var(--ink-dim); }
+.tf-board-card.selected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: rgba(255, 106, 26, 0.06);
+}
+
+/* Step 1: compact fault-scenario control bar (label + dropdown + button inline) */
+.tf-fault-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+.tf-fault-label { font-family: var(--mono); font-size: 12px; display: inline-flex; align-items: center; gap: 6px; flex: 1 1 auto; flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.tf-fault-row select { width: auto; min-width: 0; max-width: 100%; flex: 1; }
+
+/* Step 2: investigation toolbar (header + actions + pacing stay aligned) */
+.tf-investigate-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tf-investigate-head h3 { margin-bottom: 0; }
+.tf-investigate-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tf-investigate-actions button { min-height: 34px; }
+.tf-demo-pacing { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-dim); cursor: pointer; margin-top: 8px; font-family: var(--mono); }
 
 .tf-checklist { margin: 10px 0 0; padding-left: 22px; color: var(--ink-dim); font-size: 13px; }
 .tf-checklist li { margin-bottom: 6px; }
@@ -409,4 +435,6 @@ button:disabled { opacity: 0.45; cursor: default; }
   .tf-chip { white-space: normal; }
   .tf-board-cards { grid-template-columns: minmax(0, 1fr); }
   .tf-canvas-wrap { height: 280px; min-height: 0; max-height: none; }
+  .tf-header { padding: 8px 12px; }
+  .tf-fault-row select { width: 100%; flex-basis: 100%; }
 }
