@@ -301,25 +301,30 @@ let scenarioSeq = 0;
  * isolates with disjoint in-memory Maps. To survive that, `scenarioId`
  * (`scn_...`) and `investigationId` (`inv_...`) are SELF-CONTAINED: the
  * payload (board/fault indexes, owner, expiry, sequence) is encrypted with
- * AES-256-GCM (random 96-bit IV per token, Additional Data bound to the
- * token prefix) and hex-encoded — so it carries ZERO readable board/fault
- * strings and always passes `assertGroundTruthIsolated` — and authenticated
- * with BOTH the 128-bit GCM tag and an HMAC-SHA-256 tag, so ANY isolate
- * holding the same session secret can verify and rehydrate the record
- * without shared state. Tenant isolation, session expiry, and ground-truth
+ * AES-256-GCM (fresh random 96-bit IV per token via
+ * `crypto.getRandomValues`, Additional Data bound to the token prefix,
+ * explicit 128-bit GCM tag) and hex-encoded — so it carries ZERO readable
+ * board/fault strings and always passes `assertGroundTruthIsolated` — and
+ * authenticated with BOTH the 128-bit GCM tag and the full 256-bit
+ * HMAC-SHA-256 Encrypt-then-MAC tag (`_${tag64}`), verified in constant
+ * time BEFORE decryption, so ANY isolate holding the same session secret
+ * can verify and rehydrate the record without shared state. AES and HMAC
+ * keys are derived via standard Web Crypto HKDF-SHA-256 with distinct
+ * domain info labels. Tenant isolation, session expiry, and ground-truth
  * isolation are enforced on every hydrate exactly as on the originating
- * isolate. There is no XOR masking and no FNV-1a anywhere in this module.
+ * isolate. There is no XOR masking, no FNV-1a, and no deterministic IV
+ * anywhere in this module.
  * ------------------------------------------------------------------------- */
 
 const SCN_TOKEN_PREFIX = 'scn_';
 const INV_TOKEN_PREFIX = 'inv_';
 
 /** HMAC tag domain separating scenario/investigation signatures. */
-const TOKEN_TAG_DOMAIN = 'traceforge-maas-id-v2';
-/** AES-GCM key-derivation domain. */
-const TOKEN_AEAD_DOMAIN = 'traceforge-aead-v2::';
-/** HMAC key domain. */
-const TOKEN_HMAC_DOMAIN = 'traceforge-maas-hmac-v2::';
+const TOKEN_TAG_DOMAIN = 'traceforge-maas-id-v3';
+/** HKDF info label for the 256-bit AES-GCM key (distinct from HMAC). */
+const TOKEN_AEAD_INFO = 'traceforge-aead-hkdf-v3';
+/** HKDF info label for the 256-bit HMAC-SHA-256 key (distinct from AEAD). */
+const TOKEN_HMAC_INFO = 'traceforge-hmac-hkdf-v3';
 /** Default session secret (overridden via options or live-key derivation). */
 export const DEFAULT_SESSION_SECRET = 'tf-default-session-secret-v2';
 
@@ -336,21 +341,38 @@ function hexToBytes(hex: string): Uint8Array | null {
   return out;
 }
 
-/** Derive the 256-bit AES-GCM CryptoKey for one session secret. */
-async function aeadKeyForSecret(secret: string): Promise<CryptoKey> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${TOKEN_AEAD_DOMAIN}${secret}`));
-  return crypto.subtle.importKey('raw', digest, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
+/** Import one session secret as an HKDF-SHA-256 base key. */
+async function hkdfBaseKeyForSecret(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(secret), 'HKDF', false, ['deriveKey']);
 }
 
-/** HMAC-SHA-256 over text under a domain-separated session-secret key. */
-async function hmacSignHex(secret: string, text: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(`${TOKEN_HMAC_DOMAIN}${secret}`),
-    { name: 'HMAC', hash: 'SHA-256' },
+/** Derive the 256-bit AES-GCM CryptoKey for one session secret via HKDF-SHA-256. */
+async function aeadKeyForSecret(secret: string): Promise<CryptoKey> {
+  const base = await hkdfBaseKeyForSecret(secret);
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode(TOKEN_AEAD_INFO) },
+    base,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt'],
+  );
+}
+
+/** Derive the 256-bit HMAC-SHA-256 CryptoKey for one session secret via HKDF-SHA-256. */
+async function hmacKeyForSecret(secret: string): Promise<CryptoKey> {
+  const base = await hkdfBaseKeyForSecret(secret);
+  return crypto.subtle.deriveKey(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: new TextEncoder().encode(TOKEN_HMAC_INFO) },
+    base,
+    { name: 'HMAC', hash: 'SHA-256', length: 256 },
     false,
     ['sign'],
   );
+}
+
+/** HMAC-SHA-256 over text under a domain-separated session-secret key (full 64 hex chars). */
+async function hmacSignHex(secret: string, text: string): Promise<string> {
+  const key = await hmacKeyForSecret(secret);
   const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(text));
   return bytesToHex(new Uint8Array(sig));
 }
@@ -364,44 +386,38 @@ function constantTimeHexEqual(a: string, b: string): boolean {
 }
 
 /**
- * Authenticated-encrypt a token payload: AES-256-GCM (random 96-bit IV,
- * prefix bound as Additional Data, 128-bit GCM tag) plus an 8-hex-char
- * HMAC-SHA-256 tag so the format stays `${prefix}${hex}_${tag8}` matching
- * `/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/`.
+ * Authenticated-encrypt a token payload: AES-256-GCM (fresh random 96-bit
+ * IV per call, prefix bound as Additional Data, explicit 128-bit GCM tag)
+ * plus the full 64-hex-char HMAC-SHA-256 Encrypt-then-MAC tag, so the
+ * format is `${prefix}${hex}_${tag64}` matching
+ * `/^(scn|inv)_[0-9a-f]+_[0-9a-f]{64}$/`. Identical payloads encrypt to
+ * distinct ciphertexts (IND-CPA semantic security, zero nonce reuse).
  */
-export async function encryptSignedToken(prefix: string, payload: Record<string, unknown>, secret: string, ivOverride?: Uint8Array): Promise<string> {
+export async function encryptSignedToken(prefix: string, payload: Record<string, unknown>, secret: string): Promise<string> {
   const aesKey = await aeadKeyForSecret(secret);
-  const plaintextText = JSON.stringify(payload);
-  const plaintext = new TextEncoder().encode(plaintextText);
-  let iv: Uint8Array;
-  if (ivOverride && ivOverride.length === 12) {
-    // SIV safeguard: bind any caller-supplied deterministic IV seed to the
-    // exact plaintext bytes so two distinct plaintexts can NEVER share an
-    // AES-GCM nonce under the same key.
-    const sivDigest = await crypto.subtle.digest(
-      'SHA-256',
-      new TextEncoder().encode(`traceforge-aead-siv-v3::${secret}::${prefix}::${bytesToHex(ivOverride)}::${plaintextText}`),
-    );
-    iv = new Uint8Array(sivDigest).slice(0, 12);
-  } else {
-    iv = crypto.getRandomValues(new Uint8Array(12));
-  }
+  const plaintext = new TextEncoder().encode(JSON.stringify(payload));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
   const sealed = new Uint8Array(
-    await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix) }, aesKey, plaintext as unknown as BufferSource),
+    await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix), tagLength: 128 },
+      aesKey,
+      plaintext as unknown as BufferSource,
+    ),
   );
   const combined = new Uint8Array(iv.length + sealed.length);
   combined.set(iv, 0);
   combined.set(sealed, iv.length);
   const hex = bytesToHex(combined);
-  const tag8 = (await hmacSignHex(secret, `${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`)).slice(0, 8);
-  return `${prefix}${hex}_${tag8}`;
+  const tag64 = await hmacSignHex(secret, `${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`);
+  return `${prefix}${hex}_${tag64}`;
 }
 
 /**
- * Verify and decrypt a token: validates prefix, `_${tag8}` suffix, and hex
- * shape, checks the HMAC-SHA-256 tag in constant time, then AES-256-GCM
- * decrypts (128-bit GCM tag verification included). Returns `null` on any
- * failure — wrong key, bit flip, truncation, or malformed JSON.
+ * Verify and decrypt a token: validates prefix, `_${tag64}` suffix, and hex
+ * shape, checks the full 256-bit HMAC-SHA-256 tag in constant time BEFORE
+ * decryption, then AES-256-GCM decrypts (explicit 128-bit GCM tag
+ * verification included). Returns `null` on any failure — wrong key, bit
+ * flip, truncation, prefix swap, or malformed JSON.
  */
 export async function decryptSignedToken(prefix: string, token: string, secret: string): Promise<Record<string, unknown> | null> {
   if (typeof token !== 'string' || !token.startsWith(prefix)) return null;
@@ -411,8 +427,8 @@ export async function decryptSignedToken(prefix: string, token: string, secret: 
   const hex = rest.slice(0, sep);
   const tag = rest.slice(sep + 1);
   if (hex.length < 56 || hex.length > 8192 || hex.length % 2 !== 0) return null;
-  if (!/^[0-9a-f]+$/.test(hex) || !/^[0-9a-f]{8}$/.test(tag)) return null;
-  const expected = (await hmacSignHex(secret, `${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`)).slice(0, 8);
+  if (!/^[0-9a-f]+$/.test(hex) || !/^[0-9a-f]{64}$/.test(tag)) return null;
+  const expected = await hmacSignHex(secret, `${prefix}|${hex}|${TOKEN_TAG_DOMAIN}`);
   if (!constantTimeHexEqual(expected, tag)) return null;
   const combined = hexToBytes(hex);
   if (!combined || combined.length < 12 + 16) return null;
@@ -421,7 +437,7 @@ export async function decryptSignedToken(prefix: string, token: string, secret: 
   try {
     const aesKey = await aeadKeyForSecret(secret);
     const plain = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix) },
+      { name: 'AES-GCM', iv: iv as unknown as BufferSource, additionalData: new TextEncoder().encode(prefix), tagLength: 128 },
       aesKey,
       sealed as unknown as BufferSource,
     );
@@ -459,34 +475,8 @@ export interface InvestigationTokenExtras {
   u?: UsageTelemetry;
 }
 
-async function encodeInvestigationToken(payload: { s: string; o: string; q: number } & InvestigationTokenExtras, secret: string, ivOverride?: Uint8Array): Promise<string> {
-  return encryptSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>, secret, ivOverride);
-}
-
-/**
- * Deterministic 96-bit IV for the canonical investigation token of one
- * `(scenarioId, ownerActorId)` pair: the first 12 bytes of
- * `SHA-256("traceforge-inv-iv-v2::" + secret + "::" + scenarioId + "::" +
- * ownerActorId)`. Combined with the fixed sequence `q: 1`, every isolate
- * holding the session secret mints the byte-identical `inv_...` token for
- * the same deterministic diagnosis — so `investigations.status`, `.history`,
- * `.result`, `evaluation.score`, and `evaluation.report` always agree on one
- * stable `investigationId` per scenario, even on a cold isolate with no
- * Edge Cache entry. `encodeScenarioToken` / `encryptSignedToken` keep using
- * random 96-bit IVs by default.
- */
-export async function deterministicIvForInvestigation(
-  scenarioId: string,
-  ownerActorId: string,
-  secret: string,
-  payload?: Record<string, unknown>,
-): Promise<Uint8Array> {
-  const canonicalPayload = payload ? JSON.stringify(payload) : '';
-  const digest = await crypto.subtle.digest(
-    'SHA-256',
-    new TextEncoder().encode(`traceforge-inv-iv-v2::${secret}::${scenarioId}::${ownerActorId}::${canonicalPayload}`),
-  );
-  return new Uint8Array(digest).slice(0, 12);
+async function encodeInvestigationToken(payload: { s: string; o: string; q: number } & InvestigationTokenExtras, secret: string): Promise<string> {
+  return encryptSignedToken(INV_TOKEN_PREFIX, payload as unknown as Record<string, unknown>, secret);
 }
 
 async function decodeInvestigationToken(token: string, secret: string): Promise<({ s: string; o: string; q: number } & InvestigationTokenExtras) | null> {
@@ -504,6 +494,37 @@ async function decodeInvestigationToken(token: string, secret: string): Promise<
   if (typeof src === 'string' && src.length > 0) extras.src = src;
   if (u !== null && typeof u === 'object' && !Array.isArray(u)) extras.u = u as UsageTelemetry;
   return { s, o, q, ...extras };
+}
+
+/* ---------------------------------------------------------------------------
+ * TraceForge Assistant live-chat budget allocation & abuse protections
+ *
+ * RAG-first routing answers from the versioned static knowledge base at
+ * $0.00. Paid `muse-spark-1.3` inference for assistant chat is gated behind
+ * ALL of: an explicit per-request opt-in, a valid session ticket or scoped
+ * Bearer token, a configured server key, and an atomic reservation against
+ * the shared ledger below. Usage is tracked in the shared runtime ledger
+ * (persisted via `persistEdgeRuntimeSnapshot` so every isolate enforces
+ * the same allowance) and surfaced in `traceforge.budget.status`.
+ * ------------------------------------------------------------------------- */
+
+/** Maximum cumulative paid assistant-chat spend (USD) across the runtime ledger. */
+export const ASSISTANT_LIVE_ALLOWANCE_USD = 2.0;
+/** Maximum paid assistant-chat calls per chat session id. */
+export const MAX_ASSISTANT_LIVE_CALLS_PER_SESSION = 10;
+/** Maximum concurrent in-flight paid assistant-chat calls per isolate. */
+export const MAX_CONCURRENT_ASSISTANT_LIVE_CALLS = 2;
+/** Maximum assistant user-message length (characters). */
+export const ASSISTANT_MAX_INPUT_CHARS = 1000;
+/** Maximum conversation history messages accepted per chat request. */
+export const ASSISTANT_MAX_HISTORY_MESSAGES = 8;
+/** Maximum paid assistant-chat completion tokens per model call. */
+export const ASSISTANT_MAX_OUTPUT_TOKENS = 350;
+
+/** Outcome of an assistant live-call reservation attempt (fail-closed). */
+export interface AssistantLiveReservation {
+  ok: boolean;
+  reason?: string;
 }
 
 /* ---------------------------------------------------------------------------
@@ -696,6 +717,10 @@ interface EdgeRuntimeTelemetrySnapshot {
   outputTokens?: unknown;
   totalRequests?: unknown;
   liveVerified?: unknown;
+  assistantIncurredCostUsd?: unknown;
+  assistantLiveRequests?: unknown;
+  assistantInputTokens?: unknown;
+  assistantOutputTokens?: unknown;
 }
 
 function asNonNegativeNumber(value: unknown): number {
@@ -818,6 +843,18 @@ export class TraceForgeMaasService {
   /** Remote-colo spend/verified flag merged from the edge-cached runtime snapshot. */
   private edgeCachedLiveSpendUsd = 0;
   private edgeLiveVerified = false;
+  /** Assistant live-chat ledger (this isolate): paid muse-spark-1.3 chat calls only. */
+  private assistantLiveRequests = 0;
+  private assistantInputTokens = 0;
+  private assistantOutputTokens = 0;
+  private assistantIncurredCostUsd = 0;
+  /** In-flight paid assistant-chat calls (concurrency cap, this isolate only). */
+  private assistantActiveCalls = 0;
+  /** Paid assistant-chat calls consumed per chat session id (this isolate). */
+  private readonly assistantSessionCalls = new Map<string, number>();
+  /** Remote-colo assistant spend merged from the edge-cached runtime snapshot. */
+  private edgeCachedAssistantSpendUsd = 0;
+  private edgeCachedAssistantRequests = 0;
 
   constructor(options: MaasServiceOptions = {}) {
     for (const d of TRACEFORGE_MAAS_TOOL_DESCRIPTORS) this.descriptors.set(d.name, d);
@@ -938,6 +975,10 @@ export class TraceForgeMaasService {
     // double counting.
     const remote = asNonNegativeNumber(snapshot['incurredCostUsd']) - this.externalLiveSpendUsd;
     if (remote > this.edgeCachedLiveSpendUsd) this.edgeCachedLiveSpendUsd = remote;
+    const remoteAssistant = asNonNegativeNumber(snapshot['assistantIncurredCostUsd']) - this.assistantIncurredCostUsd;
+    if (remoteAssistant > this.edgeCachedAssistantSpendUsd) this.edgeCachedAssistantSpendUsd = remoteAssistant;
+    const remoteAssistantRequests = Math.floor(asNonNegativeNumber(snapshot['assistantLiveRequests'])) - this.assistantLiveRequests;
+    if (remoteAssistantRequests > this.edgeCachedAssistantRequests) this.edgeCachedAssistantRequests = remoteAssistantRequests;
   }
 
   /** Best-effort persist of the cumulative runtime snapshot (never throws). */
@@ -949,14 +990,24 @@ export class TraceForgeMaasService {
         previousSpend,
         this.externalLiveSpendUsd + this.edgeCachedLiveSpendUsd + (this.liveClient?.getTelemetry().incurredCostUsd ?? 0),
       );
+      const previousAssistant = previous && typeof previous === 'object' ? asNonNegativeNumber(previous['assistantIncurredCostUsd']) : 0;
+      const cumulativeAssistant = Math.max(previousAssistant, this.assistantIncurredCostUsd + this.edgeCachedAssistantSpendUsd);
+      const previousAssistantRequests = previous && typeof previous === 'object' ? Math.floor(asNonNegativeNumber(previous['assistantLiveRequests'])) : 0;
+      const cumulativeAssistantRequests = Math.max(previousAssistantRequests, this.assistantLiveRequests + this.edgeCachedAssistantRequests);
       await edgeCachePut(EDGE_CACHE_RUNTIME_TELEMETRY_KEY, {
         incurredCostUsd: cumulative,
         inputTokens: this.externalInputTokens + (this.liveClient?.getTelemetry().inputTokens ?? 0),
         outputTokens: this.externalOutputTokens + (this.liveClient?.getTelemetry().outputTokens ?? 0),
         totalRequests: this.externalTotalRequests + (this.liveClient?.getTelemetry().totalRequests ?? 0),
         liveVerified: true,
+        assistantIncurredCostUsd: cumulativeAssistant,
+        assistantLiveRequests: cumulativeAssistantRequests,
+        assistantInputTokens: this.assistantInputTokens,
+        assistantOutputTokens: this.assistantOutputTokens,
       });
       this.edgeCachedLiveSpendUsd = Math.max(0, cumulative - this.externalLiveSpendUsd);
+      this.edgeCachedAssistantSpendUsd = Math.max(0, cumulativeAssistant - this.assistantIncurredCostUsd);
+      this.edgeCachedAssistantRequests = Math.max(0, cumulativeAssistantRequests - this.assistantLiveRequests);
       this.edgeLiveVerified = true;
     } catch {
       // Best-effort only.
@@ -989,7 +1040,90 @@ export class TraceForgeMaasService {
   }
 
   private effectiveIncurredCostUsd(): number {
-    return this.combinedTelemetry().incurredCostUsd + this.injectedLiveSpendUsd + this.edgeCachedLiveSpendUsd;
+    return this.combinedTelemetry().incurredCostUsd + this.injectedLiveSpendUsd + this.edgeCachedLiveSpendUsd + this.effectiveAssistantSpendUsd();
+  }
+
+  /** Cumulative paid assistant-chat spend (this isolate + merged remote colo). */
+  effectiveAssistantSpendUsd(): number {
+    return this.assistantIncurredCostUsd + this.edgeCachedAssistantSpendUsd;
+  }
+
+  /** Cumulative paid assistant-chat call count (this isolate + merged remote colo). */
+  effectiveAssistantRequests(): number {
+    return this.assistantLiveRequests + this.edgeCachedAssistantRequests;
+  }
+
+  /** Shared-ledger snapshot of assistant live-chat usage (served in `traceforge.budget.status`). */
+  getAssistantLiveUsage(): {
+    liveRequests: number;
+    inputTokens: number;
+    outputTokens: number;
+    incurredCostUsd: number;
+    activeCalls: number;
+    allowanceUsd: number;
+    remainingAllowanceUsd: number;
+  } {
+    const incurred = this.effectiveAssistantSpendUsd();
+    return {
+      liveRequests: this.effectiveAssistantRequests(),
+      inputTokens: this.assistantInputTokens,
+      outputTokens: this.assistantOutputTokens,
+      incurredCostUsd: incurred,
+      activeCalls: this.assistantActiveCalls,
+      allowanceUsd: ASSISTANT_LIVE_ALLOWANCE_USD,
+      remainingAllowanceUsd: Math.max(0, ASSISTANT_LIVE_ALLOWANCE_USD - incurred),
+    };
+  }
+
+  /**
+   * Atomically reserve one paid assistant live-chat call. Enforces, in
+   * order: global kill switch, the project $95.00 safety threshold, the
+   * $2.00 assistant live allowance, the per-isolate concurrency cap
+   * (<= 2), the per-client rate limit, and the per-session request cap
+   * (<= 10). Fails closed whenever budget/accounting is exhausted or
+   * uncertain. Pair every success with exactly one `commit` (paid call
+   * completed) or `release` (not completed).
+   */
+  tryReserveAssistantLiveCall(sessionId: string, clientKey = 'anonymous'): AssistantLiveReservation {
+    if (!Number.isFinite(this.assistantIncurredCostUsd) || !Number.isFinite(this.edgeCachedAssistantSpendUsd)) {
+      return { ok: false, reason: 'accounting_uncertain' };
+    }
+    if (this.killSwitch.isGlobalKillActive()) return { ok: false, reason: 'kill_switch' };
+    if (this.isBudgetSafetyBreached()) return { ok: false, reason: 'project_budget_exhausted' };
+    if (this.effectiveAssistantSpendUsd() >= ASSISTANT_LIVE_ALLOWANCE_USD) return { ok: false, reason: 'chat_allowance_exhausted' };
+    if (this.assistantActiveCalls >= MAX_CONCURRENT_ASSISTANT_LIVE_CALLS) return { ok: false, reason: 'concurrency_limit' };
+    try {
+      this.rateLimiter.check(`assistant-live:${clientKey}`);
+    } catch {
+      return { ok: false, reason: 'rate_limited' };
+    }
+    const used = typeof sessionId === 'string' && sessionId.length > 0 ? (this.assistantSessionCalls.get(sessionId) ?? 0) : 0;
+    if (!Number.isFinite(used) || used >= MAX_ASSISTANT_LIVE_CALLS_PER_SESSION) return { ok: false, reason: 'session_limit' };
+    this.assistantActiveCalls += 1;
+    if (typeof sessionId === 'string' && sessionId.length > 0) {
+      this.assistantSessionCalls.set(sessionId, used + 1);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Commit one reserved paid assistant live-chat call to the shared ledger
+   * (exactly one commit per successful reservation that reached upstream).
+   */
+  commitAssistantLiveCall(usage: { inputTokens: number; outputTokens: number }): void {
+    this.assistantActiveCalls = Math.max(0, this.assistantActiveCalls - 1);
+    const input = asNonNegativeNumber(usage.inputTokens);
+    const output = asNonNegativeNumber(usage.outputTokens);
+    this.assistantLiveRequests += 1;
+    this.assistantInputTokens += input;
+    this.assistantOutputTokens += output;
+    this.assistantIncurredCostUsd += estimateLiveCostUsd(input, output);
+    void this.persistEdgeRuntimeSnapshot();
+  }
+
+  /** Release a reservation without charging (upstream skipped or failed). */
+  releaseAssistantLiveCall(): void {
+    this.assistantActiveCalls = Math.max(0, this.assistantActiveCalls - 1);
   }
 
   /**
@@ -1195,14 +1329,28 @@ export class TraceForgeMaasService {
     await edgeCachePut(edgeScenarioKey(record.scenarioId), this.persistedStateFor(record));
   }
 
-  /** Canonical investigation token: deterministic per `(scenarioId, owner)`. */
+  /**
+   * Canonical investigation id for one scenario: reuses the stored
+   * `latestInvestigation.investigationId` when it already exists (warm
+   * isolate or Edge Cache / Durable Object merge), otherwise mints a fresh
+   * random-IV `inv_...` token via `encodeInvestigationToken`. The caller
+   * persists it via `storeInvestigationRun` (TraceForgeStateDO / Edge
+   * Cache), so all subsequent `status`, `history`, `result`, `score`, and
+   * `report` calls across isolates return the exact same `investigationId`.
+   */
   private async mintCanonicalInvestigationId(
-    scenarioId: string,
+    scenarioRecord: ScenarioRecord,
     ownerActorId: string,
     extras: InvestigationTokenExtras = {},
   ): Promise<string> {
-    const iv = await deterministicIvForInvestigation(scenarioId, ownerActorId, this.sessionSecret);
-    return encodeInvestigationToken({ s: scenarioId, o: ownerActorId, q: 1, ...extras }, this.sessionSecret, iv);
+    const existing = scenarioRecord.latestInvestigation?.investigationId;
+    if (existing) return existing;
+    const mapped = [...this.investigations.values()].filter((r) => r.scenarioId === scenarioRecord.scenarioId).pop();
+    if (mapped) {
+      scenarioRecord.latestInvestigation = mapped;
+      return mapped.investigationId;
+    }
+    return encodeInvestigationToken({ s: scenarioRecord.scenarioId, o: ownerActorId, q: 1, ...extras }, this.sessionSecret);
   }
 
   private async requireOwnedScenario(scenarioId: string, context: MaasAuthContext, correlationId: string, capability: string): Promise<ScenarioRecord> {
@@ -1335,17 +1483,18 @@ export class TraceForgeMaasService {
   }
 
   /**
-   * Cold-isolate canonical diagnosis: run the deterministic bench first, then
-   * mint the deterministic per-scenario investigation id from the run extras,
-   * so every isolate converges on the byte-identical `inv_...` token (fixed
-   * sequence `q: 1`, deterministic IV) even with no Edge Cache entry.
+   * Cold-isolate canonical diagnosis: reuses the stored canonical
+   * investigation id when Edge Cache / Durable Object state already holds
+   * one for this scenario, otherwise mints a fresh random-IV `inv_...`
+   * token from the run extras and persists it via `storeInvestigationRun`
+   * so all isolates sharing durable/edge storage converge on the same id.
    */
   private async diagnoseAndStoreCanonicalInvestigation(
     scenarioRecord: ScenarioRecord,
     ownerActorId: string,
   ): Promise<InvestigationRecord> {
     const run: AgenticDiagnosisRun = await runAgenticDiagnosis(scenarioRecord.session, this.simClient);
-    const investigationId = await this.mintCanonicalInvestigationId(scenarioRecord.scenarioId, ownerActorId, {
+    const investigationId = await this.mintCanonicalInvestigationId(scenarioRecord, ownerActorId, {
       m: run.operationalMode,
       t: run.turns,
       d: run.proposedDiagnosis,
@@ -1430,10 +1579,10 @@ export class TraceForgeMaasService {
     }
     // Cold-isolate path: the scenario hydrated from a foreign `scn_...` token
     // (never created in this isolate's map) carries no investigation yet, so
-    // run the deterministic canonical diagnosis here — every cold isolate
-    // converges on the byte-identical `investigationId`. Scenarios created in
-    // THIS isolate keep throwing `MAAS_RESOURCE_NOT_FOUND` so existing
-    // behavior is intact.
+    // run the canonical diagnosis here and persist it — cold isolates sharing
+    // durable/edge storage converge on the same `investigationId`. Scenarios
+    // created in THIS isolate keep throwing `MAAS_RESOURCE_NOT_FOUND` so
+    // existing behavior is intact.
     if (!owned.hydratedFromToken) {
       throw new MaasToolError('MAAS_RESOURCE_NOT_FOUND', `No investigation found for '${scenarioId}'.`, correlationId, capability);
     }
@@ -1517,7 +1666,7 @@ export class TraceForgeMaasService {
       lastVerifiedBalanceUsd: LAST_VERIFIED_BALANCE_USD,
       lastVerifiedConsumedUsd: LAST_VERIFIED_CONSUMED_USD,
       lastVerifiedTimestamp: LAST_VERIFIED_TIMESTAMP,
-      verifiedNote: 'Verified $122.78 balance ($24.48 consumed across Muse Code CLI + live API; $75.52 remaining of $100.00 authorized budget) as of 2026-10-26T20:08:24-05:00.',
+      verifiedNote: 'Verified $113.63 balance ($33.63 consumed across Muse Code CLI + live API; $66.37 remaining of $100.00 authorized budget) as of 2026-10-27T00:40:47-05:00.',
       verifiedRemainingBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD - LAST_VERIFIED_CONSUMED_USD,
       ledger: {
         incurredCostUsd: incurred,
@@ -1527,9 +1676,15 @@ export class TraceForgeMaasService {
         totalRequests: telemetry.totalRequests,
         providerReportedUsage: telemetry.providerReportedUsage,
       },
-      ledgerScopeNote: 'ledger tracks runtime Meta API calls observed by this Worker isolate/colo since deployment, while lastVerifiedConsumedUsd ($24.48) is the provider-confirmed cumulative consumption across Muse Code CLI and runtime API.',
+      ledgerScopeNote: 'ledger tracks runtime Meta API calls observed by this Worker isolate/colo since deployment, while lastVerifiedConsumedUsd ($33.63) is the provider-confirmed cumulative consumption across Muse Code CLI and runtime API.',
       remainingBudgetUsd: AUTHORIZED_ADDITIONAL_BUDGET_USD - incurred,
       safetyThresholdBreached: this.isBudgetSafetyBreached(),
+      assistant: {
+        ...this.getAssistantLiveUsage(),
+        maxCallsPerSession: MAX_ASSISTANT_LIVE_CALLS_PER_SESSION,
+        maxConcurrentCalls: MAX_CONCURRENT_ASSISTANT_LIVE_CALLS,
+        maxOutputTokens: ASSISTANT_MAX_OUTPUT_TOKENS,
+      },
     };
   }
 
@@ -1940,12 +2095,12 @@ export class TraceForgeMaasService {
       run = await runAgenticDiagnosis(record.session, this.simClient);
     }
     const executionSource = run.operationalMode === 'LIVE_API' ? 'Live Muse Spark 1.3' : 'Deterministic Virtual Lab';
-    // Deterministic per-scenario identity: the canonical `inv_...` token
-    // (fixed sequence, deterministic IV) is stable for this
-    // `(scenarioId, ownerActorId)` across every isolate, and the completed
-    // record is awaited to Edge Cache so cold isolates hydrate the EXACT
-    // record (LIVE_API included) with no new API call.
-    const investigationId = await this.mintCanonicalInvestigationId(record.scenarioId, context.actorId, {
+    // Canonical per-scenario identity: reuse the stored `latestInvestigation`
+    // id when one already exists, otherwise mint a fresh random-IV `inv_...`
+    // token and persist it via `storeInvestigationRun` — the completed record
+    // is awaited to Edge Cache / TraceForgeStateDO so cold isolates hydrate
+    // the EXACT record (LIVE_API included) with no new API call.
+    const investigationId = await this.mintCanonicalInvestigationId(record, context.actorId, {
       m: run.operationalMode,
       t: run.turns,
       d: run.proposedDiagnosis,
@@ -2032,10 +2187,10 @@ export class TraceForgeMaasService {
     if (record.evaluated && record.scorecard) return record.scorecard;
     // Cold-isolate path: a scenario hydrated from a foreign `scn_...` token
     // arrives with zero local probes (and no canonical investigation yet),
-    // so run the deterministic canonical diagnosis here — every cold isolate
-    // converges on the same probes and the same `investigationId` — before
-    // scoring. Scenarios created in THIS isolate without probes still throw
-    // `MAAS_INVESTIGATION_INCOMPLETE` below.
+    // so run the canonical diagnosis here and persist it — cold isolates
+    // sharing durable/edge storage converge on the same probes and the same
+    // `investigationId` — before scoring. Scenarios created in THIS isolate
+    // without probes still throw `MAAS_INVESTIGATION_INCOMPLETE` below.
     if (record.hydratedFromToken && record.session.getProbeLog().length === 0) {
       await this.diagnoseAndStoreCanonicalInvestigation(record, context.actorId);
     }

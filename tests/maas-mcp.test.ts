@@ -951,7 +951,7 @@ describe('17. live mode with an injected liveClient', () => {
 /* --------------------------------------------------------------- area 18 -- */
 
 describe('18. verified billing checkpoint', () => {
-  it('budget.status surfaces the $147.26 baseline and the verified $122.78 checkpoint', async () => {
+  it('budget.status surfaces the $147.26 baseline and the verified $113.63 checkpoint', async () => {
     const service = new TraceForgeMaasService();
     const budget = (await service.executeTool('traceforge.budget.status', {}, {})) as {
       startingBalanceUsd: number;
@@ -969,12 +969,12 @@ describe('18. verified billing checkpoint', () => {
     expect(budget.authorizedCeilingUsd).toBe(100);
     expect(budget.mandatoryReserveUsd).toBe(47.26);
     expect(budget.safetyThresholdUsd).toBe(95);
-    expect(budget.lastVerifiedBalanceUsd).toBe(122.78);
-    expect(budget.lastVerifiedConsumedUsd).toBe(24.48);
-    expect(budget.lastVerifiedTimestamp).toBe('2026-10-26T20:08:24-05:00');
-    expect(budget.verifiedRemainingBudgetUsd).toBeCloseTo(75.52, 2);
-    expect(budget.verifiedNote).toContain('$122.78');
-    expect(budget.verifiedNote).toContain('$24.48');
+    expect(budget.lastVerifiedBalanceUsd).toBe(113.63);
+    expect(budget.lastVerifiedConsumedUsd).toBe(33.63);
+    expect(budget.lastVerifiedTimestamp).toBe('2026-10-27T00:40:47-05:00');
+    expect(budget.verifiedRemainingBudgetUsd).toBeCloseTo(66.37, 2);
+    expect(budget.verifiedNote).toContain('$113.63');
+    expect(budget.verifiedNote).toContain('$33.63');
     expect(budget.ledgerScopeNote).toContain('lastVerifiedConsumedUsd');
   });
 });
@@ -1069,7 +1069,8 @@ describe('19. explicit live-AI spending control', () => {
   });
 
   it('enforces the $95.00 safety stop against verified + runtime spend', async () => {
-    const service = new TraceForgeMaasService({ initialIncurredCostUsd: 70 });
+    // $33.63 verified + $60.00 runtime = $93.63 < $95.00: not breached yet.
+    const service = new TraceForgeMaasService({ initialIncurredCostUsd: 60 });
     expect(service.isBudgetSafetyBreached()).toBe(false);
     service.injectLiveSpendForTesting(25.5);
     expect(service.isBudgetSafetyBreached()).toBe(true);
@@ -1078,7 +1079,7 @@ describe('19. explicit live-AI spending control', () => {
       ledger: { incurredCostUsd: number };
     };
     expect(budget.safetyThresholdBreached).toBe(true);
-    expect(budget.ledger.incurredCostUsd).toBeCloseTo(95.5, 6);
+    expect(budget.ledger.incurredCostUsd).toBeCloseTo(85.5, 6);
   });
 
   it('recordExternalLiveUsage feeds the shared runtime ledger', async () => {
@@ -1103,43 +1104,100 @@ describe('20. AES-256-GCM session tokens', () => {
     const payload = { b: 0, f: 0, o: 'actor_test', x: 123, q: 1 };
     const first = await encryptSignedToken('scn_', payload, SECRET);
     const second = await encryptSignedToken('scn_', payload, SECRET);
-    expect(first).toMatch(/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/);
-    expect(second).toMatch(/^(scn|inv)_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(first).toMatch(/^(scn|inv)_[0-9a-f]+_[0-9a-f]{64}$/);
+    expect(second).toMatch(/^(scn|inv)_[0-9a-f]+_[0-9a-f]{64}$/);
     expect(first).not.toBe(second);
     expect(await decryptSignedToken('scn_', first, SECRET)).toEqual(payload);
     expect(await decryptSignedToken('scn_', second, SECRET)).toEqual(payload);
     const inv = await encryptSignedToken('inv_', { s: 'x', o: 'y', q: 2 }, SECRET);
-    expect(inv).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(inv).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
   });
 
-  it('derives a Synthetic IV (SIV) bound to the exact plaintext so distinct plaintexts never share an AES-GCM IV', async () => {
-    const fixedSeed = new Uint8Array(12);
-    fixedSeed.fill(7);
-    const payloadA = { s: 'scn_alpha', o: 'actor_test', q: 1 };
-    const payloadB = { s: 'scn_beta', o: 'actor_test', q: 1 };
-    const tokenA1 = await encryptSignedToken('inv_', payloadA, SECRET, fixedSeed);
-    const tokenA2 = await encryptSignedToken('inv_', payloadA, SECRET, fixedSeed);
-    const tokenB = await encryptSignedToken('inv_', payloadB, SECRET, fixedSeed);
-    // Identical plaintext + seed -> identical token for cold-isolate determinism
-    expect(tokenA1).toBe(tokenA2);
-    // Distinct plaintexts with the same caller seed -> distinct 12-byte IVs (first 24 hex chars after prefix)
-    const ivHexA = tokenA1.slice('inv_'.length, 'inv_'.length + 24);
+  it('produces distinct 96-bit IVs and ciphertexts for identical payloads (IND-CPA, zero nonce reuse)', async () => {
+    const payload = { s: 'scn_alpha', o: 'actor_test', q: 1 };
+    const tokenA = await encryptSignedToken('inv_', payload, SECRET);
+    const tokenB = await encryptSignedToken('inv_', payload, SECRET);
+    expect(tokenA).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
+    expect(tokenB).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
+    // Distinct 96-bit IVs: first 24 hex chars after the prefix differ.
+    const ivHexA = tokenA.slice('inv_'.length, 'inv_'.length + 24);
     const ivHexB = tokenB.slice('inv_'.length, 'inv_'.length + 24);
+    expect(ivHexA).toMatch(/^[0-9a-f]{24}$/);
+    expect(ivHexB).toMatch(/^[0-9a-f]{24}$/);
     expect(ivHexA).not.toBe(ivHexB);
-    expect(await decryptSignedToken('inv_', tokenA1, SECRET)).toEqual(payloadA);
-    expect(await decryptSignedToken('inv_', tokenB, SECRET)).toEqual(payloadB);
+    // Distinct ciphertexts overall, both decrypting to the identical payload.
+    expect(tokenA).not.toBe(tokenB);
+    expect(await decryptSignedToken('inv_', tokenA, SECRET)).toEqual(payload);
+    expect(await decryptSignedToken('inv_', tokenB, SECRET)).toEqual(payload);
   });
 
-  it('rejects bit flips, truncation, and wrong-key decryption', async () => {
+  it('rejects 1-bit modifications, truncation, wrong secret, and prefix swaps (256-bit HMAC + 128-bit GCM)', async () => {
     const token = await encryptSignedToken('scn_', { b: 0, f: 0, o: 'actor_test', x: 1, q: 1 }, SECRET);
     const hex = token.slice('scn_'.length, token.lastIndexOf('_'));
+    const suffix = token.slice(token.lastIndexOf('_'));
+    // 1-bit modification of the ciphertext hex (single hex char flip).
     const flipIndex = 30;
     const flippedChar = hex[flipIndex] === 'a' ? 'b' : 'a';
-    const flipped = `scn_${hex.slice(0, flipIndex)}${flippedChar}${hex.slice(flipIndex + 1)}${token.slice(token.lastIndexOf('_'))}`;
+    const flipped = `scn_${hex.slice(0, flipIndex)}${flippedChar}${hex.slice(flipIndex + 1)}${suffix}`;
     expect(await decryptSignedToken('scn_', flipped, SECRET)).toBeNull();
+    // 1-bit modification of the 64-char HMAC tag (last hex char flip).
+    const tagFlipped = `${token.slice(0, -1)}${token.endsWith('a') ? 'b' : 'a'}`;
+    expect(await decryptSignedToken('scn_', tagFlipped, SECRET)).toBeNull();
+    // Truncation and wrong secret.
     expect(await decryptSignedToken('scn_', token.slice(0, token.length - 10), SECRET)).toBeNull();
     expect(await decryptSignedToken('scn_', token, 'wrong-secret')).toBeNull();
+    // Prefix swap: additionalData binding rejects the foreign prefix.
     expect(await decryptSignedToken('inv_', token, SECRET)).toBeNull();
+  });
+
+  it('converges cold isolates sharing durable/edge storage on the same investigationId', async () => {
+    const store = new Map<string, string>();
+    const holder = globalThis as unknown as { caches?: unknown };
+    const previous = holder.caches;
+    holder.caches = {
+      default: {
+        async match(key: string): Promise<{ json(): Promise<unknown> } | undefined> {
+          const raw = store.get(key);
+          if (raw === undefined) return undefined;
+          return { async json() { return JSON.parse(raw) as unknown; } };
+        },
+        async put(key: string, response: Response): Promise<void> {
+          store.set(key, await response.text());
+        },
+      },
+    };
+    try {
+      const sharedSecret = 'tf-test-converge-secret-v3';
+      const isoA = new TraceForgeMaasService();
+      isoA.configureSessionSecret(sharedSecret);
+      const isoB = new TraceForgeMaasService();
+      isoB.configureSessionSecret(sharedSecret);
+      const created = (await isoA.executeTool(
+        'traceforge.scenarios.create',
+        { boardId: 'usbc-pd-trigger', faultSelector: 'scenario-0' },
+        AGENT,
+      )) as { scenarioId: string };
+      const started = (await isoA.executeTool(
+        'traceforge.investigations.start',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { investigationId: string };
+      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
+      const status = (await isoB.executeTool(
+        'traceforge.investigations.status',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { investigationId: string };
+      const result = (await isoB.executeTool(
+        'traceforge.investigations.result',
+        { scenarioId: created.scenarioId },
+        AGENT,
+      )) as { investigationId: string };
+      expect(status.investigationId).toBe(started.investigationId);
+      expect(result.investigationId).toBe(started.investigationId);
+    } finally {
+      holder.caches = previous;
+    }
   });
 
   it('rejects rotated-secret tokens on cold-isolate hydration', async () => {
@@ -1258,7 +1316,7 @@ describe('21. all-3-board fault matrix end to end', () => {
         { boardId: entry.boardId, faultSelector: entry.faultId },
         AGENT,
       )) as { scenarioId: string; boardId: string };
-      expect(created.scenarioId).toMatch(/^scn_[0-9a-f]+_[0-9a-f]{8}$/);
+      expect(created.scenarioId).toMatch(/^scn_[0-9a-f]+_[0-9a-f]{64}$/);
       expect(created.boardId).toBe(entry.boardId);
 
       const localSession = createVirtualSession(entry.boardId, entry.faultId);
@@ -1290,7 +1348,7 @@ describe('21. all-3-board fault matrix end to end', () => {
         { scenarioId: created.scenarioId },
         AGENT,
       )) as { investigationId: string; operationalMode: string; completed: boolean };
-      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
       expect(started.operationalMode).toBe('SIMULATED');
       expect(started.completed).toBe(true);
 
@@ -1463,7 +1521,7 @@ describe('22. cross-isolate MCP session consistency', () => {
         { scenarioId },
         AGENT,
       )) as { investigationId: string; probesUsed: number; turns: number };
-      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+      expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
 
       const status = (await isoB.executeTool(
         'traceforge.investigations.status',
@@ -1493,9 +1551,10 @@ describe('22. cross-isolate MCP session consistency', () => {
     }
   });
 
-  it('Defect C (cold edge): two cold isolates converge on one deterministic investigationId', async () => {
-    // Create with NO shared cache, then install an EMPTY one: both cold
-    // isolates reconstruct purely from the signed `scn_...` token.
+  it('Defect C (cold edge): two cold isolates sharing durable/edge storage converge on one investigationId', async () => {
+    // Create with NO shared cache, then install a SHARED one: the first cold
+    // isolate mints a fresh random-IV `inv_...` token and persists it, and the
+    // second cold isolate reuses it from durable/edge storage.
     const solo = freshIsolate();
     const created = (await solo.executeTool(
       'traceforge.scenarios.create',
@@ -1504,7 +1563,7 @@ describe('22. cross-isolate MCP session consistency', () => {
     )) as { scenarioId: string };
     const { scenarioId } = created;
 
-    const { store, uninstall } = installSharedEdgeCache();
+    const { uninstall } = installSharedEdgeCache();
     try {
       const coldB = freshIsolate();
       const status = (await coldB.executeTool(
@@ -1512,10 +1571,10 @@ describe('22. cross-isolate MCP session consistency', () => {
         { scenarioId },
         AGENT,
       )) as { investigationId: string };
-      expect(status.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+      expect(status.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
 
-      // Wipe everything B persisted: C must converge independently.
-      store.clear();
+      // C shares the same durable/edge storage B persisted to: it must reuse
+      // B's canonical investigationId rather than minting a new random one.
       const coldC = freshIsolate();
       const result = (await coldC.executeTool(
         'traceforge.investigations.result',

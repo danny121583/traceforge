@@ -30,6 +30,11 @@ import {
 } from '../src/maas/tools';
 import { MaasSecurityError } from '../src/maas/security';
 import {
+  KB_VERSION as ASSISTANT_KB_VERSION,
+  handleAssistantChat,
+  issueAssistantSessionTicket,
+} from '../src/lib/assistant-server';
+import {
   META_PROXY_CHAT_PATH,
   META_PROXY_MAX_BODY_BYTES,
   META_PROXY_SEGMENT_PATH,
@@ -1412,6 +1417,47 @@ export function createTraceForgeWorker(options: TraceForgeWorkerOptions = {}): T
         masks: Array.isArray(segData.masks) ? segData.masks : [],
         confidence: typeof segData.confidence === 'number' ? segData.confidence : 0,
       }, correlationId);
+    }
+
+    // TraceForge Assistant: RAG-first chat with gated live inference.
+    // `GET|POST /api/assistant/session` issues a free short-lived HMAC
+    // session ticket; `POST /api/assistant/chat` answers from the versioned
+    // knowledge base at $0.00 unless fully authorized for one live call.
+    if ((method === 'GET' || method === 'POST') && path === '/api/assistant/session') {
+      const issued = await issueAssistantSessionTicket(signingSecret, clock());
+      return jsonResponse(200, {
+        sessionTicket: issued.sessionTicket,
+        sessionId: issued.sessionId,
+        expiresAtMs: issued.expiresAtMs,
+        kbVersion: ASSISTANT_KB_VERSION,
+      }, correlationId);
+    }
+
+    if (method === 'POST' && path === '/api/assistant/chat') {
+      let chatText = '';
+      try {
+        chatText = await request.text();
+      } catch {
+        return jsonResponse(400, { error: 'Assistant could not read the request body.' }, correlationId);
+      }
+      if (chatText.length > 64 * 1024) {
+        return jsonResponse(413, { error: 'Request body too large.' }, correlationId);
+      }
+      let chatBody: unknown;
+      try {
+        chatBody = chatText ? JSON.parse(chatText) : {};
+      } catch {
+        return jsonResponse(400, { error: 'Assistant request body must be valid JSON.' }, correlationId);
+      }
+      const headers = await resolveServiceHeaders(request, env);
+      const handled = await handleAssistantChat({
+        service,
+        body: chatBody,
+        headers,
+        signingSecret,
+        apiKey: typeof env?.['META_API_KEY'] === 'string' ? env['META_API_KEY'] as string : undefined,
+      });
+      return jsonResponse(handled.status, handled.payload, correlationId);
     }
 
     return jsonResponse(404, { error: { code: 'MAAS_RESOURCE_NOT_FOUND', message: `Unknown worker path '${path}'.`, correlationId } }, correlationId);

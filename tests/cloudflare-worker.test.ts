@@ -784,7 +784,7 @@ describe('Phase 6: cross-isolate LIVE_API preservation', () => {
     expect(liveCalls).toBeGreaterThan(0);
 
     // The signed token is opaque hex: zero readable ground-truth strings.
-    expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{8}$/);
+    expect(started.investigationId).toMatch(/^inv_[0-9a-f]+_[0-9a-f]{64}$/);
     expect(started.investigationId).not.toContain('f405-nrst-gnd-short');
 
     // Cold isolate B has no live client, so any LIVE_API label it reports

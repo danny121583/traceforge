@@ -49,15 +49,15 @@ export const INPUT_COST_USD_PER_MTOKEN = 2.0;
 export const OUTPUT_COST_USD_PER_MTOKEN = 6.0;
 
 /* ---------------------------------------------------------------------------
- * Verified billing checkpoint (2026-10-26T20:08:24-05:00 provider snapshot)
+ * Verified billing checkpoint (2026-10-27T00:40:47-05:00 owner snapshot)
  * ------------------------------------------------------------------------- */
 
 /** Verified promotional-credit balance at the last provider checkpoint. */
-export const LAST_VERIFIED_BALANCE_USD = 122.78;
+export const LAST_VERIFIED_BALANCE_USD = 113.63;
 /** Verified incremental consumption (Muse Code CLI + live API) at the checkpoint. */
-export const LAST_VERIFIED_CONSUMED_USD = 24.48;
+export const LAST_VERIFIED_CONSUMED_USD = 33.63;
 /** ISO timestamp of the last verified provider billing checkpoint. */
-export const LAST_VERIFIED_TIMESTAMP = '2026-10-26T20:08:24-05:00';
+export const LAST_VERIFIED_TIMESTAMP = '2026-10-27T00:40:47-05:00';
 
 /** Default / maximum `max_tokens` per chat request (runaway-request guard). */
 export const DEFAULT_MAX_TOKENS = 1024;

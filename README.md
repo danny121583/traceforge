@@ -36,6 +36,9 @@ diagnosis score, not a vague impression.
   with structured tool calls — always behind an explicit, paid opt-in.
 - 18-tool MaaS/MCP server, Cloudflare Worker staging backend with
   OAuth 2.1 PKCE, and AES-256-GCM authenticated session tokens.
+- Floating TraceForge Assistant: RAG-first answers from a versioned
+  knowledge base (`KB_VERSION`) at `$0.00`, with explicitly authorized,
+  budget-gated live inference only as a fallback.
 - Explicit AI transparency badges on every result: `SIMULATED`,
   `STATIC_FIXTURE`, `RECORDED_LIVE_REPLAY`, `UNVERIFIED`,
   `UNAVAILABLE`, `LIVE_API`.
@@ -157,6 +160,11 @@ CH224K PD trigger. Nodes: `GND`, `V5`, `CC1`, `CC2`. Probe aliases:
   (`worker/index.ts`, `wrangler.toml`).
 - **Deployment:** Vercel Hobby frontend with edge rewrites to the
   Worker (`vercel.json`).
+- **Assistant:** floating widget (`src/components/TraceForgeAssistant.tsx`),
+  versioned knowledge base (`src/data/knowledge-base.ts`,
+  `docs/knowledge/traceforge-knowledge-base.md`), deterministic RAG
+  engine (`src/lib/rag-engine.ts`), and gated server chat endpoints
+  (`src/lib/assistant-server.ts`, `POST /api/assistant/chat`).
 
 ```mermaid
 flowchart LR
@@ -271,6 +279,33 @@ refresh-token state is persisted in `TraceForgeStateDO` so ChatGPT MCP
 connections can renew expired 1-hour access tokens without full manual
 re-authentication.
 
+### H2. TraceForge Assistant (RAG-first, `$0.00` by default)
+
+The floating **TraceForge Assistant** widget answers from a versioned
+static knowledge base first (`src/data/knowledge-base.ts`,
+`docs/knowledge/traceforge-knowledge-base.md`, pinned by `KB_VERSION =
+'2026.10.27-v2'`, 18 topics): deterministic inverted-index + synonym +
+BM25 retrieval with a confidence/coverage gate (`high`/`medium`/`low`),
+prompt-injection refusal, greeting handling, and session-grounded
+answers (board, symptom, probes, diagnosis, evaluated score breakdown)
+with strict pre-evaluation ground-truth isolation.
+
+Server flow (`POST /api/assistant/chat`, shared logic in
+`src/lib/assistant-server.ts`, served by both `worker/index.ts` and
+the local Vite middleware): RAG runs first; knowledge answers and
+policy refusals return immediately (`mode: 'knowledge_base'`,
+`liveInvoked: false`, zero Meta API calls). A paid `muse-spark-1.3`
+call (at most 1 per message, `max_tokens: 350`, grounded system prompt)
+happens only when the request opts in (`allowLiveInference: true`),
+presents a valid `tf_chat_…` session ticket
+(`GET|POST /api/assistant/session`) or a `Bearer` token with
+`traceforge:live_inference:execute`, the server holds `META_API_KEY`,
+and the shared-ledger reservation succeeds (`$2.00` chat allowance,
+`$95.00` project safety stop, ≤10 calls/session, ≤2 concurrent,
+per-client rate limit). Every other outcome — including upstream
+errors, with no retries — returns a knowledge-only fallback
+(`mode: 'knowledge_fallback'`, `liveInvoked: false`) at `$0.00`.
+
 ## I. Cloudflare Worker & Vercel Hobby ($0) Deployment
 
 - **Staging Worker** (`traceforge-mcp-staging`, `worker/index.ts`):
@@ -289,7 +324,9 @@ re-authentication.
   [`https://traceforge-ten.vercel.app`](https://traceforge-ten.vercel.app)
   (preview [`https://traceforge-kirn4r1qz-aigraphixs-projects.vercel.app`](https://traceforge-kirn4r1qz-aigraphixs-projects.vercel.app)).
   `vercel.json` rewrites `/api/meta/*`,
-  `/api/maas/*`, `/mcp`, and `/health` to the staging Worker origin —
+  `/api/maas/*`, `/api/assistant/*`, `/mcp`, and `/health` to the
+  staging Worker origin, with `Cache-Control: no-cache, no-store,
+  must-revalidate` on `/` and `/index.html` —
   no paid plans, trials, add-ons, domains, or usage billing.
 - **Rollback:** redeploy the previous good build in Vercel, or
   `wrangler rollback` / redeploy the prior Worker version; both
@@ -297,15 +334,20 @@ re-authentication.
   colocation — not a substitute for Durable Objects).
 - **Cross-request sessions:** `scn_…` / `inv_…` ids are
   self-contained AES-256-GCM tokens, so any isolate holding the
-  session secret can hydrate them. Every read merges the canonical
+  session secret can hydrate them. Every token uses a fresh random
+  96-bit IV (`crypto.getRandomValues`, NIST SP 800-38D, explicit
+  128-bit GCM tag, prefix bound as Additional Data) plus the full
+  256-bit HMAC-SHA-256 Encrypt-then-MAC tag (`_…64 hex chars`),
+  verified in constant time before decryption; AES and HMAC keys are
+  derived via Web Crypto HKDF-SHA-256 with distinct domain labels.
+  Every read merges the canonical
   `PersistedScenarioState` from Edge Cache (`probesUsed`, ordered
   probe log, canonical investigation, immutable scorecard) and every
   mutation awaits persistence first (`Cache-Control: max-age=1800`),
   so consecutive MCP calls agree even when routed across isolates.
-  Investigation ids are deterministic per `(scenarioId, owner)` using
-  a Synthetic IV (SIV) construction (`SHA-256` over secret, prefix,
-  seed, and exact serialized plaintext) so two distinct plaintexts can
-  never reuse a 96-bit AES-GCM IV; scenario tokens keep random IVs. A
+  The canonical `investigationId` is reused from stored state when
+  present and otherwise minted fresh then persisted, so cold isolates
+  sharing durable/edge storage converge on one id. A
   per-actor Edge Cache index keeps `scenarios.list` consistent across
   isolates without leaking sessions between actors.
 - **Strong global consistency on `*.workers.dev`
@@ -328,11 +370,12 @@ re-authentication.
   one-time refresh-token rotation (`grant_type=refresh_token`), replay
   rejection, scope preservation/narrowing (never escalation), and
   `POST /oauth/revoke` persisted in `TraceForgeStateDO`.
-- **AES-256-GCM + SIV + HMAC-SHA-256 tokens:** random 96-bit IV per
-  scenario token, Synthetic IV (SIV) bound to exact serialized
-  plaintext for deterministic tokens (never reusing an AES-GCM IV on
-  distinct plaintexts), prefix bound as Additional Data, constant-time
-  tag checks, and `rotateSessionSecret` / `rotateSigningSecret`
+- **AES-256-GCM + HKDF + HMAC-SHA-256 tokens:** fresh random
+  96-bit IV per token (IND-CPA semantic security, zero nonce reuse),
+  explicit 128-bit GCM tag, prefix bound as Additional Data, full
+  256-bit HMAC-SHA-256 Encrypt-then-MAC tag verified in constant time
+  before decryption, HKDF-SHA-256 key derivation with distinct domain
+  labels, and `rotateSessionSecret` / `rotateSigningSecret`
   rotation.
 - **Tool scopes & tenant isolation:** every non-public capability
   requires its scope; scenarios/investigations are strictly
@@ -359,15 +402,26 @@ errors). Coverage by area:
 - **MNA numerical verification:** solver matrices, all-3-board fault
   matrix end-to-end (website-vs-MCP voltage/current agreement).
 - **MCP protocol & security:** schemas, auth, tenant isolation,
-  rate limits, kill switch, AES-GCM token attacks (IV uniqueness,
-  bit-flip, truncation, wrong-key, rotation), OAuth per-client
+  rate limits, kill switch, AES-GCM token attacks (fresh-IV
+  uniqueness, 1-bit modification, truncation, wrong-secret, prefix
+  swap, rotation), OAuth per-client
   isolation, scope enforcement, revocation.
 - **Spending control:** omitted-mode defaults to simulated, explicit
   live invokes the client, read-only status never calls inference,
-  `$95.00` dual-measure safety stop, shared runtime ledger.
+  `$95.00` dual-measure safety stop, shared runtime ledger (including
+  the `$2.00` assistant live allowance with per-session, concurrency,
+  and rate-limit caps).
+- **Assistant RAG-first routing:** all 18 knowledge topics plus
+  `KB_VERSION` pinning, all 6 suggested questions answered locally
+  (`liveInvoked: false`), greeting handling without citation clutter,
+  session-grounded answers with pre-evaluation ground-truth
+  isolation, prompt-injection refusal, and server chat gating (ticket
+  / scope / kill switch / allowance / safety stop / input limits /
+  single-call live path with usage ledger recording).
 - **Cross-isolate consistency:** multi-isolate probe accumulation
   (`1→2→3` with ordered history), failed-probe budget preservation,
-  one stable `investigationId` warm and cold, one immutable
+  one stable `investigationId` across isolates sharing durable/edge
+  storage, one immutable
   scorecard across `score`/`report`, per-actor `scenarios.list`
   isolation, and `401`/`403`/`200` telemetry authorization.
 - **Cloudflare Worker:** health/CORS, discovery metadata, PKCE
@@ -401,7 +455,10 @@ guided 3-step UX with progressive probing and recorded replay; live
 Muse Spark 1.3 multi-turn tool calling (explicit opt-in); 18-tool
 MaaS/MCP server; Cloudflare Worker with OAuth 2.1 PKCE, AES-256-GCM
 tokens, and browser backend routes; Vercel Hobby deployment wiring;
-budget ledger with `$95.00` safety stop; full simulated test suite.
+budget ledger with `$95.00` safety stop; floating TraceForge Assistant
+with versioned RAG knowledge base (`KB_VERSION`), deterministic local
+retrieval, session-grounded answers, and explicitly authorized,
+budget-gated live chat fallback; full simulated test suite.
 
 **Deferred (not deleted where working):** live SAM 3.1 segmentation
 (`STATIC_FIXTURE` overlays); multi-hundred-page PDF/datasheet

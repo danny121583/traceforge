@@ -28,6 +28,7 @@ import {
 } from '../maas/protocol';
 import { MaasToolError, TraceForgeMaasService, maasErrorStatus } from '../maas/tools';
 import { MaasSecurityError } from '../maas/security';
+import { KB_VERSION as ASSISTANT_KB_VERSION, handleAssistantChat, issueAssistantSessionTicket } from '../lib/assistant-server';
 
 /** Minimal structural request (covers dev-server requests and test doubles). */
 export interface MaasHttpRequest {
@@ -52,6 +53,17 @@ const OAUTH_METADATA_PATH = '/.well-known/oauth-protected-resource';
 const MAAS_STATUS_PATH = '/api/maas/status';
 const MAAS_CATALOG_PATH = '/api/maas/catalog';
 const MAAS_AUDIT_PATH = '/api/maas/audit';
+const ASSISTANT_SESSION_PATH = '/api/assistant/session';
+const ASSISTANT_CHAT_PATH = '/api/assistant/chat';
+
+function serverEnv(name: string): string | undefined {
+  try {
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    return env?.[name];
+  } catch {
+    return undefined;
+  }
+}
 
 const ALL_MAAS_SCOPES = [
   'traceforge:discovery:read',
@@ -283,6 +295,38 @@ export async function handleMaasMcpRequest(
       const code = err instanceof MaasSecurityError ? err.code : 'MAAS_EXECUTION_FAILED';
       sendJson(res, maasErrorStatus(code), { error: { code, message: err instanceof Error ? err.message : String(err), correlationId } }, correlationId);
     }
+    return true;
+  }
+  // TraceForge Assistant (RAG-first, $0.00 knowledge answers; live inference
+  // only when fully authorized). The server key stays server-side.
+  if ((method === 'GET' || method === 'POST') && path === ASSISTANT_SESSION_PATH) {
+    const signingSecret = serverEnv('TRACEFORGE_SESSION_SECRET') ?? serverEnv('META_API_KEY') ?? 'tf-assistant-dev-signing-only';
+    const issued = await issueAssistantSessionTicket(signingSecret);
+    sendJson(res, 200, {
+      sessionTicket: issued.sessionTicket,
+      sessionId: issued.sessionId,
+      expiresAtMs: issued.expiresAtMs,
+      kbVersion: ASSISTANT_KB_VERSION,
+    }, correlationId);
+    return true;
+  }
+  if (method === 'POST' && path === ASSISTANT_CHAT_PATH) {
+    let body: unknown;
+    try {
+      body = await readJsonBody(req);
+    } catch {
+      sendJson(res, 400, { error: 'Assistant request body must be valid JSON.' }, correlationId);
+      return true;
+    }
+    const signingSecret = serverEnv('TRACEFORGE_SESSION_SECRET') ?? serverEnv('META_API_KEY') ?? 'tf-assistant-dev-signing-only';
+    const handled = await handleAssistantChat({
+      service,
+      body: body ?? {},
+      headers: req.headers ?? {},
+      signingSecret,
+      apiKey: serverEnv('META_API_KEY'),
+    });
+    sendJson(res, handled.status, handled.payload, correlationId);
     return true;
   }
   return false;

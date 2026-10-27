@@ -2,17 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Header } from './components/Header';
 import { PcbCanvas } from './components/PcbCanvas';
 import { DiagnosticPanel } from './components/DiagnosticPanel';
+import { TraceForgeAssistant } from './components/TraceForgeAssistant';
 import {
-  AUTHORIZED_ADDITIONAL_BUDGET_USD,
-  BUDGET_SAFETY_THRESHOLD_USD,
-  LAST_VERIFIED_BALANCE_USD,
-  LAST_VERIFIED_CONSUMED_USD,
-  LAST_VERIFIED_TIMESTAMP,
   MetaClient,
-  STARTING_PROMOTIONAL_BALANCE_USD,
-  TARGET_RESERVE_USD,
   assembleDatasheetPayload,
-  buildCostLedger,
   TOOL_DEFINITIONS,
   VIRTUAL_LAB_TOOL_DEFINITIONS,
 } from './lib/meta-client';
@@ -76,47 +69,6 @@ const FAULT_TYPE_OPTIONS: FaultType[] = [
   'parameter_drift',
   'reverse_polarity_leakage',
 ];
-
-function fmtUsd(n: number): string {
-  return `$${n.toFixed(n > 0 && n < 0.01 ? 4 : 2)}`;
-}
-
-/**
- * Promotional-credit & budget monitor banner (Milestone D). All figures come
- * from the shared ledger constants plus the live `UsageTelemetry` snapshot —
- * never hardcoded per-render guesses.
- */
-export function BudgetMonitor({ telemetry }: { telemetry: UsageTelemetry }) {
-  const ledger = buildCostLedger(telemetry);
-  const tokenSource = telemetry.providerReportedUsage ? '(tokens: provider-reported)' : '(tokens: local estimate)';
-  return (
-    <div className="tf-card" style={{ margin: '12px 18px 0' }}>
-      <h3>PROMOTIONAL CREDIT &amp; BUDGET MONITOR</h3>
-      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontFamily: 'var(--mono)', fontSize: 11 }}>
-        <span className="tf-chip">Last observed balance: <strong>{fmtUsd(STARTING_PROMOTIONAL_BALANCE_USD)} (unverified snapshot)</strong></span>
-        <span className="tf-chip">Verified balance: <strong>{fmtUsd(LAST_VERIFIED_BALANCE_USD)}</strong> (verified {LAST_VERIFIED_TIMESTAMP})</span>
-        <span className="tf-chip">Verified consumed (Muse Code CLI + live API): <strong>{fmtUsd(LAST_VERIFIED_CONSUMED_USD)}</strong></span>
-        <span className="tf-chip">Verified remaining of authorized budget: <strong>{fmtUsd(AUTHORIZED_ADDITIONAL_BUDGET_USD - LAST_VERIFIED_CONSUMED_USD)}</strong></span>
-        <span className="tf-chip">Authorized budget: <strong>{fmtUsd(AUTHORIZED_ADDITIONAL_BUDGET_USD)}</strong></span>
-        <span className="tf-chip">Target reserve: <strong>{fmtUsd(TARGET_RESERVE_USD)}</strong></span>
-        <span className="tf-chip">Safety threshold: <strong>{fmtUsd(BUDGET_SAFETY_THRESHOLD_USD)}</strong></span>
-        <span className={ledger.safetyThresholdBreached ? 'tf-chip unavailable' : 'tf-chip sim'}>
-          Est. runtime API cost (unverified): <strong>{fmtUsd(telemetry.incurredCostUsd)}</strong>
-        </span>
-        <span className="tf-chip">
-          Session tokens {tokenSource}: <strong>{telemetry.inputTokens} in / {telemetry.outputTokens} out</strong>
-          {' '}· Est. live cost (unverified local rate estimate): <strong>{fmtUsd(telemetry.projectedLiveCostUsd)}</strong>
-        </span>
-        <span className="tf-chip">
-          Requests: <strong>{telemetry.totalRequests}</strong>
-          {' '}· Retried: <strong>{telemetry.retriedRequests}</strong>
-          {' '}· Failed: <strong>{telemetry.failedRequests}</strong>
-        </span>
-        <span className="tf-chip">Est. remaining budget (unverified): <strong>{fmtUsd(ledger.remainingBudgetUsd)}</strong></span>
-      </div>
-    </div>
-  );
-}
 
 function agentStepClass(step: AgentStep): string {
   if (step.kind === 'tool_call') return 'k-tool';
@@ -1448,6 +1400,45 @@ export function App() {
           )}
         </div>
       </div>
+      <TraceForgeAssistant
+        sessionContext={{
+          boardId,
+          boardName: board.name,
+          symptom,
+          lifecycleState: lifecycle,
+          probeMeasurements: probeLog.map((p) => ({
+            target: p.target,
+            kind: p.kind,
+            detail: p.detail ?? undefined,
+            abnormal: p.abnormal,
+          })),
+          ...(agentVerdict
+            ? {
+                proposedDiagnosis: {
+                  componentRef: agentVerdict.componentRef,
+                  faultType: agentVerdict.faultType,
+                  verificationStatus: agentVerdict.verificationStatus,
+                  explanation: agentVerdict.explanation,
+                },
+                verificationStatus: agentVerdict.verificationStatus,
+              }
+            : {}),
+          ...(score
+            ? {
+                score: {
+                  totalScore: score.totalScore,
+                  componentMatch: score.componentMatch,
+                  faultTypeMatch: score.faultTypeMatch,
+                  evidenceConfirmed: score.evidenceConfirmed,
+                  probeCount: score.probeCount,
+                  efficiencyScore: score.efficiencyScore,
+                  summary: score.summary,
+                },
+                evaluated: revealed,
+              }
+            : {}),
+        }}
+      />
     </div>
   );
 }

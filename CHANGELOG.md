@@ -179,3 +179,62 @@ landed on the project branches.
   so distinct plaintexts can never share a 96-bit AES-GCM IV under the
   same key while identical `(scenarioId, ownerActorId)` payloads remain
   deterministic across cold isolates.
+- **Superseded by the cryptographic token remediation + TraceForge
+  Assistant milestone below:** deterministic IVs removed entirely in
+  favor of fresh random IVs per token with full 256-bit HMAC tags.
+
+## Cryptographic token remediation, billing checkpoint & TraceForge Assistant
+
+- **Cryptographic token remediation (`src/maas/tools.ts`,
+  `tests/maas-mcp.test.ts`, `tests/cloudflare-worker.test.ts`):**
+  removed `deterministicIvForInvestigation` and the `ivOverride`
+  parameter; every `encryptSignedToken` call mints a fresh 96-bit
+  random IV (`crypto.getRandomValues`, NIST SP 800-38D, explicit
+  `tagLength: 128`, prefix bound as Additional Data). AES-256-GCM and
+  HMAC-SHA-256 keys derive via standard Web Crypto HKDF-SHA-256 with
+  distinct info labels (`traceforge-aead-hkdf-v3`,
+  `traceforge-hmac-hkdf-v3`). Outer Encrypt-then-MAC upgraded to the
+  full 64-hex-char HMAC tag, verified in constant time before
+  decryption. Canonical `investigationId` values are reused from
+  stored state (persisted via `TraceForgeStateDO` / Edge Cache) so
+  cold isolates sharing storage converge on one id.
+- **Legacy `BudgetMonitor` removal:** deleted the banner export from
+  `src/App.tsx` (with unused helpers/imports) and the
+  `.tf-tech-drawer` rules from `src/index.css`; technical diagnostics
+  stay behind server-authorized access only.
+- **Billing checkpoint:** `LAST_VERIFIED_BALANCE_USD = 113.63`,
+  `LAST_VERIFIED_CONSUMED_USD = 33.63`,
+  `LAST_VERIFIED_TIMESTAMP = '2026-10-27T00:40:47-05:00'`.
+- **`vercel.json`:** added the `/api/assistant/:path*` rewrite to the
+  staging Worker plus `Cache-Control: no-cache, no-store,
+  must-revalidate` for `/` and `/index.html`.
+- **Versioned knowledge base & RAG-first engine
+  (`src/data/knowledge-base.ts` @ `KB_VERSION = '2026.10.27-v2'`,
+  `docs/knowledge/traceforge-knowledge-base.md`,
+  `src/lib/rag-engine.ts`):** 18 topics, deterministic inverted-index
+  + synonym + BM25 retrieval with `high`/`medium`/`low` coverage,
+  prompt-injection refusal, greeting handling, session-grounded
+  answers with pre-evaluation ground-truth isolation, and truthful
+  knowledge-only fallbacks at `$0.00`.
+- **Assistant budget & endpoints (`src/maas/tools.ts`,
+  `src/lib/assistant-server.ts`, `worker/index.ts`,
+  `src/server/maas-mcp-server.ts`):** `$2.00` shared chat allowance
+  (`ASSISTANT_LIVE_ALLOWANCE_USD`), ≤10 calls/session, ≤2
+  concurrent, 1000-char input / 8-message history caps, 350-token
+  output cap; usage tracked in the shared runtime ledger (persisted
+  via `persistEdgeRuntimeSnapshot`, surfaced in
+  `traceforge.budget.status`); `GET|POST /api/assistant/session`
+  issues HMAC-signed `tf_chat_…` tickets and
+  `POST /api/assistant/chat` answers knowledge-first with at most 1
+  fully-authorized live call, else graceful knowledge fallback (never
+  a retry, never a 500).
+- **Floating TraceForge Assistant UI
+  (`src/components/TraceForgeAssistant.tsx`, `src/index.css`,
+  `src/App.tsx`):** launcher + card panel with the 6 suggested
+  questions, source pills, Clear/Close/Escape controls, auto-scroll,
+  duplicate-send prevention, and stale-response protection.
+- **Regression coverage (`tests/assistant-rag.test.ts`, 47 tests):**
+  KB topics + version, suggested questions at `$0.00`, greetings,
+  session grounding with ground-truth isolation, prompt-injection
+  refusal, full server gating matrix, and the authorized single-call
+  live path with ledger recording.

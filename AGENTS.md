@@ -231,9 +231,10 @@ Keep the following concepts strictly distinct in data structures, prompts, and U
 
 ## 8. Budget Control & Promotional Credit Policy
 
-- **Baseline & Ceiling (Recorded 2026-10-26T15:56:48-05:00; Latest Verified Provider Snapshot 2026-10-26T20:08:24-05:00):**
+- **Baseline & Ceiling (Recorded 2026-10-26T15:56:48-05:00; Latest Verified Provider Snapshot 2026-10-26T20:08:24-05:00; Latest Owner Snapshot 2026-10-27T00:40:47-05:00):**
   - **Starting Promotional Balance:** **$147.26**
   - **Latest Verified Promotional Balance:** **$122.78** (**$24.48** cumulative consumed across Muse Code CLI and live runtime API; **$75.52** remaining of the **$100.00** authorized budget)
+  - **Latest Owner Snapshot (2026-10-27T00:40:47-05:00):** **$113.63** balance (**$33.63** cumulative consumed; **$66.37** remaining of the **$100.00** authorized budget) — reported in `traceforge.budget.status` and the workbench ledger constants.
   - **Maximum Authorized Additional Consumption:** **$100.00**
   - **Mandatory Target Ending Promotional Balance:** **$47.26 or more**
   - **Internal Safety Threshold:** **$95.00** of incremental reported/estimated consumption (stop discretionary model usage at $95.00 to preserve a $5.00 buffer against billing delay).
@@ -282,6 +283,17 @@ Keep the following concepts strictly distinct in data structures, prompts, and U
 - **Documentation Sync:** Update `README.md` and `CHANGELOG.md` whenever deployment configuration, URLs, or backend routing changes.
 - **Independent Verification:** Independently test the deployed website over HTTPS (desktop/mobile UI, all 3 reference circuits, virtual measurements, progressive probing, scoring, recorded replay, and backend connectivity) after every deployment.
 - **Project Isolation on Vercel:** Never modify or touch existing projects (`health-erecords-public`, `webcraft-studio`, etc.). Keep `META_API_KEY` strictly on the Cloudflare Worker server secret (`traceforge-mcp-staging`), never in `VITE_*` or frontend environment variables.
+
+---
+
+## 8d. TraceForge Assistant Policy (RAG-First, Knowledge-Versioned, Budget-Gated)
+
+- **RAG-first inference routing:** every assistant chat request runs deterministic local retrieval (`src/lib/rag-engine.ts`) against the versioned knowledge base FIRST. Knowledge answers and policy refusals return with zero Meta API calls (`$0.00`, `liveInvoked: false`).
+- **Knowledge versioning:** the knowledge base (`src/data/knowledge-base.ts`, `docs/knowledge/traceforge-knowledge-base.md`) is pinned by `KB_VERSION`, echoed in every chat response. Any knowledge change MUST bump `KB_VERSION` and update `tests/assistant-rag.test.ts` in the same change set — test knowledge changes alongside code changes, never separately.
+- **Explicit live-call authorization:** at most 1 paid `muse-spark-1.3` call per user message (`max_tokens: 350`, grounded system prompt) and only when ALL hold: `allowLiveInference === true`, a valid HMAC-signed `tf_chat_…` session ticket OR a `Bearer` token with `traceforge:live_inference:execute`, a configured server-side key, and a successful shared-ledger reservation. Prompt-injection and ground-truth-extraction attempts are refused with zero model calls.
+- **Shared budget enforcement:** assistant live spend is tracked in the shared runtime ledger (`ASSISTANT_LIVE_ALLOWANCE_USD = $2.00`, ≤10 calls/session, ≤2 concurrent, persisted via `TraceForgeStateDO` / Edge Cache, surfaced in `traceforge.budget.status`) and counts toward the `$95.00` project safety threshold. Fail closed on any exhausted or uncertain accounting.
+- **Knowledge-only fallback:** whenever live inference is not permitted, not configured, rate/budget limited, or fails upstream, return the knowledge fallback at `$0.00` — never retry a paid call, never return a 500 for a live failure.
+- **Ground-truth isolation:** session context is sanitized (forbidden `HiddenFault` keys stripped) before retrieval and prompting; withheld fault answers are never exposed before evaluation.
 
 ---
 

@@ -3,9 +3,7 @@ import { aiModeBadge } from '../lib/guided-ux';
 
 /**
  * Simplified workbench header: TraceForge identity + tagline, one truthful
- * AI operational-mode badge, and the live/simulated toggle. Model
- * attribution, context window, segmentation, and token/budget telemetry live
- * in the "Technology, Telemetry & Budget Details" drawer at the page bottom.
+ * AI operational-mode badge, and the live/simulated toggle.
  */
 export function Header(
   {
