@@ -16,8 +16,8 @@ export function Header(
   return (
     <header className="tf-header">
       <div className="tf-logo">
-        <img src="/traceforge-icon-3d.jpg" alt="TraceForge 3D PCB icon" className="tf-logo-icon-3d" />
-        <span className="tf-logo-text"><b>◈</b> TRACEFORGE</span>
+        <img src="/traceforge-icon-3d.png" alt="TraceForge 3D PCB icon" className="tf-logo-icon-3d" />
+        <span className="tf-logo-text">TRACEFORGE</span>
         <span className="tf-tagline">Find hidden electrical faults using an interactive virtual circuit laboratory.</span>
       </div>
       <div className="tf-status">
