@@ -1,23 +1,22 @@
 # Muse Code (`muse-spark-1.3`) Capability & Autonomy Benchmark Report
 
 **Date:** 2026-10-26  
-**Coordinator & Independent Auditor:** Antigravity  
 **Evaluated Agent:** Muse Code CLI `1.4.13 (1.4.13-R6996.1)` running `muse-spark-1.3`  
-**Isolated Benchmark Workspace:** `/Users/danny/agent-test/muse-autonomy-benchmark`  
+**Isolated Benchmark Workspace:** `<isolated-benchmark-workspace>/muse-autonomy-benchmark`  
 **Benchmark Application:** **TaskFlow** — Local Project & Task Management Web Application (TypeScript + React + Vite + Vitest)
 
 ---
 
 ## 1. Executive Summary
 
-To establish an empirical, evidence-backed governance contract in [`AGENTS.md`](file:///Users/danny/Desktop/muse%20hackathon/AGENTS.md), we conducted a 5-stage end-to-end software engineering benchmark of **Muse Code (`muse-spark-1.3`)** in a completely isolated disposable workspace (`/Users/danny/agent-test/muse-autonomy-benchmark`), alongside our production **TraceForge Phase 1.5 & Milestones B–E** runs.
+To establish an empirical, evidence-backed governance contract in [`AGENTS.md`](./AGENTS.md), we conducted a 5-stage end-to-end software engineering benchmark of **Muse Code (`muse-spark-1.3`)** in a completely isolated disposable workspace (`<isolated-benchmark-workspace>/muse-autonomy-benchmark`), alongside our production **TraceForge Phase 1.5 & Milestones B–E** runs.
 
 ### Key Empirical Findings
 - **20 / 20 Core Software Engineering Capabilities Verified as `Independent Success`:** Across two non-interactive prompts (`Stage A` and `Stages B–E`), Muse Code autonomously executed **101 / 101 tool operations with 0 unrecovered failures** (`37/37` in Stage A; `64/64` across Stages B–E), creating nested directories, initializing Git, installing 63 npm packages, writing strict TypeScript + React + Vite code, refactoring modules across directories with `git mv`, injecting and recovering from a regression test failure, and managing multi-branch Git workflows (`main`, `feat/stage-b-enhancements`, `refactor/stage-c-modularize`, `fix/stage-d-recovery`).
-- **Zero Antigravity Code Interventions Required:** Antigravity wrote **0 lines** of application or test code in both the TaskFlow benchmark (39/39 tests passing) and TraceForge Phase 1.5 / Milestones B–E (130/130 tests passing).
-- **Where Supervision & Verification Remain Mandatory:**
-  1. **Headless Browser / Visual Layout Rendering:** Muse Code runs in a headless CLI environment without an attached Chromium GUI inspector; it explicitly and honestly reported: *"Browser behavior is unverified — no Chromium runner here to check rendering."* Antigravity must retain visual/browser verification and independent QA.
-  2. **Promotional Credit & Billing Telemetry:** `muse usage --json` reports `{"schemaVersion":1,"allowance":null,"reason":"no_allowance","hint":null}` for browser-authenticated sessions, meaning the CLI does not expose a live dollar balance query. Antigravity must track session counts, model call counts, and token estimates conservatively against the owner's $100.00 promotional credit budget.
+- **100% Autonomous Implementation:** Muse Code authored all application and test code in both the TaskFlow benchmark (39/39 tests passing) and TraceForge Phase 1.5 / Milestones B–E (130/130 tests passing).
+- **Where Independent Release Verification Remains Mandatory:**
+  1. **Headless Browser / Visual Layout Rendering:** Muse Code runs in a headless CLI environment without an attached Chromium GUI inspector; it explicitly and honestly reported: *"Browser behavior is unverified — no Chromium runner here to check rendering."* Visual browser verification and responsive QA remain mandatory release gates.
+  2. **Promotional Credit & Billing Telemetry:** `muse usage --json` reports `{"schemaVersion":1,"allowance":null,"reason":"no_allowance","hint":null}` for browser-authenticated sessions, meaning the CLI does not expose a live dollar balance query. Session counts, model call counts, and dated provider balance snapshots are tracked conservatively in the project budget ledger (`traceforge.budget.status`).
 
 ---
 
@@ -41,7 +40,7 @@ Inspected safely via `muse --help`, `muse exec --help`, `muse init --dry-run`, `
 
 | # | Capability | Benchmark Test Performed | Classification | Observable Evidence |
 | :-: | :--- | :--- | :--- | :--- |
-| 1 | **Create directories** | Build nested folders (`src/components/cards/`, `src/domain/`, `src/storage/`, `src/styles/`, `tests/`, `docs/`) | **Independent Success** | All 6 nested directories created cleanly in `/Users/danny/agent-test/muse-autonomy-benchmark`. |
+| 1 | **Create directories** | Build nested folders (`src/components/cards/`, `src/domain/`, `src/storage/`, `src/styles/`, `tests/`, `docs/`) | **Independent Success** | All 6 nested directories created cleanly in `<isolated-benchmark-workspace>/muse-autonomy-benchmark`. |
 | 2 | **Create files** | Generate source, test, config, and documentation files | **Independent Success** | 17 files created in Stage A (`4211544`) + `src/storage/task-storage.ts` in Stage C (`d14c196`). |
 | 3 | **Edit existing files** | Add due dates, sorting, completed filter, and JSON import/export in Stage B | **Independent Success** | Modified `task-manager.ts`, `App.tsx`, `TaskFilterBar.tsx`, `TaskCard.tsx`, and `task-manager.test.ts` (`5fc7351`) with 0 regressions (23 → 38 tests passing). |
 | 4 | **Rename and move files** | Move `src/components/TaskCard.tsx` → `src/components/cards/TaskItemCard.tsx` | **Independent Success** | Executed `git mv` in Stage C (`d14c196`), preserving Git rename history and updating all imports. |
@@ -52,14 +51,14 @@ Inspected safely via `muse --help`, `muse exec --help`, `muse init --dry-run`, `
 | 9 | **Execute shell commands** | Run `npm install`, `npm test`, `npm run build`, and `git` commands | **Independent Success** | 101/101 tool batch executions completed across both benchmark runs. |
 | 10 | **Run tests** | Execute `vitest run` and report exact counts | **Independent Success** | 23/23 in Stage A → 38/38 in Stages B & C → 39/39 in Stages D & E. |
 | 11 | **Debug failures** | Diagnose deliberate priority-weight inversion in Stage D | **Independent Success** | Observed 2 failing priority sort tests in `f658398`, diagnosed inverted `PRIORITY_WEIGHTS`, repaired in `321347c`, and added pairwise regression test. |
-| 12 | **Git initialization** | Initialize isolated repository with `main` branch and `.gitignore` | **Independent Success** | Initialized repo in `/Users/danny/agent-test/muse-autonomy-benchmark` (`4211544`). |
+| 12 | **Git initialization** | Initialize isolated repository with `main` branch and `.gitignore` | **Independent Success** | Initialized repo in `<isolated-benchmark-workspace>/muse-autonomy-benchmark` (`4211544`). |
 | 13 | **Git branching** | Create and switch across 3 feature/refactor/fix branches | **Independent Success** | Created `feat/stage-b-enhancements`, `refactor/stage-c-modularize`, and `fix/stage-d-recovery`. |
 | 14 | **Git commits** | Stage files explicitly and create clean conventional commits | **Independent Success** | 5 clean, atomic commits (`4211544`, `5fc7351`, `d14c196`, `f658398`, `321347c`), zero build artifacts committed. |
 | 15 | **Git merges** | Merge `fix/stage-d-recovery` back into `main` locally | **Independent Success** | Fast-forward merged into `main` in Stage E without remote operations. |
 | 16 | **Documentation** | Author and update `README.md` and `docs/ARCHITECTURE.md` | **Independent Success** | Created in Stage A and updated in Stage C to reflect new module paths. |
 | 17 | **Environment variables** | Create `.env.example` (`VITE_APP_TITLE=TaskFlow Workbench`) & `.gitignore` | **Independent Success** | `.env` and `.env.*` ignored while `.env.example` tracked safely. |
-| 18 | **Error recovery** | Self-recover during implementation without Antigravity code edits | **Independent Success** | Recovered from Stage D regression and caught a differential reference-node bug during TraceForge Phase 1.5 testing on its own. |
-| 19 | **Multi-step execution** | Complete Stages B, C, D, and E from a single multi-stage prompt | **Independent Success** | Executed all 4 stages sequentially in 231.4s (`01a17a0b-8c1e-7f73-9e2a-ab1697bc14aa`) with 0 human/coordinator interventions. |
+| 18 | **Error recovery** | Self-recover during implementation without external code edits | **Independent Success** | Recovered from Stage D regression and caught a differential reference-node bug during TraceForge Phase 1.5 testing on its own. |
+| 19 | **Multi-step execution** | Complete Stages B, C, D, and E from a single multi-stage prompt | **Independent Success** | Executed all 4 stages sequentially in 231.4s (`01a17a0b-8c1e-7f73-9e2a-ab1697bc14aa`) with 0 manual interventions. |
 | 20 | **Self-verification** | Run tests, typecheck, production build, and `git status` before finishing | **Independent Success** | Every stage concluded with `vitest run`, `tsc --noEmit && vite build`, and `git status` verification. |
 
 ---
@@ -68,8 +67,8 @@ Inspected safely via `muse --help`, `muse exec --help`, `muse init --dry-run`, `
 
 Metrics extracted directly from exported session trajectories (`muse export --last --redacted`):
 
-| Run / Stage | Session ID | Prompts | Model Calls | Tool Batches (Succeeded / Failed) | Files Created / Modified / Moved / Deleted | Tests Passed / Failed | Build Outcome | Elapsed Time | Manual Antigravity Interventions |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Run / Stage | Session ID | Prompts | Model Calls | Tool Batches (Succeeded / Failed) | Files Created / Modified / Moved / Deleted | Tests Passed / Failed | Build Outcome | Elapsed Time | Manual Code Interventions |
+| :--- | :--- | :---: | :---: | :---: | :--- | :---: | :---: | :---: | :---: |
 | **TaskFlow Stage A** (Initial Build + Git Init) | `01a179fc-6f1e-73f2-824f-6184f60d7ed3` | 1 | 5 | **37 / 0** | 17 created, 0 mod, 0 moved, 1 deleted (`LegacyPlaceholder.tsx`) | **23 / 0** | **PASS** (`154.13 kB` bundle) | `128.7 s` (`128,677 ms`) | **0** |
 | **TaskFlow Stages B–E** (Features, Refactor, Bug Fix, Merge) | `01a17a0b-8c1e-7f73-9e2a-ab1697bc14aa` | 1 | 4 | **64 / 0** | 1 created (`task-storage.ts`), 6 mod, 1 moved (`TaskCard` → `TaskItemCard`), 1 deleted (`UNCOMMITTED_CHECK.tmp`) | **39 / 0** (after 2 deliberate fails in Stage D) | **PASS** (`159.23 kB` bundle) | `231.4 s` (`231,379 ms`) | **0** |
 | **TraceForge Phase 1.5** (Milestone A: MNA Lab & Proxy) | `task-50` | 1 | 5 | **All succeeded (0 failed)** | 3 created, 6 modified | **105 / 0** | **PASS** (`214.08 kB` bundle) | `~488.0 s` | **0** |
@@ -77,9 +76,9 @@ Metrics extracted directly from exported session trajectories (`muse export --la
 
 ---
 
-## 5. Independent Antigravity Verification of TaskFlow Benchmark
+## 5. Post-Run Verification Summary
 
-Antigravity independently verified `/Users/danny/agent-test/muse-autonomy-benchmark` after completion:
+Independent verification of `<isolated-benchmark-workspace>/muse-autonomy-benchmark` after completion:
 1. **Git History & Branch Topology (`git log --graph --oneline --all`):**
    - `4211544` — `feat: initial TaskFlow React+TS application and test suite` (`main` initial)
    - `5fc7351` — `feat(stage-b): add due dates, priority sorting, completed filter, and JSON import/export` (`feat/stage-b-enhancements`)
@@ -88,4 +87,4 @@ Antigravity independently verified `/Users/danny/agent-test/muse-autonomy-benchm
    - `321347c` — `fix(stage-d): repair priority sort order and add regression test` (`HEAD -> main, fix/stage-d-recovery`)
 2. **Test Suite (`npm test`):** **39 / 39 passing** (`vitest run` in 203 ms).
 3. **Production Build (`npm run build`):** **PASSED** (`tsc --noEmit && vite build` in 242 ms).
-4. **Secret & Isolation Check:** Zero secrets, zero external API calls, and zero touches outside `/Users/danny/agent-test/muse-autonomy-benchmark`.
+4. **Secret & Isolation Check:** Zero secrets, zero external API calls, and zero touches outside `<isolated-benchmark-workspace>/muse-autonomy-benchmark`.
